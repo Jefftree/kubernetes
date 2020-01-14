@@ -84,6 +84,10 @@ func ValidateEgressSelectorConfiguration(config *apiserver.EgressSelectorConfigu
 			allErrs = append(allErrs, validateDirectConnection(service.Connection, base)...)
 		case "http-connect":
 			allErrs = append(allErrs, validateHTTPConnection(service.Connection, base)...)
+		case "http-connect-uds":
+			allErrs = append(allErrs, validateUDSConnection(service.Connection, base)...)
+		case "grpc-uds":
+			allErrs = append(allErrs, validateUDSConnection(service.Connection, base)...)
 		default:
 			allErrs = append(allErrs, field.NotSupported(
 				base.Child("type"),
@@ -104,6 +108,23 @@ func validateDirectConnection(connection apiserver.Connection, fldPath *field.Pa
 		}
 	}
 	return nil
+}
+
+func validateUDSConnection(connection apiserver.Connection, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if connection.HTTPConnect != nil {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("httpConnect"),
+			"direct",
+			"httpConnect config should be absent for httpConnect uds connect"))
+	}
+	if connection.UDSName == "" {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("udsName"),
+			"nil",
+			"UDSName should be present for grpc uds or http-connect uds"))
+	}
+	return allErrs
 }
 
 func validateHTTPConnection(connection apiserver.Connection, fldPath *field.Path) field.ErrorList {

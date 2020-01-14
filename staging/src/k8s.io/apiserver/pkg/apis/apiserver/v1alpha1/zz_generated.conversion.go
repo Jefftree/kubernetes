@@ -145,6 +145,7 @@ func Convert_apiserver_AdmissionPluginConfiguration_To_v1alpha1_AdmissionPluginC
 func autoConvert_v1alpha1_Connection_To_apiserver_Connection(in *Connection, out *apiserver.Connection, s conversion.Scope) error {
 	out.Type = in.Type
 	out.HTTPConnect = (*apiserver.HTTPConnectConfig)(unsafe.Pointer(in.HTTPConnect))
+	out.UDSName = in.UDSName
 	return nil
 }
 
@@ -156,6 +157,7 @@ func Convert_v1alpha1_Connection_To_apiserver_Connection(in *Connection, out *ap
 func autoConvert_apiserver_Connection_To_v1alpha1_Connection(in *apiserver.Connection, out *Connection, s conversion.Scope) error {
 	out.Type = in.Type
 	out.HTTPConnect = (*HTTPConnectConfig)(unsafe.Pointer(in.HTTPConnect))
+	out.UDSName = in.UDSName
 	return nil
 }
 

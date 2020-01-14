@@ -80,6 +80,11 @@ type Connection struct {
 	// Presence when the type is "direct" will also cause an error
 	// +optional
 	HTTPConnect *HTTPConnectConfig `json:"httpConnect,omitempty"`
+
+	// UDSName is the name of the unix domain socket to connect to konnectivity server.
+	// Only required if communication with konnectivity server is via UDS.
+	// +optional
+	UDSName string `json:"udsName,omitempty"`
 }
 
 type HTTPConnectConfig struct {

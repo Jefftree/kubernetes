@@ -72,12 +72,16 @@ type EgressSelection struct {
 // Connection provides the configuration for a single egress selection client.
 type Connection struct {
 	// Type is the type of connection used to connect from client to konnectivity server.
-	// Currently supported values are "http-connect" and "direct".
+	// Currently supported values are "http-connect", "http-connect-uds", "grpc-uds" and "direct".
 	Type string
 
 	// httpConnect is the config needed to use http-connect to the konnectivity server.
 	// +optional
 	HTTPConnect *HTTPConnectConfig
+
+	// UDSName is the name of the unix domain socket to connect to konnectivity server
+	// +optional
+	UDSName string
 }
 
 type HTTPConnectConfig struct {
