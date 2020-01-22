@@ -71,24 +71,30 @@ type EgressSelection struct {
 
 // Connection provides the configuration for a single egress selection client.
 type Connection struct {
-	// Type is the type of connection used to connect from client to konnectivity server.
-	// Currently supported values are "http-connect", "http-connect-uds", "grpc-uds" and "direct".
-	Type string
+	// Protocol is the protocol used to connect from client to the konnectivity server.
+	// Supported values are "http-connect," "grpc", and "direct"
+	Protocol string
 
-	// httpConnect is the config needed to use http-connect to the konnectivity server.
+	// Transport is the transport socket used to connect to konnectivity server.
+	// Supported values are "uds" and "tcp". TCP will only work with http-connect protocol
 	// +optional
-	HTTPConnect *HTTPConnectConfig
+	Transport string
+
+	// URL is the location of the konnectivity server to connect to.
+	// As an example it might be "https://127.0.0.1:8131"
+	// +optional
+	URL string
 
 	// UDSName is the name of the unix domain socket to connect to konnectivity server
 	// +optional
 	UDSName string
+
+	// TLSConfig is the config needed to use TLS when connecting to konnectivity server
+	// +optional
+	TLSConfig *TLSConfig
 }
 
-type HTTPConnectConfig struct {
-	// URL is the location of the konnectivity server to connect to.
-	// As an example it might be "https://127.0.0.1:8131"
-	URL string
-
+type TLSConfig struct {
 	// CABundle is the file location of the CA to be used to determine trust with the konnectivity server.
 	// +optional
 	CABundle string

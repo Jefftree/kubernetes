@@ -53,9 +53,8 @@ func TestEgressSelector(t *testing.T) {
 					{
 						Name: "cluster",
 						Connection: apiserver.Connection{
-							Type: "direct",
-							HTTPConnect: &apiserver.HTTPConnectConfig{
-								URL:        "",
+							Protocol: "direct",
+							TLSConfig: &apiserver.TLSConfig{
 								CABundle:   "",
 								ClientKey:  "",
 								ClientCert: "",
@@ -65,9 +64,8 @@ func TestEgressSelector(t *testing.T) {
 					{
 						Name: "master",
 						Connection: apiserver.Connection{
-							Type: "direct",
-							HTTPConnect: &apiserver.HTTPConnectConfig{
-								URL:        "",
+							Protocol: "direct",
+							TLSConfig: &apiserver.TLSConfig{
 								CABundle:   "",
 								ClientKey:  "",
 								ClientCert: "",
@@ -77,9 +75,8 @@ func TestEgressSelector(t *testing.T) {
 					{
 						Name: "etcd",
 						Connection: apiserver.Connection{
-							Type: "direct",
-							HTTPConnect: &apiserver.HTTPConnectConfig{
-								URL:        "",
+							Protocol: "direct",
+							TLSConfig: &apiserver.TLSConfig{
 								CABundle:   "",
 								ClientKey:  "",
 								ClientCert: "",

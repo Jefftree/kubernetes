@@ -62,23 +62,25 @@ kind: EgressSelectorConfiguration
 egressSelections:
 - name: "cluster"
   connection:
-    type: "http-connect"
-    httpConnect:
-      url: "https://127.0.0.1:8131"
+    protocol: "http-connect"
+    transport: "tcp"
+    url: "https://127.0.0.1:8131"
+    tlsConfig:
       caBundle: "/etc/srv/kubernetes/pki/konnectivity-server/ca.crt"
       clientKey: "/etc/srv/kubernetes/pki/konnectivity-server/client.key"
       clientCert: "/etc/srv/kubernetes/pki/konnectivity-server/client.crt"
 - name: "master"
   connection:
-    type: "http-connect"
-    httpConnect:
-      url: "https://127.0.0.1:8132"
+    protocol: "http-connect"
+    transport: "tcp"
+    url: "https://127.0.0.1:8132"
+    tlsConfig:
       caBundle: "/etc/srv/kubernetes/pki/konnectivity-server-master/ca.crt"
       clientKey: "/etc/srv/kubernetes/pki/konnectivity-server-master/client.key"
       clientCert: "/etc/srv/kubernetes/pki/konnectivity-server-master/client.crt"
 - name: "etcd"
   connection:
-    type: "direct"
+    protocol: "direct"
 `,
 			expectedResult: &apiserver.EgressSelectorConfiguration{
 				TypeMeta: metav1.TypeMeta{
@@ -89,9 +91,10 @@ egressSelections:
 					{
 						Name: "cluster",
 						Connection: apiserver.Connection{
-							Type: "http-connect",
-							HTTPConnect: &apiserver.HTTPConnectConfig{
-								URL:        "https://127.0.0.1:8131",
+							Protocol:  "http-connect",
+							Transport: "tcp",
+							URL:       "https://127.0.0.1:8131",
+							TLSConfig: &apiserver.TLSConfig{
 								CABundle:   "/etc/srv/kubernetes/pki/konnectivity-server/ca.crt",
 								ClientKey:  "/etc/srv/kubernetes/pki/konnectivity-server/client.key",
 								ClientCert: "/etc/srv/kubernetes/pki/konnectivity-server/client.crt",
@@ -101,9 +104,10 @@ egressSelections:
 					{
 						Name: "master",
 						Connection: apiserver.Connection{
-							Type: "http-connect",
-							HTTPConnect: &apiserver.HTTPConnectConfig{
-								URL:        "https://127.0.0.1:8132",
+							Protocol:  "http-connect",
+							Transport: "tcp",
+							URL:       "https://127.0.0.1:8132",
+							TLSConfig: &apiserver.TLSConfig{
 								CABundle:   "/etc/srv/kubernetes/pki/konnectivity-server-master/ca.crt",
 								ClientKey:  "/etc/srv/kubernetes/pki/konnectivity-server-master/client.key",
 								ClientCert: "/etc/srv/kubernetes/pki/konnectivity-server-master/client.crt",
@@ -113,7 +117,7 @@ egressSelections:
 					{
 						Name: "etcd",
 						Connection: apiserver.Connection{
-							Type: "direct",
+							Protocol: "direct",
 						},
 					},
 				},

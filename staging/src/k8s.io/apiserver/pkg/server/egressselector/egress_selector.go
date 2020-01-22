@@ -123,13 +123,13 @@ func tunnelHTTPConnect(proxyConn net.Conn, proxyAddress, addr string) (net.Conn,
 	return proxyConn, nil
 }
 
-func createConnectDialer(connectConfig *apiserver.HTTPConnectConfig) (utilnet.DialFunc, error) {
-	clientCert := connectConfig.ClientCert
-	clientKey := connectConfig.ClientKey
-	caCert := connectConfig.CABundle
-	proxyURL, err := url.Parse(connectConfig.URL)
+func createConnectDialer(connectURL string, tlsConfig *apiserver.TLSConfig) (utilnet.DialFunc, error) {
+	clientCert := tlsConfig.ClientCert
+	clientKey := tlsConfig.ClientKey
+	caCert := tlsConfig.CABundle
+	proxyURL, err := url.Parse(connectURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid proxy server url %q: %v", connectConfig.URL, err)
+		return nil, fmt.Errorf("invalid proxy server url %q: %v", connectURL, err)
 	}
 	proxyAddress := proxyURL.Host
 
@@ -213,29 +213,39 @@ func NewEgressSelector(config *apiserver.EgressSelectorConfiguration) (*EgressSe
 		if err != nil {
 			return nil, err
 		}
-		switch service.Connection.Type {
+		switch service.Connection.Protocol {
 		case "http-connect":
-			contextDialer, err := createConnectDialer(service.Connection.HTTPConnect)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create http-connect dialer: %v", err)
+			switch service.Connection.Transport {
+			case "uds":
+				contextDialer, err := createConnectUDSDialer(service.Connection.UDSName)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create http-connect uds dialer: %v", err)
+				}
+				cs.egressToDialer[name] = contextDialer
+			case "tcp":
+				contextDialer, err := createConnectDialer(service.Connection.URL, service.Connection.TLSConfig)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create http-connect dialer: %v", err)
+				}
+				cs.egressToDialer[name] = contextDialer
+			default:
+				return nil, fmt.Errorf("unrecognized service connection transport %q", service.Connection.Transport)
 			}
-			cs.egressToDialer[name] = contextDialer
-		case "http-connect-uds":
-			contextDialer, err := createConnectUDSDialer(service.Connection.UDSName)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create http-connect uds dialer: %v", err)
+		case "grpc":
+			switch service.Connection.Transport {
+			case "uds":
+				grpcContextDialer, err := createGRPCUDSDialer(service.Connection.UDSName)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create grpc dialer: %v", err)
+				}
+				cs.egressToDialer[name] = grpcContextDialer
+			default:
+				return nil, fmt.Errorf("unrecognized service connection transport %q", service.Connection.Transport)
 			}
-			cs.egressToDialer[name] = contextDialer
-		case "grpc-uds":
-			grpcContextDialer, err := createGRPCUDSDialer(service.Connection.UDSName)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create grpc dialer: %v", err)
-			}
-			cs.egressToDialer[name] = grpcContextDialer
 		case "direct":
 			cs.egressToDialer[name] = directDialer
 		default:
-			return nil, fmt.Errorf("unrecognized service connection type %q", service.Connection.Type)
+			return nil, fmt.Errorf("unrecognized service connection protocol %q", service.Connection.Protocol)
 		}
 	}
 	return cs, nil

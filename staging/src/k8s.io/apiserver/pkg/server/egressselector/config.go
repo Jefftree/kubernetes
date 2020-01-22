@@ -79,20 +79,36 @@ func ValidateEgressSelectorConfiguration(config *apiserver.EgressSelectorConfigu
 	}
 	for _, service := range config.EgressSelections {
 		base := field.NewPath("service", "connection")
-		switch service.Connection.Type {
+		switch service.Connection.Protocol {
 		case "direct":
 			allErrs = append(allErrs, validateDirectConnection(service.Connection, base)...)
 		case "http-connect":
-			allErrs = append(allErrs, validateHTTPConnection(service.Connection, base)...)
-		case "http-connect-uds":
-			allErrs = append(allErrs, validateUDSConnection(service.Connection, base)...)
-		case "grpc-uds":
-			allErrs = append(allErrs, validateUDSConnection(service.Connection, base)...)
+			switch service.Connection.Transport {
+			case "uds":
+				allErrs = append(allErrs, validateUDSConnection(service.Connection, base)...)
+			case "tcp":
+				allErrs = append(allErrs, validateHTTPConnection(service.Connection, base)...)
+			default:
+				allErrs = append(allErrs, field.NotSupported(
+					base.Child("protocol"),
+					service.Connection.Protocol,
+					[]string{"uds", "tcp"}))
+			}
+		case "grpc":
+			switch service.Connection.Transport {
+			case "uds":
+				allErrs = append(allErrs, validateUDSConnection(service.Connection, base)...)
+			default:
+				allErrs = append(allErrs, field.NotSupported(
+					base.Child("protocol"),
+					service.Connection.Protocol,
+					[]string{"uds"}))
+			}
 		default:
 			allErrs = append(allErrs, field.NotSupported(
-				base.Child("type"),
-				service.Connection.Type,
-				[]string{"direct", "http-connect"}))
+				base.Child("protocol"),
+				service.Connection.Protocol,
+				[]string{"direct", "http-connect", "grpc"}))
 		}
 	}
 
@@ -100,11 +116,11 @@ func ValidateEgressSelectorConfiguration(config *apiserver.EgressSelectorConfigu
 }
 
 func validateDirectConnection(connection apiserver.Connection, fldPath *field.Path) field.ErrorList {
-	if connection.HTTPConnect != nil {
+	if connection.TLSConfig != nil {
 		return field.ErrorList{field.Invalid(
-			fldPath.Child("httpConnect"),
+			fldPath.Child("tlsConfig"),
 			"direct",
-			"httpConnect config should be absent for direct connect"),
+			"TLSConfig config should be absent for direct connect"),
 		}
 	}
 	return nil
@@ -112,11 +128,11 @@ func validateDirectConnection(connection apiserver.Connection, fldPath *field.Pa
 
 func validateUDSConnection(connection apiserver.Connection, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
-	if connection.HTTPConnect != nil {
+	if connection.TLSConfig != nil {
 		allErrs = append(allErrs, field.Invalid(
-			fldPath.Child("httpConnect"),
+			fldPath.Child("tlsConfig"),
 			"direct",
-			"httpConnect config should be absent for httpConnect uds connect"))
+			"tlsConfig config should be absent for connect via UDS"))
 	}
 	if connection.UDSName == "" {
 		allErrs = append(allErrs, field.Invalid(
@@ -129,68 +145,68 @@ func validateUDSConnection(connection apiserver.Connection, fldPath *field.Path)
 
 func validateHTTPConnection(connection apiserver.Connection, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
-	if connection.HTTPConnect == nil {
+	if connection.TLSConfig == nil {
 		allErrs = append(allErrs, field.Invalid(
-			fldPath.Child("httpConnect"),
+			fldPath.Child("tlsConfig"),
 			"nil",
-			"httpConnect config should be present for http-connect"))
-	} else if strings.HasPrefix(connection.HTTPConnect.URL, "https://") {
-		if connection.HTTPConnect.CABundle == "" {
+			"TLSConfig config should be present for http-connect via tcp"))
+	} else if strings.HasPrefix(connection.URL, "https://") {
+		if connection.TLSConfig.CABundle == "" {
 			allErrs = append(allErrs, field.Invalid(
-				fldPath.Child("httpConnect", "caBundle"),
+				fldPath.Child("tlsConfig", "caBundle"),
 				"nil",
 				"http-connect via https requires caBundle"))
-		} else if exists, err := path.Exists(path.CheckFollowSymlink, connection.HTTPConnect.CABundle); exists == false || err != nil {
+		} else if exists, err := path.Exists(path.CheckFollowSymlink, connection.TLSConfig.CABundle); exists == false || err != nil {
 			allErrs = append(allErrs, field.Invalid(
-				fldPath.Child("httpConnect", "caBundle"),
-				connection.HTTPConnect.CABundle,
+				fldPath.Child("tlsConfig", "caBundle"),
+				connection.TLSConfig.CABundle,
 				"http-connect ca bundle does not exist"))
 		}
-		if connection.HTTPConnect.ClientCert == "" {
+		if connection.TLSConfig.ClientCert == "" {
 			allErrs = append(allErrs, field.Invalid(
-				fldPath.Child("httpConnect", "clientCert"),
+				fldPath.Child("tlsConfig", "clientCert"),
 				"nil",
 				"http-connect via https requires clientCert"))
-		} else if exists, err := path.Exists(path.CheckFollowSymlink, connection.HTTPConnect.ClientCert); exists == false || err != nil {
+		} else if exists, err := path.Exists(path.CheckFollowSymlink, connection.TLSConfig.ClientCert); exists == false || err != nil {
 			allErrs = append(allErrs, field.Invalid(
-				fldPath.Child("httpConnect", "clientCert"),
-				connection.HTTPConnect.ClientCert,
+				fldPath.Child("tlsConfig", "clientCert"),
+				connection.TLSConfig.ClientCert,
 				"http-connect client cert does not exist"))
 		}
-		if connection.HTTPConnect.ClientKey == "" {
+		if connection.TLSConfig.ClientKey == "" {
 			allErrs = append(allErrs, field.Invalid(
-				fldPath.Child("httpConnect", "clientKey"),
+				fldPath.Child("tlsConfig", "clientKey"),
 				"nil",
 				"http-connect via https requires clientKey"))
-		} else if exists, err := path.Exists(path.CheckFollowSymlink, connection.HTTPConnect.ClientKey); exists == false || err != nil {
+		} else if exists, err := path.Exists(path.CheckFollowSymlink, connection.TLSConfig.ClientKey); exists == false || err != nil {
 			allErrs = append(allErrs, field.Invalid(
-				fldPath.Child("httpConnect", "clientKey"),
-				connection.HTTPConnect.ClientKey,
+				fldPath.Child("tlsConfig", "clientKey"),
+				connection.TLSConfig.ClientKey,
 				"http-connect client key does not exist"))
 		}
-	} else if strings.HasPrefix(connection.HTTPConnect.URL, "http://") {
-		if connection.HTTPConnect.CABundle != "" {
+	} else if strings.HasPrefix(connection.URL, "http://") {
+		if connection.TLSConfig.CABundle != "" {
 			allErrs = append(allErrs, field.Invalid(
-				fldPath.Child("httpConnect", "caBundle"),
-				connection.HTTPConnect.CABundle,
+				fldPath.Child("tlsConfig", "caBundle"),
+				connection.TLSConfig.CABundle,
 				"http-connect via http does not support caBundle"))
 		}
-		if connection.HTTPConnect.ClientCert != "" {
+		if connection.TLSConfig.ClientCert != "" {
 			allErrs = append(allErrs, field.Invalid(
-				fldPath.Child("httpConnect", "clientCert"),
-				connection.HTTPConnect.ClientCert,
+				fldPath.Child("tlsConfig", "clientCert"),
+				connection.TLSConfig.ClientCert,
 				"http-connect via http does not support clientCert"))
 		}
-		if connection.HTTPConnect.ClientKey != "" {
+		if connection.TLSConfig.ClientKey != "" {
 			allErrs = append(allErrs, field.Invalid(
-				fldPath.Child("httpConnect", "clientKey"),
-				connection.HTTPConnect.ClientKey,
+				fldPath.Child("tlsConfig", "clientKey"),
+				connection.TLSConfig.ClientKey,
 				"http-connect via http does not support clientKey"))
 		}
 	} else {
 		allErrs = append(allErrs, field.Invalid(
-			fldPath.Child("httpConnect", "url"),
-			connection.HTTPConnect.URL,
+			fldPath.Child("url"),
+			connection.URL,
 			"supported connection protocols are http:// and https://"))
 	}
 	return allErrs

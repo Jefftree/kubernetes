@@ -71,27 +71,34 @@ type EgressSelection struct {
 
 // Connection provides the configuration for a single egress selection client.
 type Connection struct {
-	// type is the type of connection used to connect from client to network/konnectivity server.
-	// Currently supported values are "http-connect" and "direct".
-	Type string `json:"type"`
+	// Protocol is the protocol used to connect from client to the konnectivity server.
+	// Supported values are "http-connect," "grpc," and "direct"
+	Protocol string `json:"protocol"`
 
-	// httpConnect is the config needed to use http-connect to the konnectivity server.
-	// Absence when the type is "http-connect" will cause an error
-	// Presence when the type is "direct" will also cause an error
+	// Transport is the transport socket used to connect to konnectivity server.
+	// Supported values are "uds" and "tcp." TCP will only work with http-connect protocol
+	// Optional only for "direct" protocol
 	// +optional
-	HTTPConnect *HTTPConnectConfig `json:"httpConnect,omitempty"`
+	Transport string `json:"transport"`
+
+	// url is the location of the proxy server to connect to.
+	// As an example it might be "https://127.0.0.1:8131"
+	// +optional
+	URL string `json:"url"`
 
 	// UDSName is the name of the unix domain socket to connect to konnectivity server.
 	// Only required if communication with konnectivity server is via UDS.
 	// +optional
 	UDSName string `json:"udsName,omitempty"`
+
+	// TLSConfig is the config needed to use TLS when connecting to konnectivity server
+	// Absence when the type is "http-connect" will cause an error
+	// Presence when the type is "direct" will also cause an error
+	// +optional
+	TLSConfig *TLSConfig `json:"tlsConfig,omitempty"`
 }
 
-type HTTPConnectConfig struct {
-	// url is the location of the proxy server to connect to.
-	// As an example it might be "https://127.0.0.1:8131"
-	URL string `json:"url"`
-
+type TLSConfig struct {
 	// caBundle is the file location of the CA to be used to determine trust with the konnectivity server.
 	// Must be absent/empty http-connect using the plain http
 	// Must be configured for http-connect using the https protocol
