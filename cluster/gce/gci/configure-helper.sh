@@ -807,15 +807,16 @@ kind: EgressSelectorConfiguration
 egressSelections:
 - name: cluster
   connection:
-    protocol: http-connect
-    transport: uds
-    udsName: /etc/srv/kubernetes/konnectivity/konnectivity-server.socket
+    proxyProtocol: http-connect
+    transport:
+      uds:
+        udsName: /etc/srv/kubernetes/konnectivity/konnectivity-server.socket
 - name: master
   connection:
-    type: direct
+    proxyProtocol: direct
 - name: etcd
   connection:
-    type: direct
+    proxyProtocol: direct
 EOF
   fi
 

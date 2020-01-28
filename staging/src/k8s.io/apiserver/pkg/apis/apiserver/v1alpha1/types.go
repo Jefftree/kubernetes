@@ -72,32 +72,57 @@ type EgressSelection struct {
 // Connection provides the configuration for a single egress selection client.
 type Connection struct {
 	// Protocol is the protocol used to connect from client to the konnectivity server.
-	// Supported values are "http-connect," "grpc," and "direct"
-	Protocol string `json:"protocol"`
+	ProxyProtocol ProtocolType `json:"proxyProtocol,omitempty"`
 
-	// Transport is the transport socket used to connect to konnectivity server.
-	// Supported values are "uds" and "tcp." TCP will only work with http-connect protocol
-	// Optional only for "direct" protocol
+	// Transport defines the transport configurations we use to dial to the konnectivity server
 	// +optional
-	Transport string `json:"transport"`
-
-	// url is the location of the proxy server to connect to.
-	// As an example it might be "https://127.0.0.1:8131"
-	// +optional
-	URL string `json:"url"`
-
-	// UDSName is the name of the unix domain socket to connect to konnectivity server.
-	// Only required if communication with konnectivity server is via UDS.
-	// +optional
-	UDSName string `json:"udsName,omitempty"`
-
-	// TLSConfig is the config needed to use TLS when connecting to konnectivity server
-	// Absence when the type is "http-connect" will cause an error
-	// Presence when the type is "direct" will also cause an error
-	// +optional
-	TLSConfig *TLSConfig `json:"tlsConfig,omitempty"`
+	Transport *Transport `json:"transport,omitempty"`
 }
 
+// ProtocolType is a set of valid values for Connection.ProtocolType
+type ProtocolType string
+
+// Valid types for ProtocolType for konnectivity server
+const (
+	// Use http-connect to connect to konnectivity server
+	ProtocolHTTPConnect ProtocolType = "http-connect"
+	// Use grpc to connect to konnectivity server
+	ProtocolGRPC ProtocolType = "grpc"
+	// Connect directly (skip konnectivity server)
+	ProtocolDirect ProtocolType = "direct"
+)
+
+// Transport defines the transport configurations we use to dial to the konnectivity server
+type Transport struct {
+	// TCP is the TCP configuration for communicating with the konnectivity server via TCP
+	// Field is optional but one of TCP or UDS must be present if Protocol is http-connect or GRPC
+	// +optional
+	TCP *TCPTransport `json:"tcp,omitempty"`
+
+	// UDS is the UDS configuration for communicating with the konnectivity server via UDS
+	// Field is optional but one of TCP or UDS must be present if Protocol is http-connect or GRPC
+	// +optional
+	UDS *UDSTransport `json:"uds,omitempty"`
+}
+
+// TCPTransport provides the information to connect to konnectivity server via TCP
+type TCPTransport struct {
+	// URL is the location of the konnectivity server to connect to.
+	// As an example it might be "https://127.0.0.1:8131"
+	URL string
+
+	// TLSConfig is the config needed to use TLS when connecting to konnectivity server
+	TLSConfig *TLSConfig
+}
+
+// UDSTransport provides the information to connect to konnectivity server via UDS
+type UDSTransport struct {
+	// UDSName is the name of the unix domain socket to connect to konnectivity server
+	UDSName string
+}
+
+// TLSConfig provides the authentication information to connect to konnectivity server
+// Only used with TCPTransport
 type TLSConfig struct {
 	// caBundle is the file location of the CA to be used to determine trust with the konnectivity server.
 	// Must be absent/empty http-connect using the plain http
