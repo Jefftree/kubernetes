@@ -219,13 +219,13 @@ func NewEgressSelector(config *apiserver.EgressSelectorConfiguration) (*EgressSe
 			if service.Connection.Transport.UDS != nil {
 				contextDialer, err := createConnectUDSDialer(service.Connection.Transport.UDS.UDSName)
 				if err != nil {
-					return nil, fmt.Errorf("failed to create http-connect uds dialer: %v", err)
+					return nil, fmt.Errorf("failed to create HTTPConnect uds dialer: %v", err)
 				}
 				cs.egressToDialer[name] = contextDialer
 			} else if service.Connection.Transport.TCP != nil {
 				contextDialer, err := createConnectTCPDialer(service.Connection.Transport.TCP)
 				if err != nil {
-					return nil, fmt.Errorf("failed to create http-connect dialer: %v", err)
+					return nil, fmt.Errorf("failed to create HTTPConnect dialer: %v", err)
 				}
 				cs.egressToDialer[name] = contextDialer
 			} else {

@@ -75,6 +75,7 @@ type Connection struct {
 	ProxyProtocol ProtocolType `json:"proxyProtocol,omitempty"`
 
 	// Transport defines the transport configurations we use to dial to the konnectivity server
+	// This is required if ProxyProtocol is HTTPConnect or GRPC
 	// +optional
 	Transport *Transport `json:"transport,omitempty"`
 }
@@ -84,23 +85,23 @@ type ProtocolType string
 
 // Valid types for ProtocolType for konnectivity server
 const (
-	// Use http-connect to connect to konnectivity server
-	ProtocolHTTPConnect ProtocolType = "http-connect"
+	// Use HTTPConnect to connect to konnectivity server
+	ProtocolHTTPConnect ProtocolType = "HTTPConnect"
 	// Use grpc to connect to konnectivity server
-	ProtocolGRPC ProtocolType = "grpc"
+	ProtocolGRPC ProtocolType = "GRPC"
 	// Connect directly (skip konnectivity server)
-	ProtocolDirect ProtocolType = "direct"
+	ProtocolDirect ProtocolType = "Direct"
 )
 
 // Transport defines the transport configurations we use to dial to the konnectivity server
 type Transport struct {
 	// TCP is the TCP configuration for communicating with the konnectivity server via TCP
-	// Field is optional but one of TCP or UDS must be present if Protocol is http-connect or GRPC
+	// Requires at least one of TCP or UDS to be set
 	// +optional
 	TCP *TCPTransport `json:"tcp,omitempty"`
 
 	// UDS is the UDS configuration for communicating with the konnectivity server via UDS
-	// Field is optional but one of TCP or UDS must be present if Protocol is http-connect or GRPC
+	// Requires at least one of TCP or UDS to be set
 	// +optional
 	UDS *UDSTransport `json:"uds,omitempty"`
 }
@@ -112,6 +113,7 @@ type TCPTransport struct {
 	URL string
 
 	// TLSConfig is the config needed to use TLS when connecting to konnectivity server
+	// +optional
 	TLSConfig *TLSConfig
 }
 
@@ -125,22 +127,22 @@ type UDSTransport struct {
 // Only used with TCPTransport
 type TLSConfig struct {
 	// caBundle is the file location of the CA to be used to determine trust with the konnectivity server.
-	// Must be absent/empty http-connect using the plain http
-	// Must be configured for http-connect using the https protocol
+	// Must be absent/empty HTTPConnect using the plain http
+	// Must be configured for HTTPConnect using the https protocol
 	// Misconfiguration will cause an error
 	// +optional
 	CABundle string `json:"caBundle,omitempty"`
 
 	// clientKey is the file location of the client key to be used in mtls handshakes with the konnectivity server.
-	// Must be absent/empty http-connect using the plain http
-	// Must be configured for http-connect using the https protocol
+	// Must be absent/empty HTTPConnect using the plain http
+	// Must be configured for HTTPConnect using the https protocol
 	// Misconfiguration will cause an error
 	// +optional
 	ClientKey string `json:"clientKey,omitempty"`
 
 	// clientCert is the file location of the client certificate to be used in mtls handshakes with the konnectivity server.
-	// Must be absent/empty http-connect using the plain http
-	// Must be configured for http-connect using the https protocol
+	// Must be absent/empty HTTPConnect using the plain http
+	// Must be configured for HTTPConnect using the https protocol
 	// Misconfiguration will cause an error
 	// +optional
 	ClientCert string `json:"clientCert,omitempty"`

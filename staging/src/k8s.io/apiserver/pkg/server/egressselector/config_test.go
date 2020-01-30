@@ -62,7 +62,7 @@ kind: EgressSelectorConfiguration
 egressSelections:
 - name: "cluster"
   connection:
-    proxyProtocol: "http-connect"
+    proxyProtocol: "HTTPConnect"
     transport:
       tcp:
         url: "https://127.0.0.1:8131"
@@ -72,7 +72,7 @@ egressSelections:
           clientCert: "/etc/srv/kubernetes/pki/konnectivity-server/client.crt"
 - name: "master"
   connection:
-    proxyProtocol: "http-connect"
+    proxyProtocol: "HTTPConnect"
     transport:
       tcp:
         url: "https://127.0.0.1:8132"
@@ -82,7 +82,7 @@ egressSelections:
           clientCert: "/etc/srv/kubernetes/pki/konnectivity-server-master/client.crt"
 - name: "etcd"
   connection:
-    proxyProtocol: "direct"
+    proxyProtocol: "Direct"
 `,
 			expectedResult: &apiserver.EgressSelectorConfiguration{
 				TypeMeta: metav1.TypeMeta{
@@ -93,7 +93,7 @@ egressSelections:
 					{
 						Name: "cluster",
 						Connection: apiserver.Connection{
-							ProxyProtocol: "http-connect",
+							ProxyProtocol: "HTTPConnect",
 							Transport: &apiserver.Transport{
 								TCP: &apiserver.TCPTransport{
 									URL: "https://127.0.0.1:8131",
@@ -110,7 +110,7 @@ egressSelections:
 					{
 						Name: "master",
 						Connection: apiserver.Connection{
-							ProxyProtocol: "http-connect",
+							ProxyProtocol: "HTTPConnect",
 							Transport: &apiserver.Transport{
 								TCP: &apiserver.TCPTransport{
 									URL: "https://127.0.0.1:8132",
@@ -126,7 +126,7 @@ egressSelections:
 					{
 						Name: "etcd",
 						Connection: apiserver.Connection{
-							ProxyProtocol: "direct",
+							ProxyProtocol: "Direct",
 						},
 					},
 				},
