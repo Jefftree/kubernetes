@@ -1652,7 +1652,7 @@ function prepare-konnectivity-server-manifest {
   params+=("--log-file=/var/log/konnectivity-server.log")
   params+=("--logtostderr=false")
   params+=("--log-file-max-size=0")
-  params+=("--udsName=/etc/srv/kubernetes/konnectivity/konnectivity-server.socket")
+  params+=("--uds-name=/etc/srv/kubernetes/konnectivity/konnectivity-server.socket")
   params+=("--cluster-cert=/etc/srv/kubernetes/pki/apiserver.crt")
   params+=("--cluster-key=/etc/srv/kubernetes/pki/apiserver.key")
   params+=("--mode=http-connect")

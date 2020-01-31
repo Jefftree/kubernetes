@@ -28,7 +28,7 @@ spec:
           hostPath:
             path: /etc/srv/kubernetes/pki/konnectivity-agent
       containers:
-        - image: gcr.io/jying-gke-dev/proxy-agent-amd64:842202cc3b819fc307b46e2b92bd8a4391bb9231
+        - image: us.gcr.io/k8s-artifacts-prod/kas-network-proxy/proxy-agent:v0.0.4
           name: konnectivity-agent
           command: ["/proxy-agent"]
           args: [
