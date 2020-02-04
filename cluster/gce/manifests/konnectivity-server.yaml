@@ -11,7 +11,7 @@ spec:
   hostNetwork: true
   containers:
   - name: konnectivity-server-container
-    image: us.gcr.io/k8s-artifacts-prod/kas-network-proxy/proxy-server:v0.0.4
+    image: gcr.io/jying-gke-dev/proxy-server-amd64:1b190b376b2e85652eb6637e8e78c626acb24194
     resources:
       requests:
         cpu: 40m
@@ -39,7 +39,7 @@ spec:
       mountPath: /etc/srv/kubernetes/pki
       readOnly: true
     - name: konnectivity-uds
-      mountPath: /etc/srv/kubernetes/konnectivity
+      mountPath: /etc/srv/kubernetes/konnectivity-server
       readOnly: false
   volumes:
   - name: varlogkonnectivityserver
@@ -51,5 +51,5 @@ spec:
       path: /etc/srv/kubernetes/pki
   - name: konnectivity-uds
     hostPath:
-      path: /etc/srv/kubernetes/konnectivity
+      path: /etc/srv/kubernetes/konnectivity-server
       type: DirectoryOrCreate

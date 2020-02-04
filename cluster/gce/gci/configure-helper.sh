@@ -652,7 +652,11 @@ function create-master-auth {
     append_or_replace_prefixed_line "${known_tokens_csv}" "${GCE_GLBC_TOKEN},"                "system:controller:glbc,uid:system:controller:glbc"
   fi
   if [[ -n "${ADDON_MANAGER_TOKEN:-}" ]]; then
-    append_or_replace_prefixed_line "${known_tokens_csv}" "${ADDON_MANAGER_TOKEN},"   "system:addon-manager,uid:system:addon-manager,system:masters"
+    append_or_replace_prefixed_line "${known_tokens_csv}" "${ADDON_MANAGER_TOKEN},"           "system:addon-manager,uid:system:addon-manager,system:masters"
+  fi
+  if [[ -n "${KONNECTIVITY_SERVER_TOKEN:-}" ]]; then
+    append_or_replace_prefixed_line "${known_tokens_csv}" "${KONNECTIVITY_SERVER_TOKEN},"     "system:konnectivity-server,uid:system:konnectivity-server"
+    create-kubeconfig "konnectivity-server" ${KONNECTIVITY_SERVER_TOKEN}
   fi
   if [[ -n "${EXTRA_STATIC_AUTH_COMPONENTS:-}" ]]; then
     # Create a static Bearer token and kubeconfig for extra, comma-separated components.
@@ -810,7 +814,7 @@ egressSelections:
     proxyProtocol: HTTPConnect
     transport:
       uds:
-        udsName: /etc/srv/kubernetes/konnectivity/konnectivity-server.socket
+        udsName: /etc/srv/kubernetes/konnectivity-server/konnectivity-server.socket
 - name: master
   connection:
     proxyProtocol: Direct
@@ -1652,13 +1656,17 @@ function prepare-konnectivity-server-manifest {
   params+=("--log-file=/var/log/konnectivity-server.log")
   params+=("--logtostderr=false")
   params+=("--log-file-max-size=0")
-  params+=("--uds-name=/etc/srv/kubernetes/konnectivity/konnectivity-server.socket")
+  params+=("--uds-name=/etc/srv/kubernetes/konnectivity-server/konnectivity-server.socket")
   params+=("--cluster-cert=/etc/srv/kubernetes/pki/apiserver.crt")
   params+=("--cluster-key=/etc/srv/kubernetes/pki/apiserver.key")
   params+=("--mode=http-connect")
   params+=("--server-port=0")
   params+=("--agent-port=$1")
   params+=("--admin-port=$2")
+  params+=("--agent-namespace=kube-system")
+  params+=("--agent-service-account=konnectivity-agent")
+  params+=("--kubeconfig=/etc/srv/kubernetes/konnectivity-server/kubeconfig")
+  params+=("--authentication-audience=system:konnectivity-server")
   konnectivity_args=""
   for param in "${params[@]}"; do
     konnectivity_args+=", \"${param}\""
@@ -2746,6 +2754,9 @@ function main() {
   ADDON_MANAGER_TOKEN="$(secure_random 32)"
   if [[ "${ENABLE_APISERVER_INSECURE_PORT:-false}" != "true" ]]; then
     KUBE_BOOTSTRAP_TOKEN="$(secure_random 32)"
+  fi
+  if [[ "${ENABLE_EGRESS_VIA_KONNECTIVITY_SERVICE:-false}" == "true" ]]; then
+    KONNECTIVITY_SERVER_TOKEN="$(secure_random 32)"
   fi
 
   setup-os-params

@@ -1,4 +1,23 @@
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: konnectivity-agent
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:konnectivity-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: system:konnectivity-server
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -28,14 +47,15 @@ spec:
           hostPath:
             path: /etc/srv/kubernetes/pki/konnectivity-agent
       containers:
-        - image: us.gcr.io/k8s-artifacts-prod/kas-network-proxy/proxy-agent:v0.0.4
+        - image: gcr.io/jying-gke-dev/proxy-agent-amd64:1b190b376b2e85652eb6637e8e78c626acb24194
           name: konnectivity-agent
           command: ["/proxy-agent"]
           args: [
                   "--logtostderr=true",
                   "--ca-cert=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
                   "--proxy-server-host=__APISERVER_IP__",
-                  "--proxy-server-port=8132"
+                  "--proxy-server-port=8132",
+                  "--service-account-token-path=/var/run/secrets/tokens/konnectivity-agent-token"
                   ]
           env:
             - name: POD_NAME
@@ -50,6 +70,9 @@ spec:
             limits:
               cpu: 50m
               memory: 30Mi
+          volumeMounts:
+            - mountPath: /var/run/secrets/tokens
+              name: konnectivity-agent-token
           livenessProbe:
             httpGet:
               host: 127.0.0.1
@@ -57,3 +80,11 @@ spec:
               path: /healthz
             initialDelaySeconds: 15
             timeoutSeconds: 15
+      serviceAccountName: konnectivity-agent
+      volumes:
+        - name: konnectivity-agent-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: konnectivity-agent-token
+                  audience: system:konnectivity-server
