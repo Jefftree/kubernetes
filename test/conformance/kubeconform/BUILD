@@ -6,9 +6,13 @@ go_library(
         "gen.go",
         "kubeconform.go",
         "link.go",
+        "genmap.go"
+    ],
+    data = [
+        "//test/e2e:all-srcs",
     ],
     importpath = "k8s.io/kubernetes/test/conformance/kubeconform",
-    visibility = ["//visibility:private"],
+    visibility = ["//visibility:public"],
     deps = [
         "//test/conformance/behaviors:go_default_library",
         "//vendor/github.com/go-openapi/analysis:go_default_library",
@@ -37,4 +41,17 @@ go_binary(
     data = ["//api/openapi-spec"],
     embed = [":go_default_library"],
     visibility = ["//visibility:public"],
+)
+
+
+genrule(
+    name = "list_behavior_link",
+    srcs = [
+        "//test/e2e:all-srcs",
+        ":kubeconform",
+    ],
+    outs = ["link.yaml"],
+    visibility = ["//visibility:public"],
+    cmd = "$(location :kubeconform) genmap  > $@",
+    message = "Listing all conformance tests.",
 )

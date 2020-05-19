@@ -86,6 +86,9 @@ type TestContextType struct {
 	// ListConformanceTests will list off all conformance tests that are available then quit
 	ListConformanceTests bool
 
+	// ConformanceBehaviorTag will tag conformance behaviors to Conformance e2e tests
+	ConformanceBehaviorTag bool
+
 	// Provider identifies the infrastructure provider (gce, gke, aws)
 	Provider string
 
@@ -306,6 +309,7 @@ func RegisterCommonFlags(flags *flag.FlagSet) {
 	flags.StringVar(&TestContext.ProgressReportURL, "progress-report-url", "", "The URL to POST progress updates to as the suite runs to assist in aiding integrations. If empty, no messages sent.")
 	flags.StringVar(&TestContext.SpecSummaryOutput, "spec-dump", "", "The file to dump all ginkgo.SpecSummary to after tests run. If empty, no objects are saved/printed.")
 	flags.StringVar(&TestContext.DockerConfigFile, "docker-config-file", "", "A file that contains credentials which can be used to pull images from certain private registries, needed for a test.")
+	flags.BoolVar(&TestContext.ConformanceBehaviorTag, "conformance-behavior-tag", true, "Whether to add tags for conformance behaviors in e2e tests")
 }
 
 // RegisterClusterFlags registers flags specific to the cluster e2e test suite.

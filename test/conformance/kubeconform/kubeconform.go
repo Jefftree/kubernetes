@@ -95,6 +95,9 @@ func parseFlags() (actionFunc, *options) {
 			action = nil
 			fmt.Fprintf(os.Stderr, "-testdata is required for 'link'\n")
 		}
+
+	case "genmap":
+		action = genmap
 	}
 
 	if o.behaviorsDir == "" {

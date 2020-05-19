@@ -260,7 +260,7 @@ func tryCommentGroupAndFrame(fset *token.FileSet, cg *ast.CommentGroup, f frame)
 	if seenLines != nil {
 		seenLines[fmt.Sprintf("%v:%v", f.File, f.Line)] = struct{}{}
 	}
-	cd := commentToConformanceData(cg.Text())
+	cd := behaviors.CommentToConformanceData(cg.Text())
 	if cd == nil {
 		return nil
 	}
@@ -273,51 +273,4 @@ func tryCommentGroupAndFrame(fset *token.FileSet, cg *ast.CommentGroup, f frame)
 func shouldProcessCommentGroup(fset *token.FileSet, cg *ast.CommentGroup, f frame) bool {
 	lineDiff := f.Line - fset.Position(cg.End()).Line
 	return lineDiff > 0 && lineDiff <= conformanceCommentsLineWindow
-}
-
-func commentToConformanceData(comment string) *behaviors.ConformanceData {
-	lines := strings.Split(comment, "\n")
-	descLines := []string{}
-	cd := &behaviors.ConformanceData{}
-	var curLine string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		if sline := regexp.MustCompile("^Testname\\s*:\\s*").Split(line, -1); len(sline) == 2 {
-			curLine = "Testname"
-			cd.TestName = sline[1]
-			continue
-		}
-		if sline := regexp.MustCompile("^Release\\s*:\\s*").Split(line, -1); len(sline) == 2 {
-			curLine = "Release"
-			cd.Release = sline[1]
-			continue
-		}
-		if sline := regexp.MustCompile("^Description\\s*:\\s*").Split(line, -1); len(sline) == 2 {
-			curLine = "Description"
-			descLines = append(descLines, sline[1])
-			continue
-		}
-		if sline := regexp.MustCompile("^Behaviors\\s*:\\s*").Split(line, -1); len(sline) == 2 {
-			curLine = "Behaviors"
-			continue
-		}
-
-		// Line has no header
-		if curLine == "Behaviors" {
-			if sline := regexp.MustCompile("^-\\s").Split(line, -1); len(sline) == 2 {
-				cd.Behaviors = append(cd.Behaviors, sline[1])
-			}
-		} else if curLine == "Description" {
-			descLines = append(descLines, line)
-		}
-	}
-	if cd.TestName == "" {
-		return nil
-	}
-
-	cd.Description = strings.Join(descLines, " ")
-	return cd
 }

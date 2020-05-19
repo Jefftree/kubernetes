@@ -184,6 +184,8 @@ var _ = framework.KubeDescribe("Pods", func() {
 		Release : v1.9
 		Testname: Pods, assigned hostip
 		Description: Create a Pod. Pod status MUST return successfully and contains a valid IP address.
+        Behaviors:
+        - pod/spec/IP
 	*/
 	framework.ConformanceIt("should get a host IP [NodeConformance]", func() {
 		name := "pod-hostip-" + string(uuid.NewUUID())
@@ -206,6 +208,9 @@ var _ = framework.KubeDescribe("Pods", func() {
 		Release : v1.9
 		Testname: Pods, lifecycle
 		Description: A Pod is created with a unique label. Pod MUST be accessible when queried using the label selector upon creation. Add a watch, check if the Pod is running. Pod then deleted, The pod deletion timestamp is observed. The watch MUST return the pod deleted event. Query with the original selector for the Pod MUST return empty list.
+        Behaviors:
+        - pod/lifecycle/label
+        - pod/lifecycle/delete
 	*/
 	framework.ConformanceIt("should be submitted and removed [NodeConformance]", func() {
 		ginkgo.By("creating the pod")

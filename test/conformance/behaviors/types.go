@@ -16,6 +16,11 @@ limitations under the License.
 
 package behaviors
 
+import (
+	"strings"
+	"regexp"
+)
+
 // Area is a conformance area composed of a list of test suites
 type Area struct {
 	Area   string  `json:"area,omitempty"`
@@ -54,4 +59,52 @@ type ConformanceData struct {
 	File string
 	// Behaviors is the list of conformance behaviors tested by a particular e2e test
 	Behaviors []string `yaml:"behaviors,omitempty"`
+}
+
+
+func CommentToConformanceData(comment string) *ConformanceData {
+	lines := strings.Split(comment, "\n")
+	descLines := []string{}
+	cd := &ConformanceData{}
+	var curLine string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		if sline := regexp.MustCompile("^Testname\\s*:\\s*").Split(line, -1); len(sline) == 2 {
+			curLine = "Testname"
+			cd.TestName = sline[1]
+			continue
+		}
+		if sline := regexp.MustCompile("^Release\\s*:\\s*").Split(line, -1); len(sline) == 2 {
+			curLine = "Release"
+			cd.Release = sline[1]
+			continue
+		}
+		if sline := regexp.MustCompile("^Description\\s*:\\s*").Split(line, -1); len(sline) == 2 {
+			curLine = "Description"
+			descLines = append(descLines, sline[1])
+			continue
+		}
+		if sline := regexp.MustCompile("^Behaviors\\s*:\\s*").Split(line, -1); len(sline) == 2 {
+			curLine = "Behaviors"
+			continue
+		}
+
+		// Line has no header
+		if curLine == "Behaviors" {
+			if sline := regexp.MustCompile("^-\\s").Split(line, -1); len(sline) == 2 {
+				cd.Behaviors = append(cd.Behaviors, sline[1])
+			}
+		} else if curLine == "Description" {
+			descLines = append(descLines, line)
+		}
+	}
+	if cd.TestName == "" {
+		return nil
+	}
+
+	cd.Description = strings.Join(descLines, " ")
+	return cd
 }

@@ -29,6 +29,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	sysruntime "runtime"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -46,10 +47,12 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
+	"k8s.io/kubernetes/test/conformance/testutil"
 	scaleclient "k8s.io/client-go/scale"
 
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/gomega"
+
 
 	// TODO: Remove the following imports (ref: https://github.com/kubernetes/kubernetes/issues/81245)
 	e2emetrics "k8s.io/kubernetes/test/e2e/framework/metrics"
@@ -594,7 +597,30 @@ func KubeDescribe(text string, body func()) bool {
 
 // ConformanceIt is wrapper function for ginkgo It.  Adds "[Conformance]" tag and makes static analysis easier.
 func ConformanceIt(text string, body interface{}, timeout ...float64) bool {
-	return ginkgo.It(text+" [Conformance]", body, timeout...)
+	_, file, line, _ := sysruntime.Caller(1)
+
+	// if !TestContext.ConformanceBehaviorTag {
+		// return ginkgo.It(text+" [Conformance]", body, timeout...)
+	// }
+
+	// The Conformance comment block ends 1 line before the function definition
+	line = line - 1
+	indexString := fmt.Sprintf("%s#%d", file, line)
+
+	mapping, _ := testutil.LoadBehaviorsMapping("../..")
+
+	o, ok := mapping[indexString]
+	behaviorString := ""
+	// if !ok {
+		// fmt.Println(indexString)
+	// }
+	if ok && len(o.Behaviors) > 0 {
+		for _, behavior := range o.Behaviors {
+			behaviorString = behaviorString + fmt.Sprintf("[ConformanceBehavior:%s]", behavior)
+		}
+	}
+
+	return ginkgo.It(text+" [Conformance]"+ behaviorString, body, timeout...)
 }
 
 // PodStateVerification represents a verification of pod state.

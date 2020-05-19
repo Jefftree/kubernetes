@@ -23,6 +23,7 @@ go_library(
     importpath = "k8s.io/kubernetes/test/e2e/framework",
     visibility = ["//visibility:public"],
     deps = [
+        "//test/conformance/kubeconform:go_default_library",
         "//pkg/kubelet/apis/config:go_default_library",
         "//pkg/kubelet/apis/stats/v1alpha1:go_default_library",
         "//staging/src/k8s.io/api/core/v1:go_default_library",
@@ -58,6 +59,7 @@ go_library(
         "//staging/src/k8s.io/component-base/cli/flag:go_default_library",
         "//staging/src/k8s.io/component-base/featuregate:go_default_library",
         "//staging/src/k8s.io/kubectl/pkg/util/podutils:go_default_library",
+        "//test/conformance/testutil:go_default_library",
         "//test/e2e/framework/auth:go_default_library",
         "//test/e2e/framework/ginkgowrapper:go_default_library",
         "//test/e2e/framework/kubectl:go_default_library",
@@ -75,6 +77,9 @@ go_library(
         "//vendor/github.com/pkg/errors:go_default_library",
         "//vendor/k8s.io/klog:go_default_library",
         "//vendor/k8s.io/utils/exec:go_default_library",
+    ],
+    data = [
+        "//test/conformance/kubeconform:list_behavior_link"
     ],
 )
 
