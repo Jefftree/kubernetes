@@ -527,7 +527,7 @@ func TestTransformingManagedFieldsToParent(t *testing.T) {
 			},
 		},
 		{
-			desc: "Subresource has multiple managers",
+			desc: "apply without stealing",
 			parent: []metav1.ManagedFieldsEntry{
 				{
 					Manager:    "test",
@@ -539,15 +539,14 @@ func TestTransformingManagedFieldsToParent(t *testing.T) {
 			},
 			subresource: []metav1.ManagedFieldsEntry{
 				{
-					Manager:     "test",
-					Operation:   metav1.ManagedFieldsOperationApply,
-					APIVersion:  "autoscaling/v1",
-					FieldsType:  "FieldsV1",
-					FieldsV1:    &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{}}}`)},
-					Subresource: "scale",
+					Manager:    "test",
+					Operation:  metav1.ManagedFieldsOperationApply,
+					APIVersion: "autoscaling/v1",
+					FieldsType: "FieldsV1",
+					FieldsV1:   &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{}}}`)},
 				},
 				{
-					Manager:     "scale",
+					Manager:     "test",
 					Operation:   metav1.ManagedFieldsOperationApply,
 					APIVersion:  "autoscaling/v1",
 					FieldsType:  "FieldsV1",
@@ -557,19 +556,11 @@ func TestTransformingManagedFieldsToParent(t *testing.T) {
 			},
 			expected: []metav1.ManagedFieldsEntry{
 				{
-					Manager:     "scale",
-					Operation:   metav1.ManagedFieldsOperationApply,
-					APIVersion:  "apps/v1",
-					FieldsType:  "FieldsV1",
-					FieldsV1:    &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{}}}`)},
-					Subresource: "scale",
-				},
-				{
 					Manager:    "test",
 					Operation:  metav1.ManagedFieldsOperationApply,
 					APIVersion: "apps/v1",
 					FieldsType: "FieldsV1",
-					FieldsV1:   &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:selector":{}}}`)},
+					FieldsV1:   &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{},"f:selector":{}}}`)},
 				},
 				{
 					Manager:     "test",

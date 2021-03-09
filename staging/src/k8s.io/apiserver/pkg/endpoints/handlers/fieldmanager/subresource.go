@@ -113,17 +113,24 @@ func (h *ScaleHandler) ToParent(scaleEntries []metav1.ManagedFieldsEntry) ([]met
 			continue
 		}
 
-		// "Steal" the replicas path from the main resource entry
-		newSet := versionedSet.Set().Difference(fieldpath.NewSet(path))
+		if _, ok := scaleFields[manager]; !ok {
+			// "Steal" the replicas path from the main resource entry
+			newSet := versionedSet.Set().Difference(fieldpath.NewSet(path))
 
-		if !newSet.Empty() {
-			newVersionedSet := fieldpath.NewVersionedSet(
-				newSet,
-				versionedSet.APIVersion(),
-				versionedSet.Applied(),
-			)
-			f[manager] = newVersionedSet
+			if !newSet.Empty() {
+				newVersionedSet := fieldpath.NewVersionedSet(
+					newSet,
+					versionedSet.APIVersion(),
+					versionedSet.Applied(),
+				)
+				f[manager] = newVersionedSet
+				t[manager] = decodedParentEntries.Times()[manager]
+			}
+		} else {
+			// Field wasn't stolen, let's keep the entry as it is.
+			f[manager] = versionedSet
 			t[manager] = decodedParentEntries.Times()[manager]
+			delete(scaleFields, manager)
 		}
 	}
 

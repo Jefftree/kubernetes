@@ -3395,9 +3395,9 @@ func TestSubresourceField(t *testing.T) {
 		AbsPath("/apis/apps/v1").
 		Namespace("default").
 		Resource("deployments").
-		SubResource("status").
+		SubResource("scale").
 		Name("deployment").
-		Body([]byte(`{"status":{"unavailableReplicas":32}}`)).
+		Body([]byte(`{"spec":{"replicas":32}}`)).
 		Param("fieldManager", "manager").
 		Do(context.TODO()).
 		Get()
@@ -3411,8 +3411,8 @@ func TestSubresourceField(t *testing.T) {
 	}
 
 	managedFields := deployment.GetManagedFields()
-	if len(managedFields) != 3 {
-		t.Fatalf("Expected object to have 3 managed fields entries, got: %d", len(managedFields))
+	if len(managedFields) != 2 {
+		t.Fatalf("Expected object to have 2 managed fields entries, got: %d", len(managedFields))
 	}
 	if managedFields[0].Manager != "manager" || managedFields[0].Operation != "Apply" || managedFields[0].Subresource != "" {
 		t.Fatalf(`Unexpected entry, got: %v`, managedFields[0])
@@ -3421,12 +3421,6 @@ func TestSubresourceField(t *testing.T) {
 		managedFields[1].Operation != "Update" ||
 		managedFields[1].Subresource != "scale" ||
 		string(managedFields[1].FieldsV1.Raw) != `{"f:spec":{"f:replicas":{}}}` {
-		t.Fatalf(`Unexpected entry, got: %v`, managedFields[1])
-	}
-	if managedFields[2].Manager != "manager" ||
-		managedFields[2].Operation != "Update" ||
-		managedFields[2].Subresource != "status" ||
-		string(managedFields[2].FieldsV1.Raw) != `{"f:status":{"f:unavailableReplicas":{}}}` {
 		t.Fatalf(`Unexpected entry, got: %v`, managedFields[1])
 	}
 }
