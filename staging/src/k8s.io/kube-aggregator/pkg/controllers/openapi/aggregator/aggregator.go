@@ -17,6 +17,7 @@ limitations under the License.
 package aggregator
 
 import (
+	// "encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -27,18 +28,23 @@ import (
 
 	"k8s.io/klog/v2"
 
+	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/server"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	v1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	"k8s.io/kube-openapi/pkg/aggregator"
 	"k8s.io/kube-openapi/pkg/builder"
 	"k8s.io/kube-openapi/pkg/common"
 	"k8s.io/kube-openapi/pkg/handler"
+	"k8s.io/kube-openapi/pkg/handler3"
+	"k8s.io/kube-openapi/pkg/spec3"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 )
 
 // SpecAggregator calls out to http handlers of APIServices and merges specs. It keeps state of the last
 // known specs including the http etag.
 type SpecAggregator interface {
+	UpdateGroups(map[string]*spec3.OpenAPI)
 	AddUpdateAPIService(handler http.Handler, apiService *v1.APIService) error
 	UpdateAPIServiceSpec(apiServiceName string, spec *spec.Swagger, etag string) error
 	RemoveAPIServiceSpec(apiServiceName string) error
@@ -72,9 +78,15 @@ func (s *specAggregator) GetAPIServiceNames() []string {
 	return names
 }
 
+func (s *specAggregator) UpdateGroups(groupSpecs map[string]*spec3.OpenAPI) {
+	for group, spec := range groupSpecs {
+		s.openAPIV3VersionedService.UpdateGroupVersion(group, spec)
+	}
+}
+
 // BuildAndRegisterAggregator registered OpenAPI aggregator handler. This function is not thread safe as it only being called on startup.
 func BuildAndRegisterAggregator(downloader *Downloader, delegationTarget server.DelegationTarget, webServices []*restful.WebService,
-	config *common.Config, pathHandler common.PathHandler) (SpecAggregator, error) {
+	config *common.Config, pathHandler common.PathHandlerByGroupVersion) (SpecAggregator, error) {
 	s := &specAggregator{
 		openAPISpecs: map[string]*openAPISpecInfo{},
 	}
@@ -89,6 +101,9 @@ func BuildAndRegisterAggregator(downloader *Downloader, delegationTarget server.
 	// Reserving non-name spec for aggregator's Spec.
 	s.addLocalSpec(aggregatorOpenAPISpec, nil, fmt.Sprintf(localDelegateChainNamePattern, i), "")
 	i++
+
+	aggregatedGroups := make(map[string]*spec3.OpenAPI)
+
 	for delegate := delegationTarget; delegate != nil; delegate = delegate.NextDelegate() {
 		handler := delegate.UnprotectedHandler()
 		if handler == nil {
@@ -107,6 +122,16 @@ func BuildAndRegisterAggregator(downloader *Downloader, delegationTarget server.
 		if delegateSpec == nil {
 			continue
 		}
+
+		groups, err := downloader.DownloadV3(handler, "")
+		if err != nil {
+			return nil, err
+		}
+
+		for group, spec := range groups {
+			aggregatedGroups[group] = spec
+		}
+
 		s.addLocalSpec(delegateSpec, handler, fmt.Sprintf(localDelegateChainNamePattern, i), etag)
 		i++
 	}
@@ -132,7 +157,23 @@ func BuildAndRegisterAggregator(downloader *Downloader, delegationTarget server.
 	}
 	err = s.openAPIVersionedService.RegisterOpenAPIVersionedService("/openapi/v2", pathHandler)
 	if err != nil {
-		return nil, err
+		klog.Fatalf("Failed to register versioned open api spec for root: %v", err)
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.OpenAPIV3) {
+		s.openAPIV3VersionedService, err = handler3.NewOpenAPIService(nil)
+		if err != nil {
+			return nil, err
+		}
+		err = s.openAPIV3VersionedService.RegisterOpenAPIV3VersionedService("/openapi/v3", pathHandler)
+		if err != nil {
+			return nil, err
+		}
+		for group, spec := range aggregatedGroups {
+			if spec != nil {
+				s.openAPIV3VersionedService.UpdateGroupVersion(group, spec)
+			}
+		}
 	}
 
 	return s, nil
@@ -147,6 +188,9 @@ type specAggregator struct {
 
 	// provided for dynamic OpenAPI spec
 	openAPIVersionedService *handler.OpenAPIService
+
+	// provided for dynamic OpenAPI spec
+	openAPIV3VersionedService *handler3.OpenAPIService
 }
 
 var _ SpecAggregator = &specAggregator{}
