@@ -1,0 +1,31 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Kubernetes",
+    "version": "v1.23.0"
+  },
+  "paths": {
+    "/logs/": {
+      "get": {
+        "responses": {}
+      }
+    },
+    "/logs/{logpath}": {
+      "get": {
+        "responses": {}
+      },
+      "parameters": [
+        {
+          "name": "logpath",
+          "in": "path",
+          "description": "path to the log",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ]
+    }
+  },
+  "components": {}
+}
