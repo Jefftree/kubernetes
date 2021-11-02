@@ -36,13 +36,13 @@ import (
 	"k8s.io/kube-openapi/pkg/handler"
 	"k8s.io/kube-openapi/pkg/handler3"
 	"k8s.io/kube-openapi/pkg/validation/spec"
-	// "k8s.io/kube-openapi/pkg/spec3"
+	"k8s.io/kube-openapi/pkg/spec3"
 )
 
 // SpecAggregator calls out to http handlers of APIServices and merges specs. It keeps state of the last
 // known specs including the http etag.
 type SpecAggregator interface {
-	UpdateGroups(map[string][]byte)
+	UpdateGroups(map[string]*spec3.OpenAPI)
 	AddUpdateAPIService(handler http.Handler, apiService *v1.APIService) error
 	UpdateAPIServiceSpec(apiServiceName string, spec *spec.Swagger, etag string) error
 	RemoveAPIServiceSpec(apiServiceName string) error
@@ -76,11 +76,8 @@ func (s *specAggregator) GetAPIServiceNames() []string {
 	return names
 }
 
-func (s *specAggregator) UpdateGroups(groupSpecs map[string][]byte) {
+func (s *specAggregator) UpdateGroups(groupSpecs map[string]*spec3.OpenAPI) {
 	for group, spec := range groupSpecs {
-		if len(spec) == 0 {
-			continue
-		}
 		s.openAPIV3VersionedService.UpdateGroupVersion(group, spec)
 	}
 }
@@ -103,7 +100,7 @@ func BuildAndRegisterAggregator(downloader *Downloader, delegationTarget server.
 	s.addLocalSpec(aggregatorOpenAPISpec, nil, fmt.Sprintf(localDelegateChainNamePattern, i), "")
 	i++
 
-	aggregatedGroups := make(map[string][]byte)
+	aggregatedGroups := make(map[string]*spec3.OpenAPI)
 
 	for delegate := delegationTarget; delegate != nil; delegate = delegate.NextDelegate() {
 		handler := delegate.UnprotectedHandler()
@@ -167,7 +164,7 @@ func BuildAndRegisterAggregator(downloader *Downloader, delegationTarget server.
 		return nil, err
 	}
 	for group, spec := range aggregatedGroups {
-		if len(spec) > 0 {
+		if spec != nil {
 			s.openAPIV3VersionedService.UpdateGroupVersion(group, spec)
 		}
 	}

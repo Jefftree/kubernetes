@@ -32,6 +32,7 @@ import (
 	"k8s.io/apiextensions-apiserver/pkg/controller/finalizer"
 	"k8s.io/apiextensions-apiserver/pkg/controller/nonstructuralschema"
 	openapicontroller "k8s.io/apiextensions-apiserver/pkg/controller/openapi"
+	openapiv3controller "k8s.io/apiextensions-apiserver/pkg/controller/openapiv3"
 	"k8s.io/apiextensions-apiserver/pkg/controller/status"
 	"k8s.io/apiextensions-apiserver/pkg/registry/customresourcedefinition"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -218,6 +219,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		crdHandler,
 	)
 	openapiController := openapicontroller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
+	openapiv3Controller := openapiv3controller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
 
 	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-informers", func(context genericapiserver.PostStartHookContext) error {
 		s.Informers.Start(context.StopCh)
@@ -229,7 +231,8 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		// choose to not enable OpenAPI by having null openAPIConfig, and thus OpenAPIVersionedService
 		// and StaticOpenAPISpec are both null. In that case we don't run the CRD OpenAPI controller.
 		if s.GenericAPIServer.OpenAPIVersionedService != nil && s.GenericAPIServer.StaticOpenAPISpec != nil {
-			go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpec, s.GenericAPIServer.OpenAPIVersionedService, s.GenericAPIServer.OpenAPIV3VersionedService, context.StopCh)
+			go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpec, s.GenericAPIServer.OpenAPIVersionedService, context.StopCh)
+			go openapiv3Controller.Run(s.GenericAPIServer.StaticOpenAPISpec, s.GenericAPIServer.OpenAPIV3VersionedService, context.StopCh)
 		}
 
 		go namingController.Run(context.StopCh)

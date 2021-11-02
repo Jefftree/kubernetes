@@ -25,7 +25,7 @@ import (
 	utiljson "k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/endpoints/request"
-	// "k8s.io/kube-openapi/pkg/spec3"
+	"k8s.io/kube-openapi/pkg/spec3"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 )
 
@@ -103,11 +103,11 @@ func (s *Downloader) Download(handler http.Handler, etag string) (returnSpec *sp
 	}
 }
 
-type Thing struct {
+type gvList struct {
 	Paths []string `json:"Paths"`
 }
 
-func (s *Downloader) DownloadV3(handler http.Handler, etag string) (returnSpec map[string][]byte, err error) {
+func (s *Downloader) DownloadV3(handler http.Handler, etag string) (returnSpec map[string]*spec3.OpenAPI, err error) {
 	// TODO: ETag caching needs to be done per group/version rather than per apiservice
 	handler = s.handlerWithUser(handler, &user.DefaultInfo{Name: aggregatorUser})
 	handler = http.TimeoutHandler(handler, specDownloadTimeout, "request timed out")
@@ -131,12 +131,12 @@ func (s *Downloader) DownloadV3(handler http.Handler, etag string) (returnSpec m
 		// Gracefully skip 404, assuming the server won't provide any spec
 		return nil, nil
 	case http.StatusOK:
-		groups := &Thing{}
-		if err := jsoniter.ConfigCompatibleWithStandardLibrary.Unmarshal(writer.data, groups); err != nil {
+		groups := gvList{}
+		if err := json.Unmarshal(writer.data, &groups); err != nil {
 			return nil, err
 		}
 
-		aggregated := make(map[string][]byte)
+		aggregated := make(map[string]*spec3.OpenAPI)
 
 		for _, path := range groups.Paths {
 			reqPath := fmt.Sprintf("/openapi/v3/%s", path)
@@ -147,11 +147,17 @@ func (s *Downloader) DownloadV3(handler http.Handler, etag string) (returnSpec m
 			req.Header.Add("Accept", "application/json")
 			openAPIWriter := newInMemoryResponseWriter()
 			handler.ServeHTTP(openAPIWriter, req)
-			aggregated[path] = openAPIWriter.data
+			var spec spec3.OpenAPI
+			// TODO|jefftree: For OpenAPI v3 Beta, if the v3 spec is empty then
+			// we should request the v2 endpoint and convert it to v3
+			if len(openAPIWriter.data) > 0 {
+				err = json.Unmarshal(openAPIWriter.data, &spec)
+				if err != nil {
+					return nil, err
+				}
+				aggregated[path] = &spec
+			}
 		}
-
-
-
 
 		// newEtag = writer.Header().Get("Etag")
 		// if len(newEtag) == 0 {

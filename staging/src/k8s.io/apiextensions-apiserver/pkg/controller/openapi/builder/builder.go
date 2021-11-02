@@ -87,6 +87,9 @@ type Options struct {
 	// Convert to OpenAPI v2.
 	V2 bool
 
+	// Used only by Server Side Apply. Create a V2 schema that includes fields from OpenAPI V3 for SSA to make better decisions
+	OverridePruneV2Fields bool
+
 	// Strip value validation.
 	StripValueValidation bool
 
@@ -133,7 +136,7 @@ func generateBuilder(crd *apiextensionsv1.CustomResourceDefinition, version stri
 	// comes from function registerResourceHandlers() in k8s.io/apiserver.
 	// Alternatives are either (ideally) refactoring registerResourceHandlers() to
 	// reuse the code, or faking an APIInstaller for CR to feed to registerResourceHandlers().
-	b := newBuilder(crd, version, schema, opts.V2)
+	b := newBuilder(crd, version, schema, opts)
 
 	// Sample response types for building web service
 	sample := &CRDCanonicalTypeNamer{
@@ -383,25 +386,26 @@ func (b *builder) buildRoute(root, path, httpMethod, actionVerb, operationVerb s
 
 // buildKubeNative builds input schema with Kubernetes' native object meta, type meta and
 // extensions
-func (b *builder) buildKubeNative(schema *structuralschema.Structural, v2 bool, crdPreserveUnknownFields bool) (ret *spec.Schema) {
+func (b *builder) buildKubeNative(schema *structuralschema.Structural, opts Options, crdPreserveUnknownFields bool) (ret *spec.Schema) {
 	// only add properties if we have a schema. Otherwise, kubectl would (wrongly) assume additionalProperties=false
 	// and forbid anything outside of apiVersion, kind and metadata. We have to fix kubectl to stop doing this, e.g. by
 	// adding additionalProperties=true support to explicitly allow additional fields.
 	// TODO: fix kubectl to understand additionalProperties=true
-	if schema == nil || (v2 && (schema.XPreserveUnknownFields || crdPreserveUnknownFields)) {
+	if schema == nil || ((opts.V2 && !opts.OverridePruneV2Fields) && (schema.XPreserveUnknownFields || crdPreserveUnknownFields)) {
 		ret = &spec.Schema{
 			SchemaProps: spec.SchemaProps{Type: []string{"object"}},
 		}
 		// no, we cannot add more properties here, not even TypeMeta/ObjectMeta because kubectl will complain about
 		// unknown fields for anything else.
 	} else {
-		if v2 {
+		if opts.V2 && !opts.OverridePruneV2Fields {
 			schema = openapiv2.ToStructuralOpenAPIV2(schema)
 		}
+
 		ret = schema.ToKubeOpenAPI()
-		ret.SetProperty("metadata", *spec.RefSchema(translateRefIfNeeded(objectMetaSchemaRef, v2)).WithDescription(swaggerPartialObjectMetadataDescriptions["metadata"]))
-		addTypeMetaProperties(ret, v2)
-		addEmbeddedProperties(ret, v2)
+		ret.SetProperty("metadata", *spec.RefSchema(translateRefIfNeeded(objectMetaSchemaRef, opts.V2)).WithDescription(swaggerPartialObjectMetadataDescriptions["metadata"]))
+		addTypeMetaProperties(ret, opts.V2)
+		addEmbeddedProperties(ret, opts)
 	}
 	ret.AddExtension(endpoints.ROUTE_META_GVK, []interface{}{
 		map[string]interface{}{
@@ -414,36 +418,36 @@ func (b *builder) buildKubeNative(schema *structuralschema.Structural, v2 bool, 
 	return ret
 }
 
-func addEmbeddedProperties(s *spec.Schema, v2 bool) {
+func addEmbeddedProperties(s *spec.Schema, opts Options) {
 	if s == nil {
 		return
 	}
 
 	for k := range s.Properties {
 		v := s.Properties[k]
-		addEmbeddedProperties(&v, v2)
+		addEmbeddedProperties(&v, opts)
 		s.Properties[k] = v
 	}
 	if s.Items != nil {
-		addEmbeddedProperties(s.Items.Schema, v2)
+		addEmbeddedProperties(s.Items.Schema, opts)
 	}
 	if s.AdditionalProperties != nil {
-		addEmbeddedProperties(s.AdditionalProperties.Schema, v2)
+		addEmbeddedProperties(s.AdditionalProperties.Schema, opts)
 	}
 
-	if isTrue, ok := s.VendorExtensible.Extensions.GetBool("x-kubernetes-preserve-unknown-fields"); ok && isTrue && v2 {
+	if isTrue, ok := s.VendorExtensible.Extensions.GetBool("x-kubernetes-preserve-unknown-fields"); ok && isTrue && opts.V2 && !opts.OverridePruneV2Fields {
 		// don't add metadata properties if we're publishing to openapi v2 and are allowing unknown fields.
 		// adding these metadata properties makes kubectl refuse to validate unknown fields.
 		return
 	}
 	if isTrue, ok := s.VendorExtensible.Extensions.GetBool("x-kubernetes-embedded-resource"); ok && isTrue {
-		s.SetProperty("apiVersion", withDescription(getDefinition(typeMetaType, v2).SchemaProps.Properties["apiVersion"],
+		s.SetProperty("apiVersion", withDescription(getDefinition(typeMetaType, opts.V2).SchemaProps.Properties["apiVersion"],
 			"apiVersion defines the versioned schema of this representation of an object. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
 		))
-		s.SetProperty("kind", withDescription(getDefinition(typeMetaType, v2).SchemaProps.Properties["kind"],
+		s.SetProperty("kind", withDescription(getDefinition(typeMetaType, opts.V2).SchemaProps.Properties["kind"],
 			"kind is a string value representing the type of this object. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
 		))
-		s.SetProperty("metadata", *spec.RefSchema(translateRefIfNeeded(objectMetaSchemaRef, v2)).WithDescription(swaggerPartialObjectMetadataDescriptions["metadata"]))
+		s.SetProperty("metadata", *spec.RefSchema(translateRefIfNeeded(objectMetaSchemaRef, opts.V2)).WithDescription(swaggerPartialObjectMetadataDescriptions["metadata"]))
 
 		req := sets.NewString(s.Required...)
 		if !req.Has("kind") {
@@ -543,7 +547,7 @@ func (b *builder) getOpenAPIConfig(v2 bool) *common.Config {
 	}
 }
 
-func newBuilder(crd *apiextensionsv1.CustomResourceDefinition, version string, schema *structuralschema.Structural, v2 bool) *builder {
+func newBuilder(crd *apiextensionsv1.CustomResourceDefinition, version string, schema *structuralschema.Structural, opts Options) *builder {
 	b := &builder{
 		schema: &spec.Schema{
 			SchemaProps: spec.SchemaProps{Type: []string{"object"}},
@@ -562,8 +566,8 @@ func newBuilder(crd *apiextensionsv1.CustomResourceDefinition, version string, s
 	}
 
 	// Pre-build schema with Kubernetes native properties
-	b.schema = b.buildKubeNative(schema, v2, crd.Spec.PreserveUnknownFields)
-	b.listSchema = b.buildListSchema(v2)
+	b.schema = b.buildKubeNative(schema, opts, crd.Spec.PreserveUnknownFields)
+	b.listSchema = b.buildListSchema(opts.V2)
 
 	return b
 }

@@ -17,7 +17,6 @@ limitations under the License.
 package routes
 
 import (
-	"encoding/json"
 	"strings"
 	restful "github.com/emicklei/go-restful"
 	"k8s.io/klog/v2"
@@ -102,8 +101,7 @@ func (oa OpenAPI) InstallV3(c *restful.Container, mux *mux.PathRecorderMux) (*ha
 
 	for x, y := range grouped {
 		sc,_ := builder3.BuildOpenAPISpec(y, oa.Config)
-		a, _ := json.Marshal(sc)
-		openAPIVersionedService.UpdateGroupVersion(x, a)
+		openAPIVersionedService.UpdateGroupVersion(x, sc)
 	}
 
 	return openAPIVersionedService, spec

@@ -46,36 +46,42 @@ func TestNewBuilder(t *testing.T) {
 		wantedItemsSchema string
 
 		v2 bool // produce OpenAPIv2
+		v2StripFieldsOverride bool // Produces OpenAPI v2 without stripping OpenAPI v3 fields
 	}{
 		{
 			"nil",
 			"",
 			`{"type":"object","x-kubernetes-group-version-kind":[{"group":"bar.k8s.io","kind":"Foo","version":"v1"}]}`, `{"$ref":"#/definitions/io.k8s.bar.v1.Foo"}`,
 			true,
+			false,
 		},
 		{"with properties",
 			`{"type":"object","properties":{"spec":{"type":"object"},"status":{"type":"object"}}}`,
 			`{"type":"object","properties":{"apiVersion":{"type":"string"},"kind":{"type":"string"},"metadata":{"$ref":"#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"},"spec":{"type":"object"},"status":{"type":"object"}},"x-kubernetes-group-version-kind":[{"group":"bar.k8s.io","kind":"Foo","version":"v1"}]}`,
 			`{"$ref":"#/definitions/io.k8s.bar.v1.Foo"}`,
 			true,
+			false,
 		},
 		{"type only",
 			`{"type":"object"}`,
 			`{"type":"object","properties":{"apiVersion":{"type":"string"},"kind":{"type":"string"},"metadata":{"$ref":"#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"}},"x-kubernetes-group-version-kind":[{"group":"bar.k8s.io","kind":"Foo","version":"v1"}]}`,
 			`{"$ref":"#/definitions/io.k8s.bar.v1.Foo"}`,
 			true,
+			false,
 		},
 		{"preserve unknown at root v2",
 			`{"type":"object","x-kubernetes-preserve-unknown-fields":true}`,
 			`{"type":"object","x-kubernetes-group-version-kind":[{"group":"bar.k8s.io","kind":"Foo","version":"v1"}]}`,
 			`{"$ref":"#/definitions/io.k8s.bar.v1.Foo"}`,
 			true,
+			false,
 		},
 		{"preserve unknown at root v3",
 			`{"type":"object","x-kubernetes-preserve-unknown-fields":true}`,
 			`{"type":"object","x-kubernetes-preserve-unknown-fields":true,"properties":{"apiVersion":{"type":"string"},"kind":{"type":"string"},"metadata":{"$ref":"#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"}},"x-kubernetes-group-version-kind":[{"group":"bar.k8s.io","kind":"Foo","version":"v1"}]}`,
 			`{"$ref":"#/definitions/io.k8s.bar.v1.Foo"}`,
-			false,
+			true,
+			true,
 		},
 		{"with extensions",
 			`
@@ -179,6 +185,7 @@ func TestNewBuilder(t *testing.T) {
 }`,
 			`{"$ref":"#/definitions/io.k8s.bar.v1.Foo"}`,
 			true,
+			false,
 		},
 		{"with extensions as v3 schema",
 			`
@@ -344,7 +351,8 @@ func TestNewBuilder(t *testing.T) {
   "x-kubernetes-group-version-kind":[{"group":"bar.k8s.io","kind":"Foo","version":"v1"}]
 }`,
 			`{"$ref":"#/definitions/io.k8s.bar.v1.Foo"}`,
-			false,
+			true,
+			true,
 		},
 	}
 	for _, tt := range tests {
@@ -384,7 +392,7 @@ func TestNewBuilder(t *testing.T) {
 					},
 					Scope: apiextensionsv1.NamespaceScoped,
 				},
-			}, "v1", schema, tt.v2)
+			}, "v1", schema, Options{V2: tt.v2, OverridePruneV2Fields: tt.v2StripFieldsOverride})
 
 			var wantedSchema, wantedItemsSchema spec.Schema
 			if err := json.Unmarshal([]byte(tt.wantedSchema), &wantedSchema); err != nil {
@@ -622,7 +630,7 @@ func TestBuildSwagger(t *testing.T) {
 			`{"type":"object","properties":{"foo":{"type":"string","oneOf":[{"pattern":"a"},{"pattern":"b"}]}}}`,
 			nil,
 			`{"type":"object","properties":{"apiVersion":{"type":"string"},"kind":{"type":"string"},"metadata":{"$ref":"#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"},"foo":{"type":"string","oneOf":[{"pattern":"a"},{"pattern":"b"}]}},"x-kubernetes-group-version-kind":[{"group":"bar.k8s.io","kind":"Foo","version":"v1"}]}`,
-			Options{V2: false},
+			Options{V2: true, OverridePruneV2Fields: true},
 		},
 	}
 	for _, tt := range tests {
