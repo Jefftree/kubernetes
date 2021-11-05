@@ -32,9 +32,9 @@ import (
 	"github.com/golang/protobuf/proto"
 	openapi_v3 "github.com/googleapis/gnostic/openapiv3"
 	"github.com/munnerz/goautoneg"
+	"k8s.io/kube-openapi/pkg/spec3"
 	"k8s.io/kube-openapi/pkg/common"
 	"k8s.io/kube-openapi/pkg/validation/spec"
-	"k8s.io/kube-openapi/pkg/spec3"
 )
 
 const (
