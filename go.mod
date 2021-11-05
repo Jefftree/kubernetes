@@ -87,19 +87,19 @@ require (
 	go.opentelemetry.io/proto/otlp v0.7.0
 	golang.org/x/crypto v0.0.0-20210817164053-32db794688a5
 	golang.org/x/exp v0.0.0-20210220032938-85be41e4509f // indirect
-	golang.org/x/net v0.0.0-20210813160813-60bc85c4be6d
+	golang.org/x/net v0.0.0-20210825183410-e898025ed96a
 	golang.org/x/oauth2 v0.0.0-20210819190943-2bc19b11175f
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20210820121016-41cdb8703e55
+	golang.org/x/sys v0.0.0-20210831042530-f4d43177bf5e
 	golang.org/x/term v0.0.0-20210615171337-6886f2dfbf5b
 	golang.org/x/time v0.0.0-20210723032227-1f47c861a9ac
 	golang.org/x/tools v0.1.6-0.20210820212750-d4cc65f0b2ff
 	gonum.org/v1/gonum v0.6.2
 	gonum.org/v1/netlib v0.0.0-20190331212654-76723241ea4e // indirect
 	google.golang.org/api v0.46.0
-	google.golang.org/genproto v0.0.0-20210602131652-f16073e35f0c
-	google.golang.org/grpc v1.38.0
-	google.golang.org/protobuf v1.26.0
+	google.golang.org/genproto v0.0.0-20210831024726-fe130286e0e2
+	google.golang.org/grpc v1.40.0
+	google.golang.org/protobuf v1.27.1
 	gopkg.in/gcfg.v1 v1.2.0
 	gopkg.in/square/go-jose.v2 v2.2.2
 	gopkg.in/yaml.v2 v2.4.0
@@ -121,7 +121,7 @@ require (
 	k8s.io/klog/v2 v2.30.0
 	k8s.io/kube-aggregator v0.0.0
 	k8s.io/kube-controller-manager v0.0.0
-	k8s.io/kube-openapi v0.0.0-20210817084001-7fbd8d59e5b8
+	k8s.io/kube-openapi v0.0.1
 	k8s.io/kube-proxy v0.0.0
 	k8s.io/kube-scheduler v0.0.0
 	k8s.io/kubectl v0.0.0
@@ -168,6 +168,7 @@ replace (
 	github.com/PuerkitoBio/urlesc => github.com/PuerkitoBio/urlesc v0.0.0-20170810143723-de5bf2ad4578
 	github.com/ajstarks/svgo => github.com/ajstarks/svgo v0.0.0-20180226025133-644b8db467af
 	github.com/antihax/optional => github.com/antihax/optional v1.0.0
+	github.com/antlr/antlr4/runtime/Go/antlr => github.com/antlr/antlr4/runtime/Go/antlr v0.0.0-20210826220005-b48c857c3a0e
 	github.com/armon/circbuf => github.com/armon/circbuf v0.0.0-20150827004946-bbbad097214e
 	github.com/armon/go-metrics => github.com/armon/go-metrics v0.0.0-20180917152333-f0300d1749da
 	github.com/armon/go-radix => github.com/armon/go-radix v0.0.0-20180808171621-7fddfc383310
@@ -238,6 +239,7 @@ replace (
 	github.com/frankban/quicktest => github.com/frankban/quicktest v1.11.3
 	github.com/fsnotify/fsnotify => github.com/fsnotify/fsnotify v1.4.9
 	github.com/fvbommel/sortorder => github.com/fvbommel/sortorder v1.0.1
+	github.com/getkin/kin-openapi => github.com/getkin/kin-openapi v0.76.0
 	github.com/getsentry/raven-go => github.com/getsentry/raven-go v0.2.0
 	github.com/ghodss/yaml => github.com/ghodss/yaml v1.0.0
 	github.com/go-errors/errors => github.com/go-errors/errors v1.0.1
@@ -263,6 +265,8 @@ replace (
 	github.com/golangplus/testing => github.com/golangplus/testing v0.0.0-20180327235837-af21d9c3145e
 	github.com/google/btree => github.com/google/btree v1.0.1
 	github.com/google/cadvisor => github.com/google/cadvisor v0.39.2
+	github.com/google/cel-go => github.com/google/cel-go v0.9.0
+	github.com/google/cel-spec => github.com/google/cel-spec v0.6.0
 	github.com/google/go-cmp => github.com/google/go-cmp v0.5.5
 	github.com/google/gofuzz => github.com/google/gofuzz v1.1.0
 	github.com/google/martian/v3 => github.com/google/martian/v3 v3.1.0
@@ -496,7 +500,7 @@ replace (
 	k8s.io/klog/v2 => k8s.io/klog/v2 v2.30.0
 	k8s.io/kube-aggregator => ./staging/src/k8s.io/kube-aggregator
 	k8s.io/kube-controller-manager => ./staging/src/k8s.io/kube-controller-manager
-	k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20210817084001-7fbd8d59e5b8
+	k8s.io/kube-openapi => github.com/jefftree/kube-openapi v0.0.1
 	k8s.io/kube-proxy => ./staging/src/k8s.io/kube-proxy
 	k8s.io/kube-scheduler => ./staging/src/k8s.io/kube-scheduler
 	k8s.io/kubectl => ./staging/src/k8s.io/kubectl

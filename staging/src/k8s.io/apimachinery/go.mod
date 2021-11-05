@@ -23,18 +23,26 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/spf13/pflag v1.0.5
 	github.com/stretchr/testify v1.7.0
-	golang.org/x/net v0.0.0-20210813160813-60bc85c4be6d
-	golang.org/x/sys v0.0.0-20210820121016-41cdb8703e55 // indirect
+	golang.org/x/net v0.0.0-20210825183410-e898025ed96a
 	gopkg.in/check.v1 v1.0.0-20200227125254-8fa46927fb4f // indirect
 	gopkg.in/inf.v0 v0.9.1
 	gopkg.in/yaml.v2 v2.4.0 // indirect
-	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b // indirect
 	k8s.io/klog/v2 v2.30.0
-	k8s.io/kube-openapi v0.0.0-20210817084001-7fbd8d59e5b8
+	k8s.io/kube-openapi v0.0.1
 	k8s.io/utils v0.0.0-20210930125809-cb0fa318a74b
 	sigs.k8s.io/json v0.0.0-20211020170558-c049b76a60c6
 	sigs.k8s.io/structured-merge-diff/v4 v4.2.0
 	sigs.k8s.io/yaml v1.2.0
 )
 
-replace k8s.io/apimachinery => ../apimachinery
+replace (
+	github.com/golang/glog => github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b
+	golang.org/x/net => golang.org/x/net v0.0.0-20210813160813-60bc85c4be6d
+	golang.org/x/sys => golang.org/x/sys v0.0.0-20210820121016-41cdb8703e55
+	golang.org/x/text => golang.org/x/text v0.3.6
+	google.golang.org/genproto => google.golang.org/genproto v0.0.0-20210602131652-f16073e35f0c
+	google.golang.org/grpc => google.golang.org/grpc v1.38.0
+	google.golang.org/protobuf => google.golang.org/protobuf v1.26.0
+	k8s.io/apimachinery => ../apimachinery
+	k8s.io/kube-openapi => github.com/jefftree/kube-openapi v0.0.1
+)
