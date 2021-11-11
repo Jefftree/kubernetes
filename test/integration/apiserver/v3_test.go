@@ -20,13 +20,14 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
+	"reflect"
 	"testing"
 
 	genericfeatures "k8s.io/apiserver/pkg/features"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	restclient "k8s.io/client-go/rest"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	"k8s.io/kube-openapi/pkg/validation/spec"
+	"k8s.io/kube-openapi/pkg/spec3"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
@@ -54,9 +55,21 @@ func TestOpenAPIV3Spec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	spec := &spec.Swagger{}
-	err = json.Unmarshal(bs, spec)
+	var firstSpec spec3.OpenAPI
+	err = json.Unmarshal(bs, &firstSpec)
 	if err != nil {
 		t.Fatal(err)
+	}
+	specBytes, err := json.Marshal(&firstSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondSpec spec3.OpenAPI
+	err = json.Unmarshal(specBytes, &secondSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(firstSpec, secondSpec) {
+		t.Fatal("spec mismatch")
 	}
 }
