@@ -26,6 +26,7 @@ import (
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/kubectl/pkg/util/openapi"
 	"k8s.io/kubectl/pkg/validation"
+	openapi_v3 "github.com/googleapis/gnostic/openapiv3"
 )
 
 // Factory provides abstractions that allow the Kubectl command to be extended across multiple types
@@ -66,4 +67,10 @@ type Factory interface {
 	OpenAPISchema() (openapi.Resources, error)
 	// OpenAPIGetter returns a getter for the openapi schema document
 	OpenAPIGetter() discovery.OpenAPISchemaInterface
+
+	// OpenAPIV3Discovery returns the list of paths for OpenAPI V3 documents
+	OpenAPIV3Discovery() (*discovery.OpenAPIV3Discovery, error)
+
+	// OpenAPIV3GroupVersionSchema returns the OpenAPI V3 schema for the corresponding group version
+	OpenAPIV3GroupVersionSchema(path, hash string) (*openapi_v3.Document, error)
 }

@@ -23,6 +23,7 @@ import (
 	"syscall"
 
 	openapi_v2 "github.com/googleapis/gnostic/openapiv2"
+	openapi_v3 "github.com/googleapis/gnostic/openapiv3"
 
 	errorsutil "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -147,6 +148,14 @@ func (d *memCacheClient) ServerVersion() (*version.Info, error) {
 
 func (d *memCacheClient) OpenAPISchema() (*openapi_v2.Document, error) {
 	return d.delegate.OpenAPISchema()
+}
+
+func (d *memCacheClient) OpenAPIV3Schema(path, hash string) (*openapi_v3.Document, error) {
+	return d.delegate.OpenAPIV3Schema(path, hash)
+}
+
+func (d *memCacheClient) OpenAPIV3Discovery() (*discovery.OpenAPIV3Discovery, error) {
+	return d.delegate.OpenAPIV3Discovery()
 }
 
 func (d *memCacheClient) Fresh() bool {

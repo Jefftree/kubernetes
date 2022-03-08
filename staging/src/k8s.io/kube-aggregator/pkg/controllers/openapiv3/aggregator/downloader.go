@@ -45,7 +45,7 @@ func (s *Downloader) handlerWithUser(handler http.Handler, info user.Info) http.
 
 // gvList is a struct for the response of the /openapi/v3 endpoint to unmarshal into
 type gvList struct {
-	Paths []string `json:"Paths"`
+	Paths map[string]string `json:"Paths"`
 }
 
 // SpecETag is a OpenAPI v3 spec and etag pair for the endpoint of each OpenAPI group/version
@@ -81,7 +81,7 @@ func (s *Downloader) Download(handler http.Handler, etagList map[string]string) 
 		if err := json.Unmarshal(writer.data, &groups); err != nil {
 			return nil, err
 		}
-		for _, path := range groups.Paths {
+		for path, _ := range groups.Paths {
 			reqPath := fmt.Sprintf("/openapi/v3/%s", path)
 			req, err := http.NewRequest("GET", reqPath, nil)
 			if err != nil {

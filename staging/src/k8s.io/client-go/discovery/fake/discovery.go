@@ -21,6 +21,7 @@ import (
 	"net/http"
 
 	openapi_v2 "github.com/googleapis/gnostic/openapiv2"
+	openapi_v3 "github.com/googleapis/gnostic/openapiv3"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,6 +30,8 @@ import (
 	kubeversion "k8s.io/client-go/pkg/version"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/testing"
+
+	"k8s.io/client-go/discovery"
 )
 
 // FakeDiscovery implements discovery.DiscoveryInterface and sometimes calls testing.Fake.Invoke with an action,
@@ -159,6 +162,14 @@ func (c *FakeDiscovery) ServerVersion() (*version.Info, error) {
 // OpenAPISchema retrieves and parses the swagger API schema the server supports.
 func (c *FakeDiscovery) OpenAPISchema() (*openapi_v2.Document, error) {
 	return &openapi_v2.Document{}, nil
+}
+
+func (d *FakeDiscovery) OpenAPIV3Schema(path, hash string) (*openapi_v3.Document, error) {
+	return &openapi_v3.Document{}, nil
+}
+
+func (d *FakeDiscovery) OpenAPIV3Discovery() (*discovery.OpenAPIV3Discovery, error) {
+	return nil, nil
 }
 
 // RESTClient returns a RESTClient that is used to communicate with API server

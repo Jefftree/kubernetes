@@ -101,6 +101,7 @@ func (o *ExplainOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 

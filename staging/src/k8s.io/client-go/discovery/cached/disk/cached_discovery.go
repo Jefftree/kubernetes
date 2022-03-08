@@ -26,6 +26,7 @@ import (
 	"time"
 
 	openapi_v2 "github.com/googleapis/gnostic/openapiv2"
+	openapi_v3 "github.com/googleapis/gnostic/openapiv3"
 	"k8s.io/klog/v2"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -238,6 +239,15 @@ func (d *CachedDiscoveryClient) ServerVersion() (*version.Info, error) {
 // OpenAPISchema retrieves and parses the swagger API schema the server supports.
 func (d *CachedDiscoveryClient) OpenAPISchema() (*openapi_v2.Document, error) {
 	return d.delegate.OpenAPISchema()
+}
+
+// OpenAPISchema retrieves and parses the swagger API schema the server supports.
+func (d *CachedDiscoveryClient) OpenAPIV3Schema(path, hash string) (*openapi_v3.Document, error) {
+	return d.delegate.OpenAPIV3Schema(path, hash)
+}
+
+func (d *CachedDiscoveryClient) OpenAPIV3Discovery() (*discovery.OpenAPIV3Discovery, error) {
+	return d.delegate.OpenAPIV3Discovery()
 }
 
 // Fresh is supposed to tell the caller whether or not to retry if the cache

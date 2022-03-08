@@ -37,6 +37,11 @@ import (
 	"k8s.io/kube-openapi/pkg/validation/spec"
 )
 
+type OpenAPIV3Discovery struct {
+	Paths map[string]string
+}
+
+
 const (
 	jsonExt = ".json"
 
@@ -83,6 +88,14 @@ func computeETag(data []byte) string {
 	return fmt.Sprintf("\"%X\"", sha512.Sum512(data))
 }
 
+// unquoteETag removes the "" quotes around a generated ETag
+func unquoteETag(etag string) string {
+	if len(etag) < 2 {
+		return etag
+	}
+	return etag[1:len(etag)-1]
+}
+
 // NewOpenAPIService builds an OpenAPIService starting with the given spec.
 func NewOpenAPIService(spec *spec.Swagger) (*OpenAPIService, error) {
 	o := &OpenAPIService{}
@@ -101,10 +114,11 @@ func (o *OpenAPIService) getGroupBytes() ([]byte, error) {
 	}
 
 	sort.Strings(keys)
-	group := make(map[string][]string)
-	group["Paths"] = keys
-
-	j, err := json.Marshal(group)
+	discovery := &OpenAPIV3Discovery{Paths: make(map[string]string)}
+	for k, v := range o.v3Schema {
+		discovery.Paths[k] = "/openapi/v3/" + k + "?hash=" + unquoteETag(v.specBytesETag)
+	}
+	j, err := json.Marshal(discovery)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +135,7 @@ func (o *OpenAPIService) getSingleGroupBytes(getType string, group string) ([]by
 	if getType == subTypeJSON {
 		return v.specBytes, v.specBytesETag, v.lastModified, nil
 	} else if getType == subTypeProtobuf {
-		return v.specPb, v.specPbETag, v.lastModified, nil
+		return v.specPb, v.specBytesETag, v.lastModified, nil
 	}
 	return nil, "", time.Now(), fmt.Errorf("Invalid accept clause %s", getType)
 }
@@ -168,6 +182,18 @@ func (o *OpenAPIService) HandleDiscovery(w http.ResponseWriter, r *http.Request)
 	http.ServeContent(w, r, "/openapi/v3", time.Now(), bytes.NewReader(data))
 }
 
+func ApplyCacheBusting(w http.ResponseWriter, r *http.Request, etag string) {
+	hash := r.URL.Query().Get("hash")
+	if hash != "" {
+		if "\"" + hash + "\"" == etag {
+			w.Header().Set("Cache-Control", "public, immutable")
+			w.Header().Set("Expires", time.Now().AddDate(5, 0, 0).Format(time.RFC1123))
+		} else {
+			http.Redirect(w, r, r.URL.Path + "?hash=" + unquoteETag(etag), 301)
+		}
+	}
+}
+
 func (o *OpenAPIService) HandleGroupVersion(w http.ResponseWriter, r *http.Request) {
 	url := strings.SplitAfterN(r.URL.Path, "/", 4)
 	group := url[3]
@@ -204,6 +230,7 @@ func (o *OpenAPIService) HandleGroupVersion(w http.ResponseWriter, r *http.Reque
 				return
 			}
 			w.Header().Set("Etag", etag)
+			ApplyCacheBusting(w, r, etag)
 			http.ServeContent(w, r, "", lastModified, bytes.NewReader(data))
 			return
 		}

@@ -30,6 +30,7 @@ import (
 	//nolint:staticcheck // SA1019 Keep using module since it's still being maintained and the api of google.golang.org/protobuf/proto differs
 	"github.com/golang/protobuf/proto"
 	openapi_v2 "github.com/googleapis/gnostic/openapiv2"
+	openapi_v3 "github.com/googleapis/gnostic/openapiv3"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,7 +47,9 @@ const (
 	// defaultRetries is the number of times a resource discovery is repeated if an api group disappears on the fly (e.g. CustomResourceDefinitions).
 	defaultRetries = 2
 	// protobuf mime type
-	mimePb = "application/com.github.proto-openapi.spec.v2@v1.0+protobuf"
+	openAPIV2mimePb = "application/com.github.proto-openapi.spec.v2@v1.0+protobuf"
+
+	openAPIV3mimePb = "application/com.github.proto-openapi.spec.v3@v1.0+protobuf"
 	// defaultTimeout is the maximum amount of time per request when no timeout has been set on a RESTClient.
 	// Defaults to 32s in order to have a distinguishable length of time, relative to other timeouts that exist.
 	defaultTimeout = 32 * time.Second
@@ -60,6 +63,7 @@ type DiscoveryInterface interface {
 	ServerResourcesInterface
 	ServerVersionInterface
 	OpenAPISchemaInterface
+    OpenAPIV3SchemaInterface
 }
 
 // CachedDiscoveryInterface is a DiscoveryInterface with cache invalidation and freshness.
@@ -126,6 +130,11 @@ type ServerVersionInterface interface {
 type OpenAPISchemaInterface interface {
 	// OpenAPISchema retrieves and parses the swagger API schema the server supports.
 	OpenAPISchema() (*openapi_v2.Document, error)
+}
+
+type OpenAPIV3SchemaInterface interface {
+	OpenAPIV3Discovery() (*OpenAPIV3Discovery, error)
+	OpenAPIV3Schema(string, string) (*openapi_v3.Document, error)
 }
 
 // DiscoveryClient implements the functions that discover server-supported API groups,
@@ -420,9 +429,9 @@ func (d *DiscoveryClient) ServerVersion() (*version.Info, error) {
 	return &info, nil
 }
 
-// OpenAPISchema fetches the open api schema using a rest client and parses the proto.
+// OpenAPISchema fetches the open api v2 schema using a rest client and parses the proto.
 func (d *DiscoveryClient) OpenAPISchema() (*openapi_v2.Document, error) {
-	data, err := d.restClient.Get().AbsPath("/openapi/v2").SetHeader("Accept", mimePb).Do(context.TODO()).Raw()
+	data, err := d.restClient.Get().AbsPath("/openapi/v2").SetHeader("Accept", openAPIV2mimePb).Do(context.TODO()).Raw()
 	if err != nil {
 		if errors.IsForbidden(err) || errors.IsNotFound(err) || errors.IsNotAcceptable(err) {
 			// single endpoint not found/registered in old server, try to fetch old endpoint
@@ -442,6 +451,42 @@ func (d *DiscoveryClient) OpenAPISchema() (*openapi_v2.Document, error) {
 	}
 	return document, nil
 }
+
+
+type OpenAPIV3Discovery struct {
+	Paths map[string]string
+}
+
+
+func (d *DiscoveryClient) OpenAPIV3Discovery() (*OpenAPIV3Discovery, error) {
+	data, err := d.restClient.Get().AbsPath("/openapi/v3").Do(context.TODO()).Raw()
+	if err != nil {
+		return nil, err
+	}
+
+	foo := &OpenAPIV3Discovery{}
+	err = json.Unmarshal(data, foo)
+	if err != nil {
+		return nil, err
+	}
+
+	return foo, nil
+}
+
+func (d *DiscoveryClient) OpenAPIV3Schema(path, hash string) (*openapi_v3.Document, error) {
+	data, err := d.restClient.Get().AbsPath("/openapi/v3", path).Param("hash", hash).SetHeader("Accept", openAPIV3mimePb).Do(context.TODO()).Raw()
+	if err != nil {
+		return nil, err
+	}
+	document := &openapi_v3.Document{}
+	err = proto.Unmarshal(data, document)
+	if err != nil {
+		return nil, err
+	}
+
+	return document, nil
+}
+
 
 // withRetries retries the given recovery function in case the groups supported by the server change after ServerGroup() returns.
 func withRetries(maxRetries int, f func() ([]*metav1.APIGroup, []*metav1.APIResourceList, error)) ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {

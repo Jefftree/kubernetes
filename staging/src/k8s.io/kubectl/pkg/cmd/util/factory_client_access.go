@@ -34,6 +34,7 @@ import (
 	"k8s.io/kubectl/pkg/util/openapi"
 	openapivalidation "k8s.io/kubectl/pkg/util/openapi/validation"
 	"k8s.io/kubectl/pkg/validation"
+	openapi_v3 "github.com/googleapis/gnostic/openapiv3"
 )
 
 type factoryImpl struct {
@@ -185,4 +186,24 @@ func (f *factoryImpl) OpenAPIGetter() discovery.OpenAPISchemaInterface {
 	})
 
 	return f.openAPIGetter
+}
+
+func (f *factoryImpl) OpenAPIV3Discovery() (*discovery.OpenAPIV3Discovery, error) {
+	discovery, err := f.clientGetter.ToDiscoveryClient()
+	if err != nil {
+		return nil, err
+	}
+
+	foo, err := discovery.OpenAPIV3Discovery()
+	return foo, err
+}
+
+func (f *factoryImpl) OpenAPIV3GroupVersionSchema(path, hash string) (*openapi_v3.Document, error) {
+	discovery, err := f.clientGetter.ToDiscoveryClient()
+	if err != nil {
+		return nil, err
+	}
+
+	schema, err := discovery.OpenAPIV3Schema(path, hash)
+	return schema, err
 }
