@@ -24,4 +24,7 @@ require (
 	sigs.k8s.io/structured-merge-diff/v4 v4.2.1 // indirect
 )
 
-replace k8s.io/code-generator => ../code-generator
+replace (
+	google.golang.org/genproto => google.golang.org/genproto v0.0.0-20210831024726-fe130286e0e2
+	k8s.io/code-generator => ../code-generator
+)

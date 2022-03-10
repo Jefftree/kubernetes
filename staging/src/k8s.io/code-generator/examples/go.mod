@@ -18,3 +18,5 @@ replace (
 )
 
 replace sigs.k8s.io/json => github.com/liggitt/json v0.0.0-20211020163728-48258682683b
+
+replace github.com/google/gnostic => github.com/jefftree/gnostic v0.7.0

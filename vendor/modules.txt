@@ -1128,7 +1128,7 @@ google.golang.org/appengine/internal/modules
 google.golang.org/appengine/internal/remote_api
 google.golang.org/appengine/internal/urlfetch
 google.golang.org/appengine/urlfetch
-# google.golang.org/genproto v0.0.0-20210831024726-fe130286e0e2 => google.golang.org/genproto v0.0.0-20210831024726-fe130286e0e2
+# google.golang.org/genproto v0.0.0-20220107163113-42d7afdf6368 => google.golang.org/genproto v0.0.0-20210831024726-fe130286e0e2
 ## explicit
 google.golang.org/genproto/googleapis/api/annotations
 google.golang.org/genproto/googleapis/api/expr/v1alpha1
@@ -2457,6 +2457,7 @@ sigs.k8s.io/yaml
 # github.com/bketelsen/crypt => github.com/bketelsen/crypt v0.0.4
 # github.com/blang/semver => github.com/blang/semver v3.5.1+incompatible
 # github.com/boltdb/bolt => github.com/boltdb/bolt v1.3.1
+# github.com/buger/jsonparser => github.com/buger/jsonparser v1.1.1
 # github.com/census-instrumentation/opencensus-proto => github.com/census-instrumentation/opencensus-proto v0.2.1
 # github.com/certifi/gocertifi => github.com/certifi/gocertifi v0.0.0-20200922220541-2c3bb06c6054
 # github.com/cespare/xxhash => github.com/cespare/xxhash v1.1.0
@@ -2509,6 +2510,7 @@ sigs.k8s.io/yaml
 # github.com/fatih/camelcase => github.com/fatih/camelcase v1.0.0
 # github.com/fatih/color => github.com/fatih/color v1.7.0
 # github.com/felixge/httpsnoop => github.com/felixge/httpsnoop v1.0.1
+# github.com/flowstack/go-jsonschema => github.com/flowstack/go-jsonschema v0.1.1
 # github.com/flynn/go-shlex => github.com/flynn/go-shlex v0.0.0-20150515145356-3f9db97f8568
 # github.com/fogleman/gg => github.com/fogleman/gg v1.2.1-0.20190220221249-0403632d5b90
 # github.com/form3tech-oss/jwt-go => github.com/form3tech-oss/jwt-go v3.2.3+incompatible
@@ -2543,6 +2545,7 @@ sigs.k8s.io/yaml
 # github.com/google/cadvisor => github.com/google/cadvisor v0.43.0
 # github.com/google/cel-go => github.com/google/cel-go v0.10.0
 # github.com/google/cel-spec => github.com/google/cel-spec v0.6.0
+# github.com/google/gnostic => github.com/jefftree/gnostic v0.7.0
 # github.com/google/go-cmp => github.com/google/go-cmp v0.5.5
 # github.com/google/gofuzz => github.com/google/gofuzz v1.1.0
 # github.com/google/martian/v3 => github.com/google/martian/v3 v3.1.0
@@ -2693,6 +2696,9 @@ sigs.k8s.io/yaml
 # github.com/vishvananda/netlink => github.com/vishvananda/netlink v1.1.0
 # github.com/vishvananda/netns => github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae
 # github.com/vmware/govmomi => github.com/vmware/govmomi v0.20.3
+# github.com/xeipuuv/gojsonpointer => github.com/xeipuuv/gojsonpointer v0.0.0-20180127040702-4e3ac2762d5f
+# github.com/xeipuuv/gojsonreference => github.com/xeipuuv/gojsonreference v0.0.0-20180127040603-bd5ef7bd5415
+# github.com/xeipuuv/gojsonschema => github.com/xeipuuv/gojsonschema v1.2.0
 # github.com/xiang90/probing => github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2
 # github.com/xlab/treeprint => github.com/xlab/treeprint v0.0.0-20181112141820-a009c3971eca
 # github.com/yuin/goldmark => github.com/yuin/goldmark v1.4.1
