@@ -26,6 +26,7 @@ import (
 
 	"k8s.io/kube-openapi/pkg/common"
 	"k8s.io/kube-openapi/pkg/common/restfuladapter"
+	"k8s.io/kube-openapi/pkg/schemamutation"
 	"k8s.io/kube-openapi/pkg/spec3"
 	"k8s.io/kube-openapi/pkg/util"
 	"k8s.io/kube-openapi/pkg/validation/spec"
@@ -396,6 +397,7 @@ func (o *openAPI) buildDefinitionRecursively(name string) error {
 		}
 		// delete the embedded v2 schema if exists, otherwise no-op
 		delete(schema.VendorExtensible.Extensions, common.ExtensionV2Schema)
+		schema = wrapRefs(schema)
 		o.spec.Components.Schemas[uniqueName] = schema
 		for _, v := range item.Dependencies {
 			if err := o.buildDefinitionRecursively(v); err != nil {
@@ -435,4 +437,31 @@ func (o *openAPI) toSchema(name string) (_ *spec.Schema, err error) {
 			},
 		}, nil
 	}
+}
+
+// wrapRefs wraps OpenAPI V3 Schema refs that contain sibling elements.
+// AllOf is used to wrap the Ref to prevent references from having sibling elements
+// Please see https://github.com/kubernetes/kubernetes/issues/106387#issuecomment-967640388
+func wrapRefs(schema *spec.Schema) *spec.Schema {
+	walker := schemamutation.Walker{
+		SchemaCallback: func(schema *spec.Schema) *spec.Schema {
+			orig := schema
+			clone := func() {
+				if orig == schema {
+					schema = new(spec.Schema)
+					*schema = *orig
+				}
+			}
+			if schema.Ref.String() != "" && (schema.Nullable != false || schema.Default != nil || len(schema.Extensions) > 0) {
+				clone()
+				newSchema := new(spec.Schema)
+				newSchema.Ref = schema.Ref
+				schema.Ref = spec.Ref{}
+				schema.AllOf = []spec.Schema{*newSchema}
+			}
+			return schema
+		},
+		RefCallback: schemamutation.RefCallbackNoop,
+	}
+	return walker.WalkSchema(schema)
 }
