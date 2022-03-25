@@ -13,16 +13,28 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"
+              }
+            ],
             "default": {}
           },
           "spec": {
-            "$ref": "#/components/schemas/io.k8s.api.certificates.v1.CertificateSigningRequestSpec",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.certificates.v1.CertificateSigningRequestSpec"
+              }
+            ],
             "default": {},
             "description": "spec contains the certificate request, and is immutable after creation. Only the request, signerName, expirationSeconds, and usages fields can be set on creation. Other fields are derived by Kubernetes and cannot be modified by users."
           },
           "status": {
-            "$ref": "#/components/schemas/io.k8s.api.certificates.v1.CertificateSigningRequestStatus",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.certificates.v1.CertificateSigningRequestStatus"
+              }
+            ],
             "default": {},
             "description": "status contains information about whether the request is approved or denied, and the certificate issued by the signer, or the failure condition indicating signer failure."
           }
@@ -43,12 +55,20 @@
         "description": "CertificateSigningRequestCondition describes a condition of a CertificateSigningRequest object",
         "properties": {
           "lastTransitionTime": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time"
+              }
+            ],
             "default": {},
             "description": "lastTransitionTime is the time the condition last transitioned from one status to another. If unset, when a new condition type is added or an existing condition's status is changed, the server defaults this to the current time."
           },
           "lastUpdateTime": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time"
+              }
+            ],
             "default": {},
             "description": "lastUpdateTime is the time of the last update to this condition"
           },
@@ -92,7 +112,11 @@
           "items": {
             "description": "items is a collection of CertificateSigningRequest objects",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.certificates.v1.CertificateSigningRequest",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.certificates.v1.CertificateSigningRequest"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -102,7 +126,11 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta"
+              }
+            ],
             "default": {}
           }
         },
@@ -193,7 +221,11 @@
           "conditions": {
             "description": "conditions applied to the request. Known conditions are \"Approved\", \"Denied\", and \"Failed\".",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.certificates.v1.CertificateSigningRequestCondition",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.certificates.v1.CertificateSigningRequestCondition"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -293,7 +325,11 @@
           "resources": {
             "description": "resources contains the name of the resources and if they are namespaced.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.APIResource",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.APIResource"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -690,7 +726,11 @@
             "type": "string"
           },
           "creationTimestamp": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time"
+              }
+            ],
             "default": {},
             "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           },
@@ -732,7 +772,11 @@
           "managedFields": {
             "description": "ManagedFields maps workflow-id and version to the set of fields that are managed by that workflow. This is mostly for internal housekeeping, and users typically shouldn't need to set or understand this field. A workflow can be the user's name, a controller's name, or the name of a specific apply path like \"ci-cd\". The set of fields is always in the version that the workflow used when modifying the object.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -748,7 +792,11 @@
           "ownerReferences": {
             "description": "List of objects depended by this object. If ALL objects in the list have been deleted, this object will be garbage collected. If this object is managed by a controller, then an entry in this list will point to this controller, with the controller field set to true. There cannot be more than one managing controller.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -854,7 +902,11 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta"
+              }
+            ],
             "default": {},
             "description": "Standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds"
           },
@@ -900,7 +952,11 @@
           "causes": {
             "description": "The Causes array includes more details associated with the StatusReason failure. Not all StatusReasons may provide detailed causes.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.StatusCause",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.StatusCause"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -938,7 +994,11 @@
         "description": "Event represents a single event to a watched resource.",
         "properties": {
           "object": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.runtime.RawExtension",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.runtime.RawExtension"
+              }
+            ],
             "default": {},
             "description": "Object is:\n * If Type is Added or Modified: the new state of the object.\n * If Type is Deleted: the state of the object immediately before deletion.\n * If Type is Error: *Status is recommended; other types may make sense\n   depending on context."
           },

@@ -27,17 +27,29 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"
+              }
+            ],
             "default": {},
             "description": "`metadata` is the standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           },
           "spec": {
-            "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.FlowSchemaSpec",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.FlowSchemaSpec"
+              }
+            ],
             "default": {},
             "description": "`spec` is the specification of the desired behavior of a FlowSchema. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
           },
           "status": {
-            "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.FlowSchemaStatus",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.FlowSchemaStatus"
+              }
+            ],
             "default": {},
             "description": "`status` is the current status of a FlowSchema. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
           }
@@ -55,7 +67,11 @@
         "description": "FlowSchemaCondition describes conditions for a FlowSchema.",
         "properties": {
           "lastTransitionTime": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time"
+              }
+            ],
             "default": {},
             "description": "`lastTransitionTime` is the last time the condition transitioned from one status to another."
           },
@@ -88,7 +104,11 @@
           "items": {
             "description": "`items` is a list of FlowSchemas.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.FlowSchema",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.FlowSchema"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -98,7 +118,11 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta"
+              }
+            ],
             "default": {},
             "description": "`metadata` is the standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           }
@@ -129,14 +153,22 @@
             "type": "integer"
           },
           "priorityLevelConfiguration": {
-            "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PriorityLevelConfigurationReference",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PriorityLevelConfigurationReference"
+              }
+            ],
             "default": {},
             "description": "`priorityLevelConfiguration` should reference a PriorityLevelConfiguration in the cluster. If the reference cannot be resolved, the FlowSchema will be ignored and marked as invalid in its status. Required."
           },
           "rules": {
             "description": "`rules` describes which requests will match this flow schema. This FlowSchema matches a request if and only if at least one member of rules matches the request. if it is an empty slice, there will be no requests matching the FlowSchema.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PolicyRulesWithSubjects",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PolicyRulesWithSubjects"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -154,7 +186,11 @@
           "conditions": {
             "description": "`conditions` is a list of the current states of FlowSchema.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.FlowSchemaCondition",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.FlowSchemaCondition"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -216,7 +252,11 @@
             "type": "integer"
           },
           "limitResponse": {
-            "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.LimitResponse",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.LimitResponse"
+              }
+            ],
             "default": {},
             "description": "`limitResponse` indicates what to do with requests that can not be executed right now"
           }
@@ -257,7 +297,11 @@
           "nonResourceRules": {
             "description": "`nonResourceRules` is a list of NonResourcePolicyRules that identify matching requests according to their verb and the target non-resource URL.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.NonResourcePolicyRule",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.NonResourcePolicyRule"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -266,7 +310,11 @@
           "resourceRules": {
             "description": "`resourceRules` is a slice of ResourcePolicyRules that identify matching requests according to their verb and the target resource. At least one of `resourceRules` and `nonResourceRules` has to be non-empty.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.ResourcePolicyRule",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.ResourcePolicyRule"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -275,7 +323,11 @@
           "subjects": {
             "description": "subjects is the list of normal user, serviceaccount, or group that this rule cares about. There must be at least one member in this slice. A slice that includes both the system:authenticated and system:unauthenticated user groups matches every request. Required.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.Subject",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.Subject"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -299,17 +351,29 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"
+              }
+            ],
             "default": {},
             "description": "`metadata` is the standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           },
           "spec": {
-            "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PriorityLevelConfigurationSpec",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PriorityLevelConfigurationSpec"
+              }
+            ],
             "default": {},
             "description": "`spec` is the specification of the desired behavior of a \"request-priority\". More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
           },
           "status": {
-            "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PriorityLevelConfigurationStatus",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PriorityLevelConfigurationStatus"
+              }
+            ],
             "default": {},
             "description": "`status` is the current status of a \"request-priority\". More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
           }
@@ -327,7 +391,11 @@
         "description": "PriorityLevelConfigurationCondition defines the condition of priority level.",
         "properties": {
           "lastTransitionTime": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time"
+              }
+            ],
             "default": {},
             "description": "`lastTransitionTime` is the last time the condition transitioned from one status to another."
           },
@@ -360,7 +428,11 @@
           "items": {
             "description": "`items` is a list of request-priorities.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PriorityLevelConfiguration",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PriorityLevelConfiguration"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -370,7 +442,11 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta"
+              }
+            ],
             "default": {},
             "description": "`metadata` is the standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           }
@@ -433,7 +509,11 @@
           "conditions": {
             "description": "`conditions` is the current state of \"request-priority\".",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PriorityLevelConfigurationCondition",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.flowcontrol.v1beta2.PriorityLevelConfigurationCondition"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -678,7 +758,11 @@
           "resources": {
             "description": "resources contains the name of the resources and if they are namespaced.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.APIResource",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.APIResource"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -1075,7 +1159,11 @@
             "type": "string"
           },
           "creationTimestamp": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time"
+              }
+            ],
             "default": {},
             "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           },
@@ -1117,7 +1205,11 @@
           "managedFields": {
             "description": "ManagedFields maps workflow-id and version to the set of fields that are managed by that workflow. This is mostly for internal housekeeping, and users typically shouldn't need to set or understand this field. A workflow can be the user's name, a controller's name, or the name of a specific apply path like \"ci-cd\". The set of fields is always in the version that the workflow used when modifying the object.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -1133,7 +1225,11 @@
           "ownerReferences": {
             "description": "List of objects depended by this object. If ALL objects in the list have been deleted, this object will be garbage collected. If this object is managed by a controller, then an entry in this list will point to this controller, with the controller field set to true. There cannot be more than one managing controller.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -1239,7 +1335,11 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta"
+              }
+            ],
             "default": {},
             "description": "Standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds"
           },
@@ -1285,7 +1385,11 @@
           "causes": {
             "description": "The Causes array includes more details associated with the StatusReason failure. Not all StatusReasons may provide detailed causes.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.StatusCause",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.StatusCause"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -1323,7 +1427,11 @@
         "description": "Event represents a single event to a watched resource.",
         "properties": {
           "object": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.runtime.RawExtension",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.runtime.RawExtension"
+              }
+            ],
             "default": {},
             "description": "Object is:\n * If Type is Added or Modified: the new state of the object.\n * If Type is Deleted: the state of the object immediately before deletion.\n * If Type is Error: *Status is recommended; other types may make sense\n   depending on context."
           },

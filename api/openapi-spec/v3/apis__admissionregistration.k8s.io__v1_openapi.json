@@ -13,7 +13,11 @@
             "type": "array"
           },
           "clientConfig": {
-            "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.WebhookClientConfig",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.WebhookClientConfig"
+              }
+            ],
             "default": {},
             "description": "ClientConfig defines how to communicate with the hook. Required"
           },
@@ -45,7 +49,11 @@
           "rules": {
             "description": "Rules describes what operations on what resources/subresources the webhook cares about. The webhook cares about an operation if it matches _any_ Rule. However, in order to prevent ValidatingAdmissionWebhooks and MutatingAdmissionWebhooks from putting the cluster in a state which cannot be recovered from without completely disabling the plugin, ValidatingAdmissionWebhooks and MutatingAdmissionWebhooks are never called on admission requests for ValidatingWebhookConfiguration and MutatingWebhookConfiguration objects.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.RuleWithOperations",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.RuleWithOperations"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -80,14 +88,22 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"
+              }
+            ],
             "default": {},
             "description": "Standard object metadata; More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata."
           },
           "webhooks": {
             "description": "Webhooks is a list of webhooks and the affected resources and operations.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.MutatingWebhook",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.MutatingWebhook"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -114,7 +130,11 @@
           "items": {
             "description": "List of MutatingWebhookConfiguration.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.MutatingWebhookConfiguration",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.MutatingWebhookConfiguration"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -124,7 +144,11 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta"
+              }
+            ],
             "default": {},
             "description": "Standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds"
           }
@@ -224,7 +248,11 @@
             "type": "array"
           },
           "clientConfig": {
-            "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.WebhookClientConfig",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.WebhookClientConfig"
+              }
+            ],
             "default": {},
             "description": "ClientConfig defines how to communicate with the hook. Required"
           },
@@ -252,7 +280,11 @@
           "rules": {
             "description": "Rules describes what operations on what resources/subresources the webhook cares about. The webhook cares about an operation if it matches _any_ Rule. However, in order to prevent ValidatingAdmissionWebhooks and MutatingAdmissionWebhooks from putting the cluster in a state which cannot be recovered from without completely disabling the plugin, ValidatingAdmissionWebhooks and MutatingAdmissionWebhooks are never called on admission requests for ValidatingWebhookConfiguration and MutatingWebhookConfiguration objects.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.RuleWithOperations",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.RuleWithOperations"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -287,14 +319,22 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"
+              }
+            ],
             "default": {},
             "description": "Standard object metadata; More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata."
           },
           "webhooks": {
             "description": "Webhooks is a list of webhooks and the affected resources and operations.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.ValidatingWebhook",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.ValidatingWebhook"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -321,7 +361,11 @@
           "items": {
             "description": "List of ValidatingWebhookConfiguration.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.ValidatingWebhookConfiguration",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.api.admissionregistration.v1.ValidatingWebhookConfiguration"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -331,7 +375,11 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta"
+              }
+            ],
             "default": {},
             "description": "Standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds"
           }
@@ -455,7 +503,11 @@
           "resources": {
             "description": "resources contains the name of the resources and if they are namespaced.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.APIResource",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.APIResource"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -785,7 +837,11 @@
           "matchExpressions": {
             "description": "matchExpressions is a list of label selector requirements. The requirements are ANDed.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.LabelSelectorRequirement",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.LabelSelectorRequirement"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -905,7 +961,11 @@
             "type": "string"
           },
           "creationTimestamp": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time"
+              }
+            ],
             "default": {},
             "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           },
@@ -947,7 +1007,11 @@
           "managedFields": {
             "description": "ManagedFields maps workflow-id and version to the set of fields that are managed by that workflow. This is mostly for internal housekeeping, and users typically shouldn't need to set or understand this field. A workflow can be the user's name, a controller's name, or the name of a specific apply path like \"ci-cd\". The set of fields is always in the version that the workflow used when modifying the object.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -963,7 +1027,11 @@
           "ownerReferences": {
             "description": "List of objects depended by this object. If ALL objects in the list have been deleted, this object will be garbage collected. If this object is managed by a controller, then an entry in this list will point to this controller, with the controller field set to true. There cannot be more than one managing controller.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference"
+                }
+              ],
               "default": {}
             },
             "type": "array",
@@ -1069,7 +1137,11 @@
             "type": "string"
           },
           "metadata": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ListMeta"
+              }
+            ],
             "default": {},
             "description": "Standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds"
           },
@@ -1115,7 +1187,11 @@
           "causes": {
             "description": "The Causes array includes more details associated with the StatusReason failure. Not all StatusReasons may provide detailed causes.",
             "items": {
-              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.StatusCause",
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.StatusCause"
+                }
+              ],
               "default": {}
             },
             "type": "array"
@@ -1153,7 +1229,11 @@
         "description": "Event represents a single event to a watched resource.",
         "properties": {
           "object": {
-            "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.runtime.RawExtension",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.runtime.RawExtension"
+              }
+            ],
             "default": {},
             "description": "Object is:\n * If Type is Added or Modified: the new state of the object.\n * If Type is Deleted: the state of the object immediately before deletion.\n * If Type is Error: *Status is recommended; other types may make sense\n   depending on context."
           },
