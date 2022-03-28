@@ -161,7 +161,6 @@ func DefaultOpenAPIV3Config() *openapicommon.Config {
 		return spec.MustCreateRef("#/components/schemas/" + openapicommon.EscapeJsonPointer(defName))
 	})
 
-
 	return openAPIConfig
 }
 
