@@ -42,7 +42,10 @@ func newCacheRoundTripper(cacheDir string, rt http.RoundTripper) http.RoundTripp
 		TempDir:  filepath.Join(cacheDir, ".diskv-temp"),
 	})
 	t := httpcache.NewTransport(diskcache.NewWithDiskv(d))
-	t.Transport = rt
+	t.Transport = &debugHeaderRoundtripper{
+		rt: rt,
+	}
+	t.MarkCachedResponses = true
 
 	return &cacheRoundTripper{rt: t}
 }
@@ -51,10 +54,11 @@ func (rt *cacheRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	return rt.rt.RoundTrip(req)
 }
 
+type canceler interface {
+	CancelRequest(*http.Request)
+}
+
 func (rt *cacheRoundTripper) CancelRequest(req *http.Request) {
-	type canceler interface {
-		CancelRequest(*http.Request)
-	}
 	if cr, ok := rt.rt.Transport.(canceler); ok {
 		cr.CancelRequest(req)
 	} else {
@@ -63,3 +67,26 @@ func (rt *cacheRoundTripper) CancelRequest(req *http.Request) {
 }
 
 func (rt *cacheRoundTripper) WrappedRoundTripper() http.RoundTripper { return rt.rt.Transport }
+
+// debugHeader
+type debugHeaderRoundtripper struct {
+	rt http.RoundTripper
+}
+
+func (rt *debugHeaderRoundtripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := rt.rt.RoundTrip(req)
+	if err == nil && resp != nil {
+		resp.Header.Set("X-Hit-Server", "1")
+	}
+	return resp, err
+}
+
+func (rt *debugHeaderRoundtripper) CancelRequest(req *http.Request) {
+	if cr, ok := rt.rt.(canceler); ok {
+		cr.CancelRequest(req)
+	} else {
+		klog.Errorf("CancelRequest not implemented by %T", rt.rt)
+	}
+}
+
+func (rt *debugHeaderRoundtripper) WrappedRoundTripper() http.RoundTripper { return rt.rt }

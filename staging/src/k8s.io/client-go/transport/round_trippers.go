@@ -582,6 +582,18 @@ func (rt *debuggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 		}
 	}
 
+	if rt.levels[DebugResponseStatus] {
+		if fromCache := response.Header.Get("X-From-Cache"); fromCache == "1" {
+			if hitServer := response.Header.Get("X-Hit-Server"); hitServer == "1" {
+				klog.Infof("%s %s served from cache after 304 Not Modified response", reqInfo.RequestVerb, reqInfo.RequestURL)
+			} else {
+				klog.Infof("%s %s served from cache without network", reqInfo.RequestVerb, reqInfo.RequestURL)
+			}
+		} else {
+			klog.Infof("%s %s served live from server", reqInfo.RequestVerb, reqInfo.RequestURL)
+		}
+	}
+
 	return response, err
 }
 
