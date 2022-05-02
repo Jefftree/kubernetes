@@ -41,7 +41,8 @@ type APIVersionHandler struct {
 func NewAPIVersionHandler(
 	serializer runtime.NegotiatedSerializer,
 	groupVersion schema.GroupVersion,
-	resources []metav1.APIResource) *APIVersionHandler {
+	resources []metav1.APIResource,
+) *APIVersionHandler {
 
 	resourceList := &metav1.APIResourceList{
 		GroupVersion: groupVersion.String(),

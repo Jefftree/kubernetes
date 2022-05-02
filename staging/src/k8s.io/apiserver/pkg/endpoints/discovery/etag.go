@@ -38,7 +38,7 @@ type Marshalable interface {
 }
 
 // Attaches Cache-Busting functionality to an endpoint
-// 	* Immutability Response Header
+//  * Immutability Response Header
 //  * Expires Never
 //  * Redirects when incorrect hash is provided
 //  * Sets ETag haeader to provided hash
