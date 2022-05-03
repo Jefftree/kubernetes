@@ -75,7 +75,7 @@ type debugHeaderRoundtripper struct {
 
 func (rt *debugHeaderRoundtripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := rt.rt.RoundTrip(req)
-	if err == nil && resp != nil {
+	if err == nil && resp != nil && req.Header.Get("if-none-match") != "" {
 		resp.Header.Set("X-Hit-Server", "1")
 	}
 	return resp, err
