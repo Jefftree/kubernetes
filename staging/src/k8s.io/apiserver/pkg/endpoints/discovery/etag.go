@@ -94,8 +94,10 @@ func ServeHTTPWithETag(
 
 		// If Request includes If-None-Match and matches hash, reply with 304
 		// Otherwise, we delegate to the handler for actual content
-		if clientCachedHash := req.Header.Get("If-None-Match"); hash == clientCachedHash {
-			w.WriteHeader(http.StatusNotModified)
+		if clientCachedHash := req.Header.Get("If-None-Match"); clientCachedHash != "" {
+			if unquoted, err := strconv.Unquote(clientCachedHash); err == nil && hash == unquoted {
+				w.WriteHeader(http.StatusNotModified)
+			}
 			return
 		}
 	}
