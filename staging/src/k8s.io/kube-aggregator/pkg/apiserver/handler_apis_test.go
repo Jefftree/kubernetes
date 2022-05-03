@@ -49,7 +49,7 @@ func TestAPIs(t *testing.T) {
 			expected: &metav1.APIGroupList{
 				TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
 				Groups: []metav1.APIGroup{
-					discoveryGroup(sets.NewString("v1", "v1beta1")),
+					discoveryGroup(sets.NewString("v1", "v1beta1"), nil),
 				},
 			},
 		},
@@ -60,7 +60,7 @@ func TestAPIs(t *testing.T) {
 			expected: &metav1.APIGroupList{
 				TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
 				Groups: []metav1.APIGroup{
-					discoveryGroup(sets.NewString("v1")),
+					discoveryGroup(sets.NewString("v1"), nil),
 				},
 			},
 		},
@@ -106,7 +106,7 @@ func TestAPIs(t *testing.T) {
 			expected: &metav1.APIGroupList{
 				TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
 				Groups: []metav1.APIGroup{
-					discoveryGroup(sets.NewString("v1", "v1beta1")),
+					discoveryGroup(sets.NewString("v1", "v1beta1"), nil),
 					{
 						Name: "foo",
 						Versions: []metav1.GroupVersionForDiscovery{
@@ -214,7 +214,7 @@ func TestAPIs(t *testing.T) {
 			expected: &metav1.APIGroupList{
 				TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
 				Groups: []metav1.APIGroup{
-					discoveryGroup(sets.NewString("v1", "v1beta1")),
+					discoveryGroup(sets.NewString("v1", "v1beta1"), nil),
 					{
 						Name: "foo",
 						Versions: []metav1.GroupVersionForDiscovery{
@@ -277,7 +277,7 @@ func TestAPIs(t *testing.T) {
 			expected: &metav1.APIGroupList{
 				TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
 				Groups: []metav1.APIGroup{
-					discoveryGroup(sets.NewString("v1", "v1beta1")),
+					discoveryGroup(sets.NewString("v1", "v1beta1"), nil),
 					{
 						Name: "foo",
 						Versions: []metav1.GroupVersionForDiscovery{
@@ -301,7 +301,7 @@ func TestAPIs(t *testing.T) {
 		handler := &apisHandler{
 			codecs:         aggregatorscheme.Codecs,
 			lister:         listers.NewAPIServiceLister(indexer),
-			discoveryGroup: discoveryGroup(tc.enabled),
+			discoveryGroup: discoveryGroup(tc.enabled, nil),
 		}
 		for _, o := range tc.apiservices {
 			indexer.Add(o)
