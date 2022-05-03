@@ -97,8 +97,8 @@ func ServeHTTPWithETag(
 		if clientCachedHash := req.Header.Get("If-None-Match"); clientCachedHash != "" {
 			if unquoted, err := strconv.Unquote(clientCachedHash); err == nil && hash == unquoted {
 				w.WriteHeader(http.StatusNotModified)
+				return
 			}
-			return
 		}
 	}
 
