@@ -23,10 +23,8 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
-	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 )
 
 // legacyRootAPIHandler creates a webservice serving api group discovery.
@@ -83,5 +81,5 @@ func (s *legacyRootAPIHandler) handle(req *restful.Request, resp *restful.Respon
 		Hashes:                     map[string]string{"v1": s.hash},
 	}
 
-	responsewriters.WriteObjectNegotiated(s.serializer, negotiation.DefaultEndpointRestrictions, schema.GroupVersion{}, resp.ResponseWriter, req.Request, http.StatusOK, apiVersions)
+	ServeHTTPWithETag(apiVersions, s.hash, s.serializer, resp.ResponseWriter, req.Request)
 }
