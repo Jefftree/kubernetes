@@ -299,7 +299,7 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 		leaseNamespace:       "kube-system",               // TODO: put this in kube-system once RBAC is set up for that
 		leaseDurationSeconds: 10,
 		clock:                clock.RealClock{},
-		controllerLeaseName:  "kube-controller-manager", // TODO: wire this in
+		canLeadLeases:        "kube-system/kube-controller-manager", // TODO: wire this in. It must be comma separated namespace/name pairs.
 		renewInterval:        5,
 	}
 	// TODO: Wrap this in a Run/sync() loop like lease.controller.Run()/sync()
@@ -368,7 +368,7 @@ type identityLease struct {
 	leaseNamespace string
 
 	// controller lease
-	controllerLeaseName string
+	canLeadLeases string
 
 	leaseDurationSeconds int32
 	renewInterval        time.Duration
@@ -456,7 +456,8 @@ func (c *identityLease) newLease(base *v1.Lease) (*v1.Lease, error) {
 				Name:      c.leaseName,
 				Namespace: c.leaseNamespace,
 				Labels: map[string]string{
-					"coordination.kubernetes.io/leader-leases": c.controllerLeaseName,
+					// TODO: use CanLeadLeasesLabelName const
+					"coordination.k8s.io/can-lead-leases": c.canLeadLeases,
 				},
 			},
 			Spec: v1.LeaseSpec{

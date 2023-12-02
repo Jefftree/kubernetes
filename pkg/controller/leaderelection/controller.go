@@ -238,6 +238,7 @@ func (c *Controller) reconcile(ctx context.Context, lease *v1.Lease) error {
 	}
 
 	if canLead, ok := lease.Labels[CanLeadLeasesLabelName]; ok {
+		klog.Infof("reconcile found canLead label namespace=%q, name=%q: %q", lease.Namespace, lease.Name, canLead)
 		for _, leadeLeaseId := range strings.Split(canLead, ",") {
 			leaderLeaseId, err := parseLeaderLeaseId(leadeLeaseId)
 			if err != nil {
