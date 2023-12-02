@@ -44,7 +44,8 @@ func (ll *LeaseLock) Get(ctx context.Context) (*LeaderElectionRecord, []byte, er
 		return nil, nil, err
 	}
 	ll.lease = lease
-	record := LeaseSpecToLeaderElectionRecord(&ll.lease.Spec)
+	endOfTerm := ll.lease.Annotations["coordination.k8s.io/end-of-term"]
+	record := LeaseSpecToLeaderElectionRecord(&ll.lease.Spec, endOfTerm == "true")
 	recordByte, err := json.Marshal(*record)
 	if err != nil {
 		return nil, nil, err
@@ -71,6 +72,11 @@ func (ll *LeaseLock) Update(ctx context.Context, ler LeaderElectionRecord) error
 		return errors.New("lease not initialized, call get or create first")
 	}
 	ll.lease.Spec = LeaderElectionRecordToLeaseSpec(&ler)
+	if ler.EndOfTerm {
+		ll.lease.Annotations["coordination.k8s.io/end-of-term"] = "true"
+	} else {
+		delete(ll.lease.Annotations, "coordination.k8s.io/end-of-term")
+	}
 
 	lease, err := ll.Client.Leases(ll.LeaseMeta.Namespace).Update(ctx, ll.lease, metav1.UpdateOptions{})
 	if err != nil {
@@ -105,7 +111,7 @@ func (ll *LeaseLock) Identity() string {
 	return ll.LockConfig.Identity
 }
 
-func LeaseSpecToLeaderElectionRecord(spec *coordinationv1.LeaseSpec) *LeaderElectionRecord {
+func LeaseSpecToLeaderElectionRecord(spec *coordinationv1.LeaseSpec, endOfTerm bool) *LeaderElectionRecord {
 	var r LeaderElectionRecord
 	if spec.HolderIdentity != nil {
 		r.HolderIdentity = *spec.HolderIdentity
@@ -122,6 +128,7 @@ func LeaseSpecToLeaderElectionRecord(spec *coordinationv1.LeaseSpec) *LeaderElec
 	if spec.RenewTime != nil {
 		r.RenewTime = metav1.Time{Time: spec.RenewTime.Time}
 	}
+	r.EndOfTerm = endOfTerm
 	return &r
 
 }

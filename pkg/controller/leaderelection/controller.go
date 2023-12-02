@@ -121,15 +121,12 @@ func NewController(leaseInformer coordinationv1.LeaseInformer, leaseClient coord
 	}
 	reg, err := leaseInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			klog.Infof("AddFunc")
 			c.enqueueLease(obj)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			klog.Infof("UpdateFunc")
 			c.enqueueLease(newObj)
 		},
 		DeleteFunc: func(oldObj interface{}) {
-			klog.Infof("DeleteFunc")
 			c.leaseDeleted(oldObj)
 		},
 	})
@@ -141,14 +138,12 @@ func NewController(leaseInformer coordinationv1.LeaseInformer, leaseClient coord
 }
 
 func (c *Controller) enqueueLease(obj any) {
-	klog.Infof("enqueueLease")
 	if lease, ok := obj.(*v1.Lease); ok {
 		// TODO: handle namespaces
 		key, err := controller.KeyFunc(lease)
 		if err != nil {
 			utilruntime.HandleError(fmt.Errorf("cannot get name of object %v: %w", lease, err))
 		}
-		klog.Infof("enqueueLease, Add: %q", key)
 		c.leaseQueue.Add(key)
 	}
 }
@@ -174,7 +169,6 @@ func (c *Controller) runWorker(ctx context.Context) {
 }
 
 func (c *Controller) processNextWorkItem(ctx context.Context) bool {
-	klog.Infof("processNextWorkItem")
 	key, shutdown := c.leaseQueue.Get()
 	if shutdown {
 		return false
@@ -190,7 +184,6 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 		if err != nil {
 			return err
 		}
-		klog.Infof("processNextWorkItem looking up lease namespace=%q, name=%q", namespace, name)
 		lease, err := c.leaseInformer.Lister().Leases(namespace).Get(name)
 		if err != nil {
 			if kerrors.IsNotFound(err) {
@@ -200,7 +193,6 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 			}
 			return err
 		}
-		klog.Infof("processNextWorkItem reconciling")
 		return c.reconcile(ctx, lease)
 	}()
 
@@ -235,10 +227,10 @@ func (c *Controller) runElectionLoop(stopCh <-chan struct{}) {
 }
 
 func (c *Controller) reconcile(ctx context.Context, lease *v1.Lease) error {
-	klog.Infof("reconcile for lease namespace=%q, name=%q", lease.Namespace, lease.Name)
 	if lease == nil {
 		return nil
 	}
+	klog.Infof("reconcile for lease namespace=%q, name=%q", lease.Namespace, lease.Name)
 
 	if canLead, ok := lease.Annotations[CanLeadLeasesAnnotationName]; ok {
 		klog.Infof("reconcile found canLead label namespace=%q, name=%q: %q", lease.Namespace, lease.Name, canLead)
@@ -260,6 +252,7 @@ func (c *Controller) reconcile(ctx context.Context, lease *v1.Lease) error {
 					return err
 				}
 				if !shouldReelect(candidates, leader) {
+					klog.Infof("shouldReelect returned false")
 					continue
 				}
 			}
@@ -314,7 +307,7 @@ func (c *Controller) scheduleElection(leaderLeaseId leaderLeaseId) error {
 }
 
 func (c *Controller) runElection(ctx context.Context, leaderLeaseId leaderLeaseId) error {
-	klog.Infof("runElection")
+	klog.Infof("runElection %q %q", leaderLeaseId.namespace, leaderLeaseId.name)
 	candidates, err := c.listCandidates(leaderLeaseId)
 	if err != nil {
 		return err
@@ -325,6 +318,9 @@ func (c *Controller) runElection(ctx context.Context, leaderLeaseId leaderLeaseI
 		return nil
 	}
 
+	klog.Infof("pickLeader found %q %q", electee.Namespace, electee.Name)
+
+	klog.Infof("Creating lease %q %q for %q", leaderLeaseId.namespace, leaderLeaseId.name, electee.Spec.HolderIdentity)
 	// create the leader election lease
 	leaderLease := &v1.Lease{
 		// TODO: fill out all lease fields
@@ -343,7 +339,7 @@ func (c *Controller) runElection(ctx context.Context, leaderLeaseId leaderLeaseI
 	if err != nil {
 		if kerrors.IsAlreadyExists(err) {
 			// TODO: Check if there is a better leader. If so, mark the lease as "end of term"
-
+			klog.Infof("lease %q %q already exists, marking end of term", leaderLeaseId.namespace, leaderLeaseId.name)
 			// mark as "end of term"
 
 			// Update approach:
@@ -351,10 +347,12 @@ func (c *Controller) runElection(ctx context.Context, leaderLeaseId leaderLeaseI
 			if err != nil {
 				return err
 			}
-			lease.Annotations[EndOfTermAnnotationName] = "true"
-			_, err = c.leaseClient.Leases(leaderLeaseId.namespace).Update(ctx, lease, metav1.UpdateOptions{})
-			if err != nil {
-				return err
+			if lease.Spec.HolderIdentity != electee.Spec.HolderIdentity {
+				lease.Annotations[EndOfTermAnnotationName] = "true"
+				_, err = c.leaseClient.Leases(leaderLeaseId.namespace).Update(ctx, lease, metav1.UpdateOptions{})
+				if err != nil {
+					return err
+				}
 			}
 
 			// Apply approach:
@@ -390,7 +388,7 @@ func shouldReelect(candidates []*v1.Lease, currentLeader *v1.Lease) bool {
 	if pickedLeader == nil {
 		return false
 	}
-	return compare(currentLeader, pickedLeader) < 0
+	return compare(currentLeader, pickedLeader) > 0
 }
 
 func getCompatibilityVersion(l *v1.Lease) semver.Version {

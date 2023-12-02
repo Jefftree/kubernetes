@@ -5,3 +5,11 @@ k delete -n kube-system lease amazing-controller
 
 k get -n kube-system lease kube-controller-manager -oyaml
 # note that the controller is renewing..
+
+
+
+cd staging/src/k8s.io/sample-controller
+go build -o sample-controller .
+
+./sample-controller --kubeconfig=/var/run/kubernetes/admin.kubeconfig --binary-version=1.29 --compatibility-version=1.29 --identity=sample-controller-a
+./sample-controller --kubeconfig=/var/run/kubernetes/admin.kubeconfig --binary-version=1.28 --compatibility-version=1.28 --identity=sample-controller-b

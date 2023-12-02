@@ -294,7 +294,7 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 	// Start component identity lease management
 	identityLease := &identityLease{
 		leaseClient:          c.Client.CoordinationV1().Leases("kube-system"),
-		holderIdentity:       "kube-controller-manager",
+		holderIdentity:       "kube-controller-manager-a",
 		leaseName:            "kube-controller-manager-a", // TODO: safely append uids
 		leaseNamespace:       "kube-system",               // TODO: put this in kube-system once RBAC is set up for that
 		leaseDurationSeconds: 10,
