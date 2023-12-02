@@ -456,8 +456,10 @@ func (c *identityLease) newLease(base *v1.Lease) (*v1.Lease, error) {
 				Name:      c.leaseName,
 				Namespace: c.leaseNamespace,
 				Annotations: map[string]string{
-					// TODO: use CanLeadLeasesLabelName const
-					"coordination.k8s.io/can-lead-leases": c.canLeadLeases,
+					// TODO: use constants
+					"coordination.k8s.io/can-lead-leases":       c.canLeadLeases,
+					"coordination.k8s.io/binary-version":        version.Get().Major + "." + version.Get().Minor, // TODO: wire this in
+					"coordination.k8s.io/compatibility-version": version.Get().Major + "." + version.Get().Minor, // TODO: wire this in
 				},
 			},
 			Spec: v1.LeaseSpec{

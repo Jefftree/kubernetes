@@ -1,0 +1,7 @@
+k apply -f demo
+k get -n kube-system leases
+k get -n kube-system lease amazing-controller -oyaml
+k delete -n kube-system lease amazing-controller
+
+k get -n kube-system lease kube-controller-manager -oyaml
+# note that the controller is renewing..

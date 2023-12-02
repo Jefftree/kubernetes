@@ -377,7 +377,7 @@ func pickLeader(candidates []*v1.Lease) *v1.Lease {
 	klog.Infof("pickLeader")
 	var electee *v1.Lease
 	for _, c := range candidates {
-		if electee == nil || compare(electee, c) < 0 {
+		if electee == nil || compare(electee, c) > 0 {
 			electee = c
 		}
 	}
