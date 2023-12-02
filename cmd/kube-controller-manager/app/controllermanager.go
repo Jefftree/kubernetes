@@ -455,7 +455,7 @@ func (c *identityLease) newLease(base *v1.Lease) (*v1.Lease, error) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      c.leaseName,
 				Namespace: c.leaseNamespace,
-				Labels: map[string]string{
+				Annotations: map[string]string{
 					// TODO: use CanLeadLeasesLabelName const
 					"coordination.k8s.io/can-lead-leases": c.canLeadLeases,
 				},
