@@ -8,6 +8,8 @@ local-controlplane-up
 cd staging/src/k8s.io/sample-controller
 go build -o sample-controller .
 
+k apply -f staging/src/k8s.io/sample-controller/artifacts/examples/crd.yaml
+
 k get -n kube-system leases sample-controller -oyaml --watch
 
 ./sample-controller --kubeconfig=/var/run/kubernetes/admin.kubeconfig --binary-version=1.29 --compatibility-version=1.29 --identity=sample-controller-a

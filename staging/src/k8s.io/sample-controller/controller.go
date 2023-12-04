@@ -294,6 +294,7 @@ type identityLease struct {
 }
 
 func (c *identityLease) acquireOrRenewLease(ctx context.Context) {
+	klog.Infof("Starting identity lease management")
 	sleep := 1 * time.Second
 	for {
 		c.backoffEnsureLease(ctx)
@@ -303,6 +304,7 @@ func (c *identityLease) acquireOrRenewLease(ctx context.Context) {
 		case <-time.After(sleep):
 		}
 	}
+	klog.Infof("Shutting down identity lease management")
 }
 
 // backoffEnsureLease attempts to create the lease if it does not exist,
@@ -310,7 +312,7 @@ func (c *identityLease) acquireOrRenewLease(ctx context.Context) {
 // with retries. Returns the lease, and true if this call created the lease,
 // false otherwise.
 func (c *identityLease) backoffEnsureLease(ctx context.Context) (*v1.Lease, bool) {
-	klog.Infof("Starting identity lease management")
+	//klog.Infof("Starting identity lease management")
 	var (
 		lease   *v1.Lease
 		created bool
@@ -331,7 +333,7 @@ func (c *identityLease) backoffEnsureLease(ctx context.Context) (*v1.Lease, bool
 		case <-time.After(sleep):
 		}
 	}
-	klog.Infof("Shutting down identity lease management")
+	//klog.Infof("Shutting down identity lease management")
 	return lease, created
 }
 
@@ -367,7 +369,7 @@ func (c *identityLease) ensureLease(ctx context.Context) (*v1.Lease, bool, error
 		// unexpected error getting lease
 		return nil, false, err
 	}
-	klog.Infof("identity lease exists.. renewing")
+	//klog.Infof("identity lease exists.. renewing")
 	clone := lease.DeepCopy()
 	clone.Spec.RenewTime = &metav1.MicroTime{Time: c.clock.Now()}
 	lease, err = c.leaseClient.Update(ctx, clone, metav1.UpdateOptions{})
