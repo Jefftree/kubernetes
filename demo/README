@@ -1,3 +1,23 @@
+### Prep
+
+make quick-release
+local-controlplane-up
+
+### Sample Controller Demo
+
+cd staging/src/k8s.io/sample-controller
+go build -o sample-controller .
+
+k get -n kube-system leases sample-controller -oyaml --watch
+
+./sample-controller --kubeconfig=/var/run/kubernetes/admin.kubeconfig --binary-version=1.29 --compatibility-version=1.29 --identity=sample-controller-a
+# wait for a to claim lease
+
+./sample-controller --kubeconfig=/var/run/kubernetes/admin.kubeconfig --binary-version=1.28 --compatibility-version=1.28 --identity=sample-controller-b
+# observe how b takes over, since it has lower version
+
+### Old: KCM controller demo (don't use until election controller moved to apiserver)
+
 k apply -f demo
 k get -n kube-system leases
 k get -n kube-system lease amazing-controller -oyaml
@@ -7,9 +27,16 @@ k get -n kube-system lease kube-controller-manager -oyaml
 # note that the controller is renewing..
 
 
+### Rules
 
-cd staging/src/k8s.io/sample-controller
-go build -o sample-controller .
+- Controllers (in leaderelection.go)
+- If isLeader AND lease is not expired AND not end-of-term: renew
+- never acquire directly
 
-./sample-controller --kubeconfig=/var/run/kubernetes/admin.kubeconfig --binary-version=1.29 --compatibility-version=1.29 --identity=sample-controller-a
-./sample-controller --kubeconfig=/var/run/kubernetes/admin.kubeconfig --binary-version=1.28 --compatibility-version=1.28 --identity=sample-controller-b
+### TODO
+
+- Keep identity leases alive, don't attempt to elect if identity lease is stale
+- Funnel all reconcilation to main lease. If a identity lease is reconciled, enqueue the main lease for reconcilation..
+- Move election controller to apiserver
+- [x] Create a variant of leaselock to do coordinated elections
+- Create a variant of leaderelection that can be used for coorindated elections

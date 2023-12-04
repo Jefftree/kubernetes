@@ -197,7 +197,7 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 	}
 	// TODO: Wrap this in a Run/sync() loop like lease.controller.Run()/sync()
 	// TODO: Need to fix this in order to trigger re-elections!
-	go identityLease.backoffEnsureLease(ctx)
+	go identityLease.acquireOrRenewLease(ctx)
 
 	// TODO: Port in leaderElectAndRun from controllermanager.go
 
@@ -230,7 +230,7 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 	klog.Info("calling leaderElectAndRun")
 	go leaderElectAndRun(ctx, c.kubeconfig, c.identity, electionChecker,
 		"kube-system",
-		"leases",
+		"coordinatedLeases",
 		"sample-controller",
 		leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
@@ -293,6 +293,18 @@ type identityLease struct {
 	binaryVersion, compatibilityVersion string
 }
 
+func (c *identityLease) acquireOrRenewLease(ctx context.Context) {
+	sleep := 1 * time.Second
+	for {
+		c.backoffEnsureLease(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(sleep):
+		}
+	}
+}
+
 // backoffEnsureLease attempts to create the lease if it does not exist,
 // and uses exponentially increasing waits to prevent overloading the API server
 // with retries. Returns the lease, and true if this call created the lease,
@@ -332,7 +344,7 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-// ensureLease creates the lease if it does not exist. Returns the lease and
+// ensureLease creates the lease if it does not exist and renew it if it exists. Returns the lease and
 // a bool (true if this call created the lease), or any error that occurs.
 func (c *identityLease) ensureLease(ctx context.Context) (*v1.Lease, bool, error) {
 	lease, err := c.leaseClient.Get(ctx, c.leaseName, metav1.GetOptions{})
@@ -355,8 +367,13 @@ func (c *identityLease) ensureLease(ctx context.Context) (*v1.Lease, bool, error
 		// unexpected error getting lease
 		return nil, false, err
 	}
-	klog.Infof("identity lease exists.. doing nothing")
-	// lease already existed
+	klog.Infof("identity lease exists.. renewing")
+	clone := lease.DeepCopy()
+	clone.Spec.RenewTime = &metav1.MicroTime{Time: c.clock.Now()}
+	lease, err = c.leaseClient.Update(ctx, clone, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, false, err
+	}
 	return lease, false, nil
 }
 
