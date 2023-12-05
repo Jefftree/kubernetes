@@ -282,7 +282,7 @@ func (le *LeaderElector) renew(ctx context.Context) {
 			return
 		}
 		le.metrics.leaderOff(le.config.Name)
-		klog.Infof("failed to renew lease %v: %v", desc, err)
+		//klog.Infof("failed to renew lease %v: %v", desc, err)
 		cancel()
 	}, le.config.RetryPeriod, ctx.Done())
 
@@ -371,7 +371,7 @@ func (le *LeaderElector) tryAcquireOrRenew(ctx context.Context) bool {
 	hasNotExpired := le.observedTime.Add(time.Second * time.Duration(oldLeaderElectionRecord.LeaseDurationSeconds)).After(now.Time)
 
 	if !hasNotExpired { // TODO: switch to hasExpired
-		klog.Infof("lock has expired: %v", le.config.Lock.Describe())
+		//klog.Infof("lock has expired: %v", le.config.Lock.Describe())
 		return false
 	}
 
@@ -384,7 +384,7 @@ func (le *LeaderElector) tryAcquireOrRenew(ctx context.Context) bool {
 	// 2b. If the lease has been marked as "end of term", don't renew it
 	if le.IsLeader() && oldLeaderElectionRecord.EndOfTerm {
 		//klog.V(4).Infof("lock is marked as 'end of term', yielding lease ownership")
-		klog.Infof("lock is marked as 'end of term': %v", le.config.Lock.Describe())
+		//klog.Infof("lock is marked as 'end of term': %v", le.config.Lock.Describe())
 		// TODO: Instead of letting lease expire, the holder may deleted it directly
 		// This will not be compatible with all controllers, so it needs to be opt-in behavior..
 		// Usually once this returns false, the process is terminated..

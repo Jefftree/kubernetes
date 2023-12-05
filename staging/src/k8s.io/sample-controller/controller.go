@@ -238,7 +238,7 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 				run(ctx)
 			},
 			OnStoppedLeading: func() {
-				klog.Error(nil, "leaderelection lost")
+				klog.Error("Lost leadership, stopping")
 				klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 			},
 		})
