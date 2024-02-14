@@ -74,7 +74,8 @@ import (
 	"k8s.io/controller-manager/pkg/informerfactory"
 	"k8s.io/controller-manager/pkg/leadermigration"
 	"k8s.io/klog/v2"
-	kubefeatures "k8s.io/kubernetes/pkg/features"
+
+	// kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 
@@ -713,7 +714,7 @@ func NewControllerDescriptors() map[string]*ControllerDescriptor {
 		}
 	}
 	// TODO: Add feature gate
-	register(names.LeaderElectionController, startLeaderElectionController)
+	// register(names.LeaderElectionController, startLeaderElectionController)
 
 	return controllers
 }

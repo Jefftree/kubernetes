@@ -395,7 +395,6 @@ func (le *LeaderElector) tryAcquireOrRenew(ctx context.Context) bool {
 
 	// 3. We're going to try to update. The leaderElectionRecord is set to it's default
 	// here. Let's correct it before updating.
-<<<<<<< HEAD
 	if le.IsLeader() {
 		leaderElectionRecord.AcquireTime = oldLeaderElectionRecord.AcquireTime
 		leaderElectionRecord.LeaderTransitions = oldLeaderElectionRecord.LeaderTransitions
@@ -403,10 +402,6 @@ func (le *LeaderElector) tryAcquireOrRenew(ctx context.Context) bool {
 	} else {
 		leaderElectionRecord.LeaderTransitions = oldLeaderElectionRecord.LeaderTransitions + 1
 	}
-=======
-	leaderElectionRecord.AcquireTime = oldLeaderElectionRecord.AcquireTime
-	leaderElectionRecord.LeaderTransitions = oldLeaderElectionRecord.LeaderTransitions
->>>>>>> 8484250461c (Fully working demo)
 
 	// update the lock itself
 	if err = le.config.Lock.Update(ctx, leaderElectionRecord); err != nil {

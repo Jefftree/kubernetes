@@ -85,6 +85,7 @@ import (
 	"k8s.io/kubernetes/pkg/controlplane/controller/clusterauthenticationtrust"
 	"k8s.io/kubernetes/pkg/controlplane/controller/defaultservicecidr"
 	"k8s.io/kubernetes/pkg/controlplane/controller/kubernetesservice"
+	"k8s.io/kubernetes/pkg/controlplane/controller/leaderelection"
 	"k8s.io/kubernetes/pkg/controlplane/controller/legacytokentracking"
 	"k8s.io/kubernetes/pkg/controlplane/controller/systemnamespaces"
 	"k8s.io/kubernetes/pkg/controlplane/reconcilers"
@@ -589,6 +590,16 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		}
 
 		go controller.Run(ctx, 1)
+		return nil
+	})
+
+	m.GenericAPIServer.AddPostStartHookOrDie("start-kube-apiserver-coordinated-leader-election-controller", func(hookContext genericapiserver.PostStartHookContext) error {
+		ctx := wait.ContextForChannel(hookContext.StopCh)
+		le, err := leaderelection.NewController(c.ExtraConfig.VersionedInformers.Coordination().V1().Leases(), clientset.CoordinationV1())
+		if err != nil {
+			runtime.HandleError(err)
+		}
+		go le.Run(ctx, 1)
 		return nil
 	})
 
