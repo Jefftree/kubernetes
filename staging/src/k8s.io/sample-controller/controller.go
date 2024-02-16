@@ -21,8 +21,6 @@ import (
 	"fmt"
 	"time"
 
-	"golang.org/x/time/rate"
-
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -120,13 +118,8 @@ func NewController(
 	eventBroadcaster.StartStructuredLogging(0)
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeclientset.CoreV1().Events("")})
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
-	ratelimiter := workqueue.NewMaxOfRateLimiter(
-		workqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 1000*time.Second),
-		&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(50), 300)},
-	)
-
 	controller := &Controller{
-    kubeconfig:           kubeconfig,
+		kubeconfig:           kubeconfig,
 		identity:             identity,
 		binaryVersion:        binaryVersion,
 		compatibilityVersion: compatibilityVersion,
