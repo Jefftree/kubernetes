@@ -957,6 +957,8 @@ const (
 	//
 	// Enables the image volume source.
 	ImageVolume featuregate.Feature = "ImageVolume"
+
+	AAATestFeature featuregate.Feature = "AAATestFeature"
 )
 
 func init() {
