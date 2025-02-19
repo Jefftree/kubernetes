@@ -12,12 +12,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # seems necessary to diff with master instead of using HEAD
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9' # Or your preferred version
+          python-version: '3.9'
 
       - name: Install dependencies
         run: |
@@ -28,20 +28,22 @@ jobs:
         id: get_diff
         run: |
           echo "DIFF<<EOF" >> $GITHUB_OUTPUT
-          git diff origin/${GITHUB_BASE_REF}...origin/${GITHUB_HEAD_REF} >> $GITHUB_OUTPUT
+          echo $(git diff origin/${GITHUB_BASE_REF}...origin/${GITHUB_HEAD_REF} | base64) >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Gemini API Call
         id: gemini_review_call
         run: |
           python <<EOF
-          import os
+          import os, base64
           import google.generativeai as genai
 
           genai.configure(api_key=os.environ['GEMINI_API_KEY'])
 
           model = genai.GenerativeModel('gemini-pro')
-          prompt = f"Review this code diff for potential issues and provide feedback:\n\n ${{ steps.get_diff.outputs.DIFF }}"
+          diff_encoded = "${{ steps.get_diff.outputs.DIFF }}".strip()
+          diff = base64.b64decode(diff_encoded).decode('utf-8')
+          prompt = f"Review this code diff for potential issues and provide feedback:\n\n {diff}"
           response = model.generate_content(prompt)
 
           print(f"REVIEW<<EOF")
