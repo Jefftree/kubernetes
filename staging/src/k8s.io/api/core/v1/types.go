@@ -2559,7 +2559,7 @@ type ExecAction struct {
 // SleepAction describes a "sleep" action.
 type SleepAction struct {
 	// Seconds is the number of seconds to sleep.
-	Seconds int64 `json:"seconds" protobuf:"bytes,1,opt,name=seconds"`
+	Seconds int32 `json:"seconds" protobuf:"bytes,1,opt,name=seconds"`
 }
 
 // Probe describes a health check to be performed against a container to determine whether it is
