@@ -1953,7 +1953,7 @@ type ServiceAccountTokenProjection struct {
 	// its time to live or if the token is older than 24 hours.Defaults to 1 hour
 	// and must be at least 10 minutes.
 	// +optional
-	ExpirationSeconds *int64 `json:"expirationSeconds,omitempty" protobuf:"varint,2,opt,name=expirationSeconds"`
+	ExpirationSeconds *int32 `json:"expirationSeconds,omitempty" protobuf:"varint,2,opt,name=expirationSeconds"`
 	// path is the path relative to the mount point of the file to project the
 	// token into.
 	Path string `json:"path" protobuf:"bytes,3,opt,name=path"`
@@ -2559,7 +2559,7 @@ type ExecAction struct {
 // SleepAction describes a "sleep" action.
 type SleepAction struct {
 	// Seconds is the number of seconds to sleep.
-	Seconds int64 `json:"seconds" protobuf:"bytes,1,opt,name=seconds"`
+	Seconds int32 `json:"seconds" protobuf:"bytes,1,opt,name=seconds"`
 }
 
 // Probe describes a health check to be performed against a container to determine whether it is
