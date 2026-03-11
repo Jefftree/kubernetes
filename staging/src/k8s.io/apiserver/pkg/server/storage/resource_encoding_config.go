@@ -18,6 +18,7 @@ package storage
 
 import (
 	"fmt"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -127,11 +128,10 @@ func emulatedStorageVersion(binaryVersionOfResource schema.GroupVersion, example
 		return binaryVersionOfResource, nil
 	}
 
-	// Look up example in scheme to find all objects of the same Group-Kind
-	// Use the highest priority version for that group-kind whose lifecycle window
-	// includes the current emulation version.
-	// If no version is found, use the binary version
-	// (in this case the API should be disabled anyway)
+	// Look up example in scheme to find all versions of the same Group-Kind.
+	// Use the highest-priority version whose lifecycle window includes the
+	// current compatibility/emulation version. If no version qualifies, fall
+	// back to the binary version (the API should be disabled in that case).
 	gvks, _, err := scheme.ObjectKinds(example)
 	if err != nil {
 		return schema.GroupVersion{}, err
@@ -151,55 +151,65 @@ func emulatedStorageVersion(binaryVersionOfResource schema.GroupVersion, example
 		return schema.GroupVersion{}, fmt.Errorf("object %T has no GVKs registered in scheme", example)
 	}
 
-	// VersionsForGroupKind returns versions in priority order
+	// VersionsForGroupKind returns versions in priority order.
+	// Use the kind's priority version as the fallback instead of the group's,
+	// because the kind may not exist in the group's top version
+	// (e.g. a new alpha kind added to a group that already has a GA version).
 	versions := scheme.VersionsForGroupKind(schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind})
+	for _, gv := range versions {
+		if gv.Version != runtime.APIVersionInternal {
+			binaryVersionOfResource = gv
+			break
+		}
+	}
 
 	compatibilityVersion := effectiveVersion.MinCompatibilityVersion()
+	emulationVersion := effectiveVersion.EmulationVersion()
 
+	// introducedVersion returns when a version of this kind was introduced,
+	// or nil if unknown. When nil, the version is assumed to always exist.
+	// Skip the introduced check when compatibility version is 0.0 (test mode).
+	introducedVersion := func(gv schema.GroupVersion) (*apimachineryversion.Version, error) {
+		obj, err := scheme.New(schema.GroupVersionKind{Group: gv.Group, Version: gv.Version, Kind: gvk.Kind})
+		if err != nil {
+			return nil, err
+		}
+		if introduced, ok := obj.(introducedInterface); ok && (compatibilityVersion.Major() > 0 || compatibilityVersion.Minor() > 0) {
+			major, minor := introduced.APILifecycleIntroduced()
+			return apimachineryversion.MajorMinor(uint(major), uint(minor)), nil
+		}
+		return nil, nil
+	}
+
+	// Pass 1: Find the highest-priority non-alpha version introduced by
+	// MinCompatibilityVersion. Non-alpha versions need n-1 rollback safety.
+	for _, gv := range versions {
+		if gv.Version == runtime.APIVersionInternal || strings.Contains(gv.Version, "alpha") {
+			continue
+		}
+		ver, err := introducedVersion(gv)
+		if err != nil {
+			return schema.GroupVersion{}, err
+		}
+		if ver == nil || !ver.GreaterThan(compatibilityVersion) {
+			return gv, nil
+		}
+	}
+
+	// Pass 2: No non-alpha version qualifies (alpha-only kind).
+	// Find the highest-priority version introduced by EmulationVersion.
 	for _, gv := range versions {
 		if gv.Version == runtime.APIVersionInternal {
 			continue
 		}
-
-		gvk := schema.GroupVersionKind{
-			Group:   gv.Group,
-			Version: gv.Version,
-			Kind:    gvk.Kind,
-		}
-
-		exampleOfGVK, err := scheme.New(gvk)
+		ver, err := introducedVersion(gv)
 		if err != nil {
 			return schema.GroupVersion{}, err
 		}
-
-		// If it was introduced after current compatibility version, don't use it
-		// skip the introduced check for test when current compatibility version is 0.0 to test all apis
-		if introduced, hasIntroduced := exampleOfGVK.(introducedInterface); hasIntroduced && (compatibilityVersion.Major() > 0 || compatibilityVersion.Minor() > 0) {
-			// API resource lifecycles should be relative to k8s api version
-			majorIntroduced, minorIntroduced := introduced.APILifecycleIntroduced()
-			introducedVer := apimachineryversion.MajorMinor(uint(majorIntroduced), uint(minorIntroduced))
-			if introducedVer.GreaterThan(compatibilityVersion) {
-				continue
-			}
+		if ver == nil || !ver.GreaterThan(emulationVersion) {
+			return gv, nil
 		}
-
-		// versions is returned in priority order, so just use first result
-		return gvk.GroupVersion(), nil
 	}
 
-	// Getting here means we're serving a version that is unknown to the
-	// min-compatibility-version server.
-	//
-	// This is only expected to happen when serving an alpha API type due
-	// to missing pre-release lifecycle information
-	// (which doesn't happen by default), or when emulation-version and
-	// min-compatibility-version are several versions apart so a beta or GA API
-	// was being served which didn't exist at all in min-compatibility-version.
-	//
-	// In the alpha case - we do not support compatibility versioning of
-	// alpha types and recommend users do not mix the two.
-	// In the skip-level case - The version of apiserver we are retaining
-	// compatibility with has no knowledge of the type,
-	// so storing it in another type is no issue.
 	return binaryVersionOfResource, nil
 }
