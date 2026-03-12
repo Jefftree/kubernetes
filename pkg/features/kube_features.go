@@ -2142,6 +2142,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 		{Version: version.MustParse("1.36"), Default: false, LockToDefault: true, PreRelease: featuregate.Deprecated},
 	},
 
+	genericfeatures.ShardedListAndWatch: {
+		{Version: version.MustParse("1.36"), Default: false, PreRelease: featuregate.Alpha},
+	},
+
 	genericfeatures.SizeBasedListCostEstimate: {
 		{Version: version.MustParse("1.34"), Default: true, PreRelease: featuregate.Beta},
 	},
@@ -2612,6 +2616,8 @@ var defaultKubernetesFeatureGateDependencies = map[featuregate.Feature][]feature
 	genericfeatures.RetryGenerateName: {},
 
 	genericfeatures.SeparateCacheWatchRPC: {},
+
+	genericfeatures.ShardedListAndWatch: {},
 
 	genericfeatures.SizeBasedListCostEstimate: {},
 
