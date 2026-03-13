@@ -72,7 +72,7 @@ func (s *shardSelector) Matches(obj runtime.Object) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	hash := HashField(value)
+	hash := "0x" + HashField(value)
 
 	for _, req := range s.requirements {
 		if !hexLess(hash, req.Start) && hexLess(hash, req.End) {

@@ -32,14 +32,11 @@ func TestHashField(t *testing.T) {
 
 	for _, tt := range tests {
 		result := HashField(tt.input)
-		if len(result) != 18 {
-			t.Errorf("HashField(%q) returned %q (len %d), expected 18 chars (0x + 16 hex)", tt.input, result, len(result))
+		if len(result) != 16 {
+			t.Errorf("HashField(%q) returned %q (len %d), expected 16 hex chars", tt.input, result, len(result))
 		}
-		if result[:2] != "0x" {
-			t.Errorf("HashField(%q) returned %q, expected 0x prefix", tt.input, result)
-		}
-		// Verify digits after prefix are all hex chars
-		for _, c := range result[2:] {
+		// Verify all chars are hex
+		for _, c := range result {
 			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 				t.Errorf("HashField(%q) returned %q which contains non-hex char %q", tt.input, result, string(c))
 			}

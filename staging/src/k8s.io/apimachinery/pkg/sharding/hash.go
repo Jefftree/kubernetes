@@ -22,9 +22,9 @@ import (
 )
 
 // HashField computes the FNV-1a 64-bit hash of value and returns it
-// as a 16-character lowercase hex string.
+// as a 16-character lowercase hex string (no "0x" prefix).
 func HashField(value string) string {
 	h := fnv.New64a()
 	h.Write([]byte(value))
-	return fmt.Sprintf("0x%016x", h.Sum64())
+	return fmt.Sprintf("%016x", h.Sum64())
 }

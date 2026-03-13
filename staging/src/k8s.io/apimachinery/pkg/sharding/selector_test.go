@@ -46,7 +46,7 @@ func TestSelectorMatches(t *testing.T) {
 		},
 	}
 
-	hash := HashField("test-uid-123")
+	hash := "0x" + HashField("test-uid-123")
 
 	tests := []struct {
 		name      string
