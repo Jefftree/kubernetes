@@ -66,7 +66,7 @@ func hexLess(a, b string) bool {
 // objectInShard returns true if the object's UID hash falls within the given shard range.
 func objectInShard(uid string, index, total int) bool {
 	start, end := calculateShardRange(index, total)
-	hash := sharding.HashField(uid)
+	hash := "0x" + sharding.HashField(uid)
 	if hexLess(hash, start) {
 		return false
 	}

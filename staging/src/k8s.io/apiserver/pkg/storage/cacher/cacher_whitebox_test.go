@@ -3363,7 +3363,7 @@ func (f *fakeSnapshotter) Len() int {
 
 // selectorIncludingUID builds a shard selector whose range contains the hash of uid.
 func selectorIncludingUID(uid string) sharding.Selector {
-	hash := sharding.HashField(uid)
+	hash := "0x" + sharding.HashField(uid)
 	return sharding.NewSelector(sharding.ShardRangeRequirement{
 		Key:   "object.metadata.uid",
 		Start: hash,
@@ -3373,7 +3373,7 @@ func selectorIncludingUID(uid string) sharding.Selector {
 
 // selectorExcludingUID builds a shard selector whose range does NOT contain the hash of uid.
 func selectorExcludingUID(uid string) sharding.Selector {
-	hash := sharding.HashField(uid)
+	hash := "0x" + sharding.HashField(uid)
 	return sharding.NewSelector(sharding.ShardRangeRequirement{
 		Key:   "object.metadata.uid",
 		Start: "0x0000000000000000",
@@ -3540,7 +3540,7 @@ func TestFilterWithAttrsAndPrefixFunction_NamespaceSharding(t *testing.T) {
 	ns := "my-namespace"
 	pod := makeExamplePod("pod-ns", ns, "some-uid", nil)
 
-	nsHash := sharding.HashField(ns)
+	nsHash := "0x" + sharding.HashField(ns)
 	sel := sharding.NewSelector(sharding.ShardRangeRequirement{
 		Key:   "object.metadata.namespace",
 		Start: nsHash,
@@ -3565,7 +3565,7 @@ func TestFilterWithAttrsAndPrefixFunction_NamespaceShardingMismatch(t *testing.T
 	ns := "other-namespace"
 	pod := makeExamplePod("pod-ns2", ns, "some-uid-2", nil)
 
-	targetHash := sharding.HashField("my-namespace")
+	targetHash := "0x" + sharding.HashField("my-namespace")
 	sel := sharding.NewSelector(sharding.ShardRangeRequirement{
 		Key:   "object.metadata.namespace",
 		Start: targetHash,
