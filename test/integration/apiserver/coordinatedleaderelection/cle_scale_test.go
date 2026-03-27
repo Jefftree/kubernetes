@@ -19,6 +19,8 @@ package leaderelection
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -374,5 +376,632 @@ func pollForLeaseCandidate(ctx context.Context, t *testing.T, clientset kubernet
 	})
 	if err != nil {
 		t.Fatalf("timeout waiting for LeaseCandidate %s/%s", namespace, name)
+	}
+}
+
+// --- Happy path tests ---
+
+// TestCLERenewalOverhead measures steady-state renewal API call overhead.
+// With the fast path from PR #138064, CLE renewal should use a single Update
+// per cycle (no Get), matching plain lease LE.
+func TestCLERenewalOverhead(t *testing.T) {
+	const renewalDuration = 15 * time.Second
+
+	// --- Plain lease renewal ---
+	t.Run("plain", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, false)
+
+		server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), nil, framework.SharedEtcd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.TearDownFn()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cletest := setupCLE(server.ClientConfig, ctx, t)
+		defer cletest.cleanup()
+
+		go cletest.createAndRunFakeLegacyController("plain-renew-1", "default", "renew-bench-plain")
+		cletest.pollForLease(ctx, "renew-bench-plain", "default", ptr.To("plain-renew-1"))
+
+		// Count renewals over the measurement window.
+		renewalCount := countLeaseRenewals(ctx, t, cletest.clientset, "default", "renew-bench-plain", renewalDuration)
+		t.Logf("Plain: %d renewals in %v (%.1f/s)", renewalCount, renewalDuration, float64(renewalCount)/renewalDuration.Seconds())
+	})
+
+	// --- CLE renewal ---
+	t.Run("coordinated", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, true)
+
+		flags := []string{fmt.Sprintf("--runtime-config=%s=true", v1beta1.SchemeGroupVersion)}
+		server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), flags, framework.SharedEtcd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.TearDownFn()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cletest := setupCLE(server.ClientConfig, ctx, t)
+		defer cletest.cleanup()
+
+		go cletest.createAndRunFakeController("cle-renew-1", "default", "renew-bench-cle", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+		cletest.pollForLease(ctx, "renew-bench-cle", "default", ptr.To("cle-renew-1"))
+
+		renewalCount := countLeaseRenewals(ctx, t, cletest.clientset, "default", "renew-bench-cle", renewalDuration)
+		t.Logf("CLE: %d renewals in %v (%.1f/s)", renewalCount, renewalDuration, float64(renewalCount)/renewalDuration.Seconds())
+	})
+}
+
+// countLeaseRenewals polls the lease and counts how many times RenewTime changes.
+func countLeaseRenewals(ctx context.Context, t *testing.T, clientset kubernetes.Interface, namespace, name string, duration time.Duration) int {
+	t.Helper()
+	var count int
+	var lastRenew time.Time
+
+	deadline := time.Now().Add(duration)
+	for time.Now().Before(deadline) {
+		lease, err := clientset.CoordinationV1().Leases(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if lease.Spec.RenewTime != nil && !lease.Spec.RenewTime.Time.Equal(lastRenew) {
+			count++
+			lastRenew = lease.Spec.RenewTime.Time
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return count
+}
+
+// TestCLEAcquisitionAtScale measures time to elect leaders for many leases concurrently.
+func TestCLEAcquisitionAtScale(t *testing.T) {
+	const numLeases = 20
+	const candidatesPerLease = 2
+
+	// --- Plain lease acquisition ---
+	t.Run("plain", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, false)
+
+		server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), nil, framework.SharedEtcd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.TearDownFn()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cletest := setupCLE(server.ClientConfig, ctx, t)
+		defer cletest.cleanup()
+
+		start := time.Now()
+		for i := 0; i < numLeases; i++ {
+			leaseName := fmt.Sprintf("acq-plain-%d", i)
+			name := fmt.Sprintf("plain-ctrl-%d", i)
+			go cletest.createAndRunFakeLegacyController(name, "default", leaseName)
+		}
+
+		for i := 0; i < numLeases; i++ {
+			leaseName := fmt.Sprintf("acq-plain-%d", i)
+			name := fmt.Sprintf("plain-ctrl-%d", i)
+			cletest.pollForLease(ctx, leaseName, "default", ptr.To(name))
+		}
+		elapsed := time.Since(start)
+		t.Logf("Plain: %d leases acquired in %v", numLeases, elapsed)
+	})
+
+	// --- CLE acquisition ---
+	t.Run("coordinated", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, true)
+
+		flags := []string{fmt.Sprintf("--runtime-config=%s=true", v1beta1.SchemeGroupVersion)}
+		server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), flags, framework.SharedEtcd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.TearDownFn()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cletest := setupCLE(server.ClientConfig, ctx, t)
+		defer cletest.cleanup()
+
+		start := time.Now()
+		for i := 0; i < numLeases; i++ {
+			leaseName := fmt.Sprintf("acq-cle-%d", i)
+			for j := 0; j < candidatesPerLease; j++ {
+				name := fmt.Sprintf("cle-ctrl-%d-%d", i, j)
+				emulationVersion := "1.20.0"
+				if j == 0 {
+					emulationVersion = "1.19.0" // j=0 should win
+				}
+				go cletest.createAndRunFakeController(name, "default", leaseName, "1.20.0", emulationVersion, v1.OldestEmulationVersion)
+			}
+		}
+
+		for i := 0; i < numLeases; i++ {
+			leaseName := fmt.Sprintf("acq-cle-%d", i)
+			expectedWinner := fmt.Sprintf("cle-ctrl-%d-0", i)
+			cletest.pollForLease(ctx, leaseName, "default", ptr.To(expectedWinner))
+		}
+		elapsed := time.Since(start)
+		t.Logf("CLE: %d leases (x%d candidates) acquired in %v", numLeases, candidatesPerLease, elapsed)
+	})
+}
+
+// TestCLEGracefulFailover measures failover time when the leader shuts down gracefully.
+// With PR #138067, the LeaseCandidate is deleted on shutdown, so the server can
+// re-elect immediately without waiting for GC.
+func TestCLEGracefulFailover(t *testing.T) {
+	// NOTE on measurement asymmetry:
+	// Plain LE uses client-side expiry: isLeaseValid checks observedTime (when the CLIENT
+	// last saw a record change) + LeaseDuration. Even if we force-expire on the server,
+	// the acquiring client resets its observation clock on every Get, so it always waits a
+	// full LeaseDuration from its own observation before acquiring.
+	// CLE uses server-side expiry: the server checks the lease's actual RenewTime, so
+	// force-expiring the lease lets the server re-elect immediately.
+	// This means force-expire helps CLE but not plain LE. Both tests cancel the leader
+	// and force-expire for consistency, but the plain client will still wait ~LeaseDuration.
+
+	// --- Plain lease failover ---
+	t.Run("plain", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, false)
+
+		server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), nil, framework.SharedEtcd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.TearDownFn()
+
+		clientset := kubernetes.NewForConfigOrDie(server.ClientConfig)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cletest := setupCLE(server.ClientConfig, ctx, t)
+		defer cletest.cleanup()
+
+		// Start two controllers; first one acquires.
+		go cletest.createAndRunFakeLegacyController("plain-fo-1", "default", "fo-plain")
+		cletest.pollForLease(ctx, "fo-plain", "default", ptr.To("plain-fo-1"))
+
+		go cletest.createAndRunFakeLegacyController("plain-fo-2", "default", "fo-plain")
+		// Give the second controller time to start its acquire loop.
+		time.Sleep(2 * time.Second)
+
+		// Cancel leader and force-expire.
+		cletest.cancelController("plain-fo-1", "default")
+		forceExpireLease(ctx, t, clientset, "default", "fo-plain")
+
+		// Plain client still waits ~LeaseDuration from its next observation (see note above).
+		failoverStart := time.Now()
+		cletest.pollForLease(ctx, "fo-plain", "default", ptr.To("plain-fo-2"))
+		failoverTime := time.Since(failoverStart)
+		t.Logf("Plain graceful failover: %v (includes client-side LeaseDuration wait)", failoverTime)
+	})
+
+	// --- CLE failover ---
+	t.Run("coordinated", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, true)
+
+		flags := []string{fmt.Sprintf("--runtime-config=%s=true", v1beta1.SchemeGroupVersion)}
+		server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), flags, framework.SharedEtcd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.TearDownFn()
+
+		clientset := kubernetes.NewForConfigOrDie(server.ClientConfig)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cletest := setupCLE(server.ClientConfig, ctx, t)
+		defer cletest.cleanup()
+
+		go cletest.createAndRunFakeController("cle-fo-1", "default", "fo-cle", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+		cletest.pollForLease(ctx, "fo-cle", "default", ptr.To("cle-fo-1"))
+
+		go cletest.createAndRunFakeController("cle-fo-2", "default", "fo-cle", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+		pollForLeaseCandidate(ctx, t, clientset, "default", "cle-fo-2")
+
+		// Graceful shutdown — LeaseCandidate gets deleted via #138067.
+		// Server checks actual RenewTime, so force-expire triggers immediate re-election.
+		cletest.cancelController("cle-fo-1", "default")
+		forceExpireLease(ctx, t, clientset, "default", "fo-cle")
+
+		failoverStart := time.Now()
+		cletest.pollForLease(ctx, "fo-cle", "default", ptr.To("cle-fo-2"))
+		failoverTime := time.Since(failoverStart)
+		t.Logf("CLE graceful failover: %v (server-side re-election)", failoverTime)
+	})
+}
+
+// TestCLECrashFailover measures re-election time when the leader crashes (ungraceful).
+// Same measurement asymmetry as TestCLEGracefulFailover applies — see note there.
+func TestCLECrashFailover(t *testing.T) {
+	// --- Plain lease crash failover ---
+	t.Run("plain", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, false)
+
+		server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), nil, framework.SharedEtcd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.TearDownFn()
+
+		clientset := kubernetes.NewForConfigOrDie(server.ClientConfig)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cletest := setupCLE(server.ClientConfig, ctx, t)
+		defer cletest.cleanup()
+
+		go cletest.createAndRunFakeLegacyController("plain-crash-1", "default", "crash-plain")
+		cletest.pollForLease(ctx, "crash-plain", "default", ptr.To("plain-crash-1"))
+
+		go cletest.createAndRunFakeLegacyController("plain-crash-2", "default", "crash-plain")
+		time.Sleep(2 * time.Second)
+
+		// Simulate crash: cancel without cleanup + force-expire the lease.
+		cletest.cancelController("plain-crash-1", "default")
+		forceExpireLease(ctx, t, clientset, "default", "crash-plain")
+
+		reelectionStart := time.Now()
+		cletest.pollForLease(ctx, "crash-plain", "default", ptr.To("plain-crash-2"))
+		reelectionTime := time.Since(reelectionStart)
+		t.Logf("Plain crash re-election: %v", reelectionTime)
+	})
+
+	// --- CLE crash failover ---
+	t.Run("coordinated", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, true)
+
+		flags := []string{fmt.Sprintf("--runtime-config=%s=true", v1beta1.SchemeGroupVersion)}
+		server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), flags, framework.SharedEtcd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.TearDownFn()
+
+		clientset := kubernetes.NewForConfigOrDie(server.ClientConfig)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cletest := setupCLE(server.ClientConfig, ctx, t)
+		defer cletest.cleanup()
+
+		go cletest.createAndRunFakeController("cle-crash-1", "default", "crash-cle", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+		cletest.pollForLease(ctx, "crash-cle", "default", ptr.To("cle-crash-1"))
+
+		go cletest.createAndRunFakeController("cle-crash-2", "default", "crash-cle", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+		pollForLeaseCandidate(ctx, t, clientset, "default", "cle-crash-2")
+
+		// Crash: cancel and force-expire (LeaseCandidate NOT deleted — simulates SIGKILL).
+		cletest.cancelController("cle-crash-1", "default")
+		forceExpireLease(ctx, t, clientset, "default", "crash-cle")
+
+		reelectionStart := time.Now()
+		cletest.pollForLease(ctx, "crash-cle", "default", ptr.To("cle-crash-2"))
+		reelectionTime := time.Since(reelectionStart)
+		t.Logf("CLE crash re-election: %v", reelectionTime)
+	})
+}
+
+// TestCLEHandoffToBetterCandidate measures the time for CLE to hand off leadership
+// to a better candidate when one joins.
+func TestCLEHandoffToBetterCandidate(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, true)
+
+	flags := []string{fmt.Sprintf("--runtime-config=%s=true", v1beta1.SchemeGroupVersion)}
+	server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), flags, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	clientset := kubernetes.NewForConfigOrDie(server.ClientConfig)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cletest := setupCLE(server.ClientConfig, ctx, t)
+	defer cletest.cleanup()
+
+	// Phase 1: Establish leader with emulation version 1.20.
+	go cletest.createAndRunFakeController("handoff-1", "default", "handoff-lease", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+	cletest.pollForLease(ctx, "handoff-lease", "default", ptr.To("handoff-1"))
+	t.Logf("Phase 1: handoff-1 is leader (emulation 1.20)")
+
+	// Phase 2: Add a better candidate with emulation version 1.19.
+	handoffStart := time.Now()
+	go cletest.createAndRunFakeController("handoff-2", "default", "handoff-lease", "1.20.0", "1.19.0", v1.OldestEmulationVersion)
+	pollForLeaseCandidate(ctx, t, clientset, "default", "handoff-2")
+	cletest.pollForLease(ctx, "handoff-lease", "default", ptr.To("handoff-2"))
+	handoffTime := time.Since(handoffStart)
+	t.Logf("Phase 2: handoff to handoff-2 (emulation 1.19) took %v", handoffTime)
+
+	if handoffTime > 20*time.Second {
+		t.Errorf("Handoff too slow: %v > 20s", handoffTime)
+	}
+}
+
+// --- Likely path tests ---
+
+// TestCLERollingUpgrade simulates a rolling upgrade where candidates with different
+// versions join and leave, verifying correct leadership transitions.
+func TestCLERollingUpgrade(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, true)
+
+	flags := []string{fmt.Sprintf("--runtime-config=%s=true", v1beta1.SchemeGroupVersion)}
+	server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), flags, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	clientset := kubernetes.NewForConfigOrDie(server.ClientConfig)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cletest := setupCLE(server.ClientConfig, ctx, t)
+	defer cletest.cleanup()
+
+	// Phase 1: Start 3 replicas at v1.19. The oldest emulation version wins (all same, so
+	// first to register). Wait for any of them to become leader.
+	go cletest.createAndRunFakeController("upgrade-a", "default", "upgrade-lease", "1.19.0", "1.19.0", v1.OldestEmulationVersion)
+	go cletest.createAndRunFakeController("upgrade-b", "default", "upgrade-lease", "1.19.0", "1.19.0", v1.OldestEmulationVersion)
+	go cletest.createAndRunFakeController("upgrade-c", "default", "upgrade-lease", "1.19.0", "1.19.0", v1.OldestEmulationVersion)
+
+	// Wait for any leader to be elected.
+	var initialLeader string
+	err = wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 20*time.Second, true, func(ctx context.Context) (bool, error) {
+		lease, err := clientset.CoordinationV1().Leases("default").Get(ctx, "upgrade-lease", metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity != "" {
+			initialLeader = *lease.Spec.HolderIdentity
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		t.Fatalf("timeout waiting for initial leader")
+	}
+	t.Logf("Phase 1: initial leader is %s (all v1.19)", initialLeader)
+
+	// Phase 2: Simulate rolling upgrade — remove the leader and add a v1.20 replacement.
+	cletest.cancelController(initialLeader, "default")
+	forceExpireLease(ctx, t, clientset, "default", "upgrade-lease")
+
+	go cletest.createAndRunFakeController("upgrade-d", "default", "upgrade-lease", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+	pollForLeaseCandidate(ctx, t, clientset, "default", "upgrade-d")
+
+	// A v1.19 candidate should win (oldest emulation version).
+	var newLeader string
+	err = wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 20*time.Second, true, func(ctx context.Context) (bool, error) {
+		lease, err := clientset.CoordinationV1().Leases("default").Get(ctx, "upgrade-lease", metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity != "" && *lease.Spec.HolderIdentity != initialLeader {
+			newLeader = *lease.Spec.HolderIdentity
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		t.Fatalf("timeout waiting for new leader after rolling upgrade")
+	}
+	t.Logf("Phase 2: new leader is %s after removing %s and adding upgrade-d (v1.20)", newLeader, initialLeader)
+
+	// The new leader should NOT be the v1.20 candidate — a v1.19 should win.
+	if newLeader == "upgrade-d" {
+		t.Errorf("Expected a v1.19 candidate to be elected, but got v1.20 candidate %s", newLeader)
+	}
+
+	// Phase 3: Continue upgrade — remove remaining v1.19 candidates.
+	remainingV19 := []string{"upgrade-a", "upgrade-b", "upgrade-c"}
+	for _, name := range remainingV19 {
+		if name != initialLeader {
+			cletest.cancelController(name, "default")
+		}
+	}
+	forceExpireLease(ctx, t, clientset, "default", "upgrade-lease")
+
+	// Only upgrade-d (v1.20) should be left.
+	cletest.pollForLease(ctx, "upgrade-lease", "default", ptr.To("upgrade-d"))
+	t.Logf("Phase 3: upgrade-d (v1.20) is leader after all v1.19 removed")
+}
+
+// TestCLELeaderStabilityUnderLoad verifies that an established CLE leader maintains
+// leadership while the apiserver handles high lease churn from node heartbeats.
+func TestCLELeaderStabilityUnderLoad(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, true)
+
+	flags := []string{fmt.Sprintf("--runtime-config=%s=true", v1beta1.SchemeGroupVersion)}
+	server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), flags, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	clientset := kubernetes.NewForConfigOrDie(server.ClientConfig)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start node lease churn first.
+	const numNodeLeases = 500
+	createNodeLeases(ctx, t, clientset, numNodeLeases)
+	churnCtx, churnCancel := context.WithCancel(ctx)
+	defer churnCancel()
+	go simulateNodeLeaseRenewals(churnCtx, t, clientset, numNodeLeases)
+
+	cletest := setupCLE(server.ClientConfig, ctx, t)
+	defer cletest.cleanup()
+
+	go cletest.createAndRunFakeController("stable-1", "default", "stability-lease", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+	cletest.pollForLease(ctx, "stability-lease", "default", ptr.To("stable-1"))
+
+	// Monitor that the leader stays stable for 30 seconds under load.
+	var leaderChanges atomic.Int32
+	monitorCtx, monitorCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer monitorCancel()
+
+	go func() {
+		lastHolder := "stable-1"
+		for {
+			select {
+			case <-monitorCtx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+				lease, err := clientset.CoordinationV1().Leases("default").Get(ctx, "stability-lease", metav1.GetOptions{})
+				if err != nil {
+					continue
+				}
+				if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity != lastHolder {
+					leaderChanges.Add(1)
+					lastHolder = *lease.Spec.HolderIdentity
+				}
+			}
+		}
+	}()
+
+	<-monitorCtx.Done()
+	changes := leaderChanges.Load()
+	t.Logf("Leader changes during 30s under %d-node churn: %d", numNodeLeases, changes)
+	if changes > 0 {
+		t.Errorf("Leader should remain stable under load, but changed %d times", changes)
+	}
+}
+
+// --- Benchmark summary test ---
+
+// TestCLEPerformanceSummary runs all key scenarios back-to-back and prints a comparison table.
+func TestCLEPerformanceSummary(t *testing.T) {
+	type result struct {
+		scenario string
+		plain    time.Duration
+		cle      time.Duration
+	}
+	var results []result
+
+	// Scenario 1: Single lease acquisition
+	t.Run("single_acquisition", func(t *testing.T) {
+		var plainTime, cleTime time.Duration
+
+		t.Run("plain", func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, false)
+			server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), nil, framework.SharedEtcd())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer server.TearDownFn()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cletest := setupCLE(server.ClientConfig, ctx, t)
+			defer cletest.cleanup()
+
+			start := time.Now()
+			go cletest.createAndRunFakeLegacyController("summary-p-1", "default", "summary-plain")
+			cletest.pollForLease(ctx, "summary-plain", "default", ptr.To("summary-p-1"))
+			plainTime = time.Since(start)
+		})
+
+		t.Run("coordinated", func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, true)
+			flags := []string{fmt.Sprintf("--runtime-config=%s=true", v1beta1.SchemeGroupVersion)}
+			server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), flags, framework.SharedEtcd())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer server.TearDownFn()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cletest := setupCLE(server.ClientConfig, ctx, t)
+			defer cletest.cleanup()
+
+			start := time.Now()
+			go cletest.createAndRunFakeController("summary-c-1", "default", "summary-cle", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+			cletest.pollForLease(ctx, "summary-cle", "default", ptr.To("summary-c-1"))
+			cleTime = time.Since(start)
+		})
+
+		results = append(results, result{"single acquisition", plainTime, cleTime})
+	})
+
+	// Scenario 2: Re-election after leader loss
+	t.Run("reelection", func(t *testing.T) {
+		var plainTime, cleTime time.Duration
+
+		t.Run("plain", func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, false)
+			server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), nil, framework.SharedEtcd())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer server.TearDownFn()
+
+			clientset := kubernetes.NewForConfigOrDie(server.ClientConfig)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cletest := setupCLE(server.ClientConfig, ctx, t)
+			defer cletest.cleanup()
+
+			go cletest.createAndRunFakeLegacyController("re-p-1", "default", "re-plain")
+			cletest.pollForLease(ctx, "re-plain", "default", ptr.To("re-p-1"))
+			go cletest.createAndRunFakeLegacyController("re-p-2", "default", "re-plain")
+			time.Sleep(2 * time.Second)
+
+			cletest.cancelController("re-p-1", "default")
+			forceExpireLease(ctx, t, clientset, "default", "re-plain")
+			start := time.Now()
+			cletest.pollForLease(ctx, "re-plain", "default", ptr.To("re-p-2"))
+			plainTime = time.Since(start)
+		})
+
+		t.Run("coordinated", func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, true)
+			flags := []string{fmt.Sprintf("--runtime-config=%s=true", v1beta1.SchemeGroupVersion)}
+			server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), flags, framework.SharedEtcd())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer server.TearDownFn()
+
+			clientset := kubernetes.NewForConfigOrDie(server.ClientConfig)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cletest := setupCLE(server.ClientConfig, ctx, t)
+			defer cletest.cleanup()
+
+			go cletest.createAndRunFakeController("re-c-1", "default", "re-cle", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+			cletest.pollForLease(ctx, "re-cle", "default", ptr.To("re-c-1"))
+			go cletest.createAndRunFakeController("re-c-2", "default", "re-cle", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+			pollForLeaseCandidate(ctx, t, clientset, "default", "re-c-2")
+
+			cletest.cancelController("re-c-1", "default")
+			forceExpireLease(ctx, t, clientset, "default", "re-cle")
+			start := time.Now()
+			cletest.pollForLease(ctx, "re-cle", "default", ptr.To("re-c-2"))
+			cleTime = time.Since(start)
+		})
+
+		results = append(results, result{"re-election after loss", plainTime, cleTime})
+	})
+
+	// Print summary table.
+	t.Logf("\n=== CLE Performance Parity Summary ===")
+	t.Logf("%-30s %15s %15s %10s", "Scenario", "Plain", "CLE", "Ratio")
+	t.Logf("%-30s %15s %15s %10s", strings.Repeat("-", 30), strings.Repeat("-", 15), strings.Repeat("-", 15), strings.Repeat("-", 10))
+	for _, r := range results {
+		ratio := float64(r.cle) / float64(r.plain)
+		t.Logf("%-30s %15v %15v %9.2fx", r.scenario, r.plain.Round(time.Millisecond), r.cle.Round(time.Millisecond), ratio)
 	}
 }
