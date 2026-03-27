@@ -879,6 +879,224 @@ func TestCLELeaderStabilityUnderLoad(t *testing.T) {
 	}
 }
 
+// --- Scalability tests ---
+
+// TestCLEElectionLatencyUnderNodeChurn measures how election latency degrades
+// as node lease churn increases. This tests the CLE controller's single worker
+// processing node lease updates (no-op reconciles) while real elections are needed.
+func TestCLEElectionLatencyUnderNodeChurn(t *testing.T) {
+	nodeCounts := []int{0, 1000, 3000, 5000}
+
+	type result struct {
+		nodes             int
+		initialElection   time.Duration
+		reelection        time.Duration
+		handoff           time.Duration
+		churnRateAchieved float64 // actual renewals/s observed
+	}
+	var results []result
+
+	for _, numNodes := range nodeCounts {
+		t.Run(fmt.Sprintf("nodes_%d", numNodes), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, true)
+
+			flags := []string{fmt.Sprintf("--runtime-config=%s=true", v1beta1.SchemeGroupVersion)}
+			server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), flags, framework.SharedEtcd())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer server.TearDownFn()
+
+			clientset := kubernetes.NewForConfigOrDie(server.ClientConfig)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			// Create node leases and start churn before any elections.
+			var churnRate atomic.Int64
+			if numNodes > 0 {
+				createNodeLeases(ctx, t, clientset, numNodes)
+				churnCtx, churnCancel := context.WithCancel(ctx)
+				defer churnCancel()
+				// Use multiple goroutines for higher churn rates.
+				numChurnWorkers := numNodes / 500
+				if numChurnWorkers < 1 {
+					numChurnWorkers = 1
+				}
+				for w := 0; w < numChurnWorkers; w++ {
+					go simulateNodeLeaseRenewalsWithCounter(churnCtx, t, clientset, numNodes, &churnRate)
+				}
+				// Let churn stabilize.
+				time.Sleep(2 * time.Second)
+			}
+
+			cletest := setupCLE(server.ClientConfig, ctx, t)
+			defer cletest.cleanup()
+
+			// Measure 1: Initial election.
+			start := time.Now()
+			go cletest.createAndRunFakeController("scale-1", "default", "scale-lease", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+			cletest.pollForLease(ctx, "scale-lease", "default", ptr.To("scale-1"))
+			initialElection := time.Since(start)
+			t.Logf("Initial election: %v (nodes: %d)", initialElection, numNodes)
+
+			// Measure 2: Re-election after leader loss.
+			go cletest.createAndRunFakeController("scale-2", "default", "scale-lease", "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+			pollForLeaseCandidate(ctx, t, clientset, "default", "scale-2")
+
+			cletest.cancelController("scale-1", "default")
+			forceExpireLease(ctx, t, clientset, "default", "scale-lease")
+
+			reelectionStart := time.Now()
+			cletest.pollForLease(ctx, "scale-lease", "default", ptr.To("scale-2"))
+			reelection := time.Since(reelectionStart)
+			t.Logf("Re-election: %v", reelection)
+
+			// Measure 3: Handoff to better candidate.
+			// This involves: electionNeeded detects better candidate → ping/ack → set PreferredHolder →
+			// current leader steps down → lease expires → new election. Can take 10-15s.
+			handoffStart := time.Now()
+			go cletest.createAndRunFakeController("scale-3", "default", "scale-lease", "1.20.0", "1.19.0", v1.OldestEmulationVersion)
+			pollForLeaseCandidate(ctx, t, clientset, "default", "scale-3")
+			err = wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 45*time.Second, true, func(ctx context.Context) (bool, error) {
+				lease, err := clientset.CoordinationV1().Leases("default").Get(ctx, "scale-lease", metav1.GetOptions{})
+				if err != nil {
+					return false, nil
+				}
+				return lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity == "scale-3", nil
+			})
+			if err != nil {
+				t.Fatalf("timeout waiting for handoff to scale-3")
+			}
+			handoff := time.Since(handoffStart)
+			t.Logf("Handoff to better candidate: %v", handoff)
+
+			// Snapshot churn rate.
+			observedChurn := float64(churnRate.Load()) / time.Since(start).Seconds()
+
+			r := result{
+				nodes:             numNodes,
+				initialElection:   initialElection,
+				reelection:        reelection,
+				handoff:           handoff,
+				churnRateAchieved: observedChurn,
+			}
+			results = append(results, r)
+
+			// Hard limit: elections should complete within 20s even under heavy churn.
+			const maxLatency = 20 * time.Second
+			if initialElection > maxLatency {
+				t.Errorf("Initial election too slow: %v > %v", initialElection, maxLatency)
+			}
+			if reelection > maxLatency {
+				t.Errorf("Re-election too slow: %v > %v", reelection, maxLatency)
+			}
+			if handoff > maxLatency {
+				t.Errorf("Handoff too slow: %v > %v", handoff, maxLatency)
+			}
+		})
+	}
+
+	// Print summary table.
+	t.Logf("\n=== CLE Election Latency vs Node Lease Churn ===")
+	t.Logf("%-10s %10s %15s %15s %15s", "Nodes", "Churn/s", "Initial", "Re-election", "Handoff")
+	t.Logf("%-10s %10s %15s %15s %15s", strings.Repeat("-", 10), strings.Repeat("-", 10), strings.Repeat("-", 15), strings.Repeat("-", 15), strings.Repeat("-", 15))
+	for _, r := range results {
+		t.Logf("%-10d %10.0f %15v %15v %15v",
+			r.nodes, r.churnRateAchieved,
+			r.initialElection.Round(time.Millisecond),
+			r.reelection.Round(time.Millisecond),
+			r.handoff.Round(time.Millisecond))
+	}
+}
+
+// simulateNodeLeaseRenewalsWithCounter is like simulateNodeLeaseRenewals but
+// increments an atomic counter for each successful renewal.
+func simulateNodeLeaseRenewalsWithCounter(ctx context.Context, t *testing.T, clientset kubernetes.Interface, numLeases int, counter *atomic.Int64) {
+	t.Helper()
+	i := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		name := fmt.Sprintf("node-%04d", i%numLeases)
+		lease, err := clientset.CoordinationV1().Leases(corev1.NamespaceNodeLease).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			i++
+			continue
+		}
+		lease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
+		_, err = clientset.CoordinationV1().Leases(corev1.NamespaceNodeLease).Update(ctx, lease, metav1.UpdateOptions{})
+		if err != nil {
+			i++
+			continue
+		}
+		counter.Add(1)
+		i++
+
+		// Pace to avoid overwhelming the test apiserver.
+		err = wait.PollUntilContextTimeout(ctx, 2*time.Millisecond, time.Second, true, func(ctx context.Context) (bool, error) {
+			return true, nil
+		})
+		if err != nil {
+			return
+		}
+	}
+}
+
+// TestCLEConcurrentElectionsUnderLoad measures how many concurrent elections
+// the CLE controller can handle while under node lease churn.
+func TestCLEConcurrentElectionsUnderLoad(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, true)
+
+	flags := []string{fmt.Sprintf("--runtime-config=%s=true", v1beta1.SchemeGroupVersion)}
+	server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), flags, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	clientset := kubernetes.NewForConfigOrDie(server.ClientConfig)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start heavy churn.
+	const numNodeLeases = 3000
+	createNodeLeases(ctx, t, clientset, numNodeLeases)
+	churnCtx, churnCancel := context.WithCancel(ctx)
+	defer churnCancel()
+	for w := 0; w < 6; w++ {
+		go simulateNodeLeaseRenewals(churnCtx, t, clientset, numNodeLeases)
+	}
+	time.Sleep(2 * time.Second)
+
+	// Trigger 20 concurrent elections (simulating KCM + scheduler + custom controllers).
+	const numLeases = 20
+	cletest := setupCLE(server.ClientConfig, ctx, t)
+	defer cletest.cleanup()
+
+	start := time.Now()
+	for i := 0; i < numLeases; i++ {
+		leaseName := fmt.Sprintf("concurrent-%d", i)
+		name := fmt.Sprintf("ctrl-%d", i)
+		go cletest.createAndRunFakeController(name, "default", leaseName, "1.20.0", "1.20.0", v1.OldestEmulationVersion)
+	}
+
+	for i := 0; i < numLeases; i++ {
+		leaseName := fmt.Sprintf("concurrent-%d", i)
+		expectedWinner := fmt.Sprintf("ctrl-%d", i)
+		cletest.pollForLease(ctx, leaseName, "default", ptr.To(expectedWinner))
+	}
+	elapsed := time.Since(start)
+	t.Logf("All %d elections completed in %v under %d-node churn", numLeases, elapsed, numNodeLeases)
+
+	if elapsed > 30*time.Second {
+		t.Errorf("Concurrent elections too slow: %v > 30s", elapsed)
+	}
+}
+
 // --- Benchmark summary test ---
 
 // TestCLEPerformanceSummary runs all key scenarios back-to-back and prints a comparison table.

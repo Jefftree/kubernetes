@@ -363,17 +363,22 @@ func (le *LeaderElector) tryCoordinatedRenew(ctx context.Context) bool {
 	// last time is the current version.
 	if le.IsLeader() && le.isLeaseValid(now.Time) {
 		oldObservedRecord := le.getObservedRecord()
-		leaderElectionRecord.AcquireTime = oldObservedRecord.AcquireTime
-		leaderElectionRecord.LeaderTransitions = oldObservedRecord.LeaderTransitions
-		// For coordinated, also preserve Strategy
-		leaderElectionRecord.Strategy = oldObservedRecord.Strategy
+		// If PreferredHolder is set, the server is signaling end-of-term.
+		// Skip the fast path so the slow path can read the current state and handle it.
+		if oldObservedRecord.PreferredHolder != "" {
+			logger.V(4).Info("PreferredHolder set, skipping fast path", "lock", le.config.Lock.Describe())
+		} else {
+			leaderElectionRecord.AcquireTime = oldObservedRecord.AcquireTime
+			leaderElectionRecord.LeaderTransitions = oldObservedRecord.LeaderTransitions
+			leaderElectionRecord.Strategy = oldObservedRecord.Strategy
 
-		err := le.config.Lock.Update(ctx, leaderElectionRecord)
-		if err == nil {
-			le.setObservedRecord(&leaderElectionRecord)
-			return true
+			err := le.config.Lock.Update(ctx, leaderElectionRecord)
+			if err == nil {
+				le.setObservedRecord(&leaderElectionRecord)
+				return true
+			}
+			logger.V(2).Info("Failed to update lease optimistically, falling back to slow path", "lock", le.config.Lock.Describe(), "err", err)
 		}
-		logger.V(2).Info("Failed to update lease optimistically, falling back to slow path", "lock", le.config.Lock.Describe(), "err", err)
 	}
 
 	// 2. obtain the electionRecord
