@@ -31,6 +31,7 @@ import (
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apiserver/pkg/storage"
+	cachertesting "k8s.io/apiserver/pkg/storage/cacher/testing"
 	"k8s.io/apiserver/pkg/storage/etcd3"
 	"k8s.io/utils/clock"
 )
@@ -40,7 +41,7 @@ func BenchmarkCacherInit(b *testing.B) {
 
 	ctx := context.Background()
 
-	server, etcdStorage := newCorev1EtcdTestStorage(b)
+	server, etcdStorage := cachertesting.NewCorev1EtcdTestStorage(b)
 	b.Cleanup(func() { server.Terminate(b) })
 
 	seedCorev1PodsParallel(b, ctx, etcdStorage, 1, pods, 32)
@@ -54,10 +55,10 @@ func BenchmarkCacherInit(b *testing.B) {
 		KeyFunc: func(obj runtime.Object) (string, error) {
 			return storage.NamespaceKeyFunc("/pods/", obj)
 		},
-		GetAttrsFunc: getCorev1PodAttrs,
+		GetAttrsFunc: cachertesting.GetCorev1PodAttrs,
 		NewFunc:      func() runtime.Object { return &corev1.Pod{} },
 		NewListFunc:  func() runtime.Object { return &corev1.PodList{} },
-		Codec:        corev1ProtoCodec,
+		Codec:        cachertesting.Corev1ProtoCodec,
 		Clock:        clock.RealClock{},
 	}
 

@@ -26,17 +26,14 @@ import (
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/rand"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/apis/example"
-	examplev1 "k8s.io/apiserver/pkg/apis/example/v1"
 	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
+	cachertesting "k8s.io/apiserver/pkg/storage/cacher/testing"
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
 	storagetesting "k8s.io/apiserver/pkg/storage/testing"
 	"k8s.io/apiserver/pkg/storage/value/encrypt/identity"
@@ -48,51 +45,10 @@ import (
 	"k8s.io/utils/clock"
 )
 
-func init() {
-	metav1.AddToGroupVersion(scheme, metav1.SchemeGroupVersion)
-	utilruntime.Must(example.AddToScheme(scheme))
-	utilruntime.Must(examplev1.AddToScheme(scheme))
-}
-
-// GetPodAttrs returns labels and fields of a given object for filtering purposes.
-func GetPodAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
-	pod, ok := obj.(*example.Pod)
-	if !ok {
-		return nil, nil, fmt.Errorf("not a pod")
-	}
-	return labels.Set(pod.ObjectMeta.Labels), PodToSelectableFields(pod), nil
-}
-
-// PodToSelectableFields returns a field set that represents the object
-// TODO: fields are not labels, and the validation rules for them do not apply.
-func PodToSelectableFields(pod *example.Pod) fields.Set {
-	// The purpose of allocation with a given number of elements is to reduce
-	// amount of allocations needed to create the fields.Set. If you add any
-	// field here or the number of object-meta related fields changes, this should
-	// be adjusted.
-	podSpecificFieldsSet := make(fields.Set, 5)
-	podSpecificFieldsSet["spec.nodeName"] = pod.Spec.NodeName
-	podSpecificFieldsSet["spec.restartPolicy"] = string(pod.Spec.RestartPolicy)
-	podSpecificFieldsSet["status.phase"] = string(pod.Status.Phase)
-	return AddObjectMetaFieldsSet(podSpecificFieldsSet, &pod.ObjectMeta, true)
-}
-
-func AddObjectMetaFieldsSet(source fields.Set, objectMeta *metav1.ObjectMeta, hasNamespaceField bool) fields.Set {
-	source["metadata.name"] = objectMeta.Name
-	if hasNamespaceField {
-		source["metadata.namespace"] = objectMeta.Namespace
-	}
-	return source
-}
-
-func checkStorageInvariants(ctx context.Context, t *testing.T, key string) {
-	// No-op function since cacher simply passes object creation to the underlying storage.
-}
-
 func TestCreate(t *testing.T) {
 	ctx, cacher, terminate := testSetup(t)
 	t.Cleanup(terminate)
-	storagetesting.RunTestCreate(ctx, t, cacher, checkStorageInvariants)
+	storagetesting.RunTestCreate(ctx, t, cacher, cachertesting.CheckStorageInvariants)
 }
 
 func TestCreateWithTTL(t *testing.T) {
@@ -194,14 +150,14 @@ func TestLists(t *testing.T) {
 				t.Parallel()
 				ctx, cacher, server, terminate := testSetupWithEtcdServer(t)
 				t.Cleanup(terminate)
-				storagetesting.RunTestConsistentList(ctx, t, cacher, increaseRVFunc(server.V3Client.Client), true, true, listFromCacheSnapshot)
+				storagetesting.RunTestConsistentList(ctx, t, cacher, cachertesting.IncreaseRVFunc(server.V3Client.Client), true, true, listFromCacheSnapshot)
 			})
 
 			t.Run("GetListNonRecursive", func(t *testing.T) {
 				t.Parallel()
 				ctx, cacher, server, terminate := testSetupWithEtcdServer(t)
 				t.Cleanup(terminate)
-				storagetesting.RunTestGetListNonRecursive(ctx, t, increaseRVFunc(server.V3Client.Client), cacher)
+				storagetesting.RunTestGetListNonRecursive(ctx, t, cachertesting.IncreaseRVFunc(server.V3Client.Client), cacher)
 			})
 		})
 	}
@@ -212,7 +168,7 @@ func TestCompactRevision(t *testing.T) {
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ListFromCacheSnapshot, true)
 	ctx, cacher, server, terminate := testSetupWithEtcdServer(t)
 	t.Cleanup(terminate)
-	storagetesting.RunTestCompactRevision(ctx, t, cacher, increaseRVFunc(server.V3Client.Client), compactStore(cacher, server.V3Client.Client))
+	storagetesting.RunTestCompactRevision(ctx, t, cacher, cachertesting.IncreaseRVFunc(server.V3Client.Client), compactStore(cacher, server.V3Client.Client))
 }
 
 func TestMarkConsistent(t *testing.T) {
@@ -286,7 +242,7 @@ func TestMarkConsistent(t *testing.T) {
 func createObject(t *testing.T, ctx context.Context, store storage.Interface) string {
 	var out example.Pod
 	pod := &example.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: rand.String(10)}}
-	err := store.Create(ctx, computePodKey(pod), pod, &out, 0)
+	err := store.Create(ctx, cachertesting.ComputePodKey(pod), pod, &out, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +337,7 @@ func TestStats(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SizeBasedListCostEstimate, sizeBasedListCostEstimate)
 			ctx, cacher, terminate := testSetup(t)
 			t.Cleanup(terminate)
-			storagetesting.RunTestStats(ctx, t, cacher, examplev1ProtoCodec, identity.NewEncryptCheckTransformer(), sizeBasedListCostEstimate)
+			storagetesting.RunTestStats(ctx, t, cacher, cachertesting.Examplev1ProtoCodec, identity.NewEncryptCheckTransformer(), sizeBasedListCostEstimate)
 		})
 	}
 }
@@ -503,7 +459,7 @@ func withDefaults(options *setupOptions) {
 	options.resourcePrefix = prefix
 	options.keyFunc = func(obj runtime.Object) (string, error) { return storage.NamespaceKeyFunc(prefix, obj) }
 	options.clock = clock.RealClock{}
-	options.codec = examplev1ProtoCodec
+	options.codec = cachertesting.Examplev1ProtoCodec
 }
 
 func withClusterScopedKeyFunc(options *setupOptions) {
@@ -547,7 +503,7 @@ func testSetupWithEtcdServer(t testing.TB, opts ...setupOption) (context.Context
 		opt(&setupOpts)
 	}
 
-	server, etcdStorage := newEtcdTestStorageWithCodec(t, etcd3testing.PathPrefix(), setupOpts.codec)
+	server, etcdStorage := cachertesting.NewEtcdTestStorageWithCodec(t, etcd3testing.PathPrefix(), setupOpts.codec)
 	// Inject one list error to make sure we test the relist case.
 	listErrors := 1
 	if clientfeatures.FeatureGates().Enabled(clientfeatures.WatchListClient) {
@@ -567,9 +523,9 @@ func testSetupWithEtcdServer(t testing.TB, opts ...setupOption) (context.Context
 		EventsHistoryWindow: DefaultEventFreshDuration,
 		ResourcePrefix:      setupOpts.resourcePrefix,
 		KeyFunc:             setupOpts.keyFunc,
-		GetAttrsFunc:        GetPodAttrs,
-		NewFunc:             newPod,
-		NewListFunc:         newPodList,
+		GetAttrsFunc:        cachertesting.GetPodAttrs,
+		NewFunc:             cachertesting.NewPod,
+		NewListFunc:         cachertesting.NewPodList,
 		IndexerFuncs:        setupOpts.indexerFuncs,
 		Indexers:            &setupOpts.indexers,
 		Codec:               setupOpts.codec,
@@ -683,7 +639,7 @@ func BenchmarkStoreList(b *testing.B) {
 			b.Cleanup(terminate)
 			var out example.Pod
 			for _, pod := range data.Pods {
-				err := cacher.Create(ctx, computePodKey(pod), pod, &out, 0)
+				err := cacher.Create(ctx, cachertesting.ComputePodKey(pod), pod, &out, 0)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -704,7 +660,7 @@ func BenchmarkStoreStats(b *testing.B) {
 	b.Cleanup(terminate)
 	var out example.Pod
 	for _, pod := range data.Pods {
-		err := cacher.Create(ctx, computePodKey(pod), pod, &out, 0)
+		err := cacher.Create(ctx, cachertesting.ComputePodKey(pod), pod, &out, 0)
 		if err != nil {
 			b.Fatal(err)
 		}

@@ -25,6 +25,7 @@ import (
 	"k8s.io/apiserver/pkg/apis/example"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/cacher/consistency"
+	cachertesting "k8s.io/apiserver/pkg/storage/cacher/testing"
 )
 
 func TestConsistencyCheckerDigestMatches(t *testing.T) {
@@ -36,7 +37,7 @@ func TestConsistencyCheckerDigestMatches(t *testing.T) {
 	t.Logf("Create %d pods to ensure pagination", storageWatchListPageSize+1)
 	for i := 0; i < int(storageWatchListPageSize)+1; i++ {
 		pod := &example.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: fmt.Sprintf("%d", i)}}
-		err := store.Create(ctx, computePodKey(pod), pod, &out, 0)
+		err := store.Create(ctx, cachertesting.ComputePodKey(pod), pod, &out, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -91,7 +91,7 @@ func newTestCacherWithoutSyncing(s storage.Interface, c clock.WithTicker) (*Cach
 		},
 		NewFunc:     func() runtime.Object { return &example.Pod{} },
 		NewListFunc: func() runtime.Object { return &example.PodList{} },
-		Codec:       codecs.LegacyCodec(examplev1.SchemeGroupVersion),
+		Codec:       cachertesting.Codecs.LegacyCodec(examplev1.SchemeGroupVersion),
 		Clock:       c,
 	}
 	cacher, err := NewCacherFromConfig(config)
@@ -457,7 +457,7 @@ apiserver_watch_cache_consistent_read_total{fallback="skipped", group="", resour
 					return nil
 				}
 				if tc.fallbackError {
-					return errDummy
+					return cachertesting.ErrDummy
 				}
 				podList.ResourceVersion = tc.storageRV
 				return nil
@@ -637,7 +637,7 @@ func TestGetListNonRecursiveCacheWithConsistentListFromCache(t *testing.T) {
 			backingStorage.GetListFn = func(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
 				getListCount++
 				if tc.injectRVError {
-					return errDummy
+					return cachertesting.ErrDummy
 				}
 				podList := listObj.(*example.PodList)
 				podList.ListMeta = metav1.ListMeta{ResourceVersion: "100"}
@@ -649,7 +649,7 @@ func TestGetListNonRecursiveCacheWithConsistentListFromCache(t *testing.T) {
 				rv := uint64(100)
 				err := error(nil)
 				if tc.injectRVError {
-					err = errDummy
+					err = cachertesting.ErrDummy
 					return 0, err
 				}
 				return rv, nil
@@ -737,7 +737,7 @@ func TestGetCacheBypass(t *testing.T) {
 	result := &example.Pod{}
 
 	// Inject error to underlying layer and check if cacher is not bypassed.
-	backingStorage.InjectGetListError(errDummy)
+	backingStorage.InjectGetListError(cachertesting.ErrDummy)
 	err = delegator.Get(context.TODO(), "/pods/ns/pod-0", storage.GetOptions{
 		IgnoreNotFound:  true,
 		ResourceVersion: "0",
@@ -750,7 +750,7 @@ func TestGetCacheBypass(t *testing.T) {
 		IgnoreNotFound:  true,
 		ResourceVersion: "",
 	}, result)
-	if !errors.Is(err, errDummy) {
+	if !errors.Is(err, cachertesting.ErrDummy) {
 		t.Errorf("Get without RV=0 should bypass cacher: %v", err)
 	}
 }
@@ -783,7 +783,7 @@ func TestWatchCacheBypass(t *testing.T) {
 }
 
 func TestEmptyWatchEventCache(t *testing.T) {
-	server, etcdStorage := newEtcdTestStorage(t, etcd3testing.PathPrefix())
+	server, etcdStorage := cachertesting.NewEtcdTestStorage(t, etcd3testing.PathPrefix())
 	defer server.Terminate(t)
 
 	// add a few objects
@@ -792,7 +792,7 @@ func TestEmptyWatchEventCache(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		pod := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("foo-%d", i), Namespace: "test-ns"}}
 		out := &example.Pod{}
-		key := computePodKey(pod)
+		key := cachertesting.ComputePodKey(pod)
 		if err := etcdStorage.Create(context.Background(), key, pod, out, 0); err != nil {
 			t.Fatalf("Create failed: %v", err)
 		}
@@ -2879,7 +2879,7 @@ func forceRequestWatchProgressSupport(t *testing.T) {
 		return
 	}
 
-	server, _ := newEtcdTestStorage(t, etcd3testing.PathPrefix())
+	server, _ := cachertesting.NewEtcdTestStorage(t, etcd3testing.PathPrefix())
 	defer server.Terminate(t)
 	if err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, wait.ForeverTestTimeout, true, func(_ context.Context) (bool, error) {
 		return etcdfeature.DefaultFeatureSupportChecker.Supports(storage.RequestWatchProgress), nil
