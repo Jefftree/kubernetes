@@ -786,13 +786,14 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 	var numFetched int
 	var numEvald int
 	var streamed bool
+	var decodeDuration time.Duration
 	startTime := time.Now()
 	// Because these metrics are for understanding the costs of handling LIST requests,
 	// get them recorded even in error cases.
 	defer func() {
 		numReturn := v.Len()
 		metrics.RecordStorageListMetrics(s.groupResource, "", numFetched, numEvald, numReturn)
-		metrics.RecordListLatency(s.groupResource, streamed, startTime)
+		metrics.RecordListLatency(s.groupResource, streamed, time.Since(startTime), decodeDuration)
 	}()
 
 	aggregator := s.listErrAggrFactory()
@@ -829,7 +830,7 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 		}
 		count = chunk.count
 
-		chunkLastKey, chunkEvaluated, limitReached, err := s.appendChunk(ctx, chunk.kvs, opts.Predicate, newItemFunc, aggregator, v, paging)
+		chunkLastKey, chunkEvaluated, limitReached, err := s.appendChunk(ctx, chunk.kvs, opts.Predicate, newItemFunc, aggregator, v, paging, &decodeDuration)
 		if err != nil {
 			return err
 		}
@@ -1006,7 +1007,7 @@ func (s *store) finalizeList(listObj runtime.Object, pred storage.SelectionPredi
 	return nil
 }
 
-func (s *store) processListItem(ctx context.Context, kv *mvccpb.KeyValue, pred storage.SelectionPredicate, newItemFunc func() runtime.Object, aggregator listItemErrors, v reflect.Value) (bool, error) {
+func (s *store) processListItem(ctx context.Context, kv *mvccpb.KeyValue, pred storage.SelectionPredicate, newItemFunc func() runtime.Object, aggregator listItemErrors, v reflect.Value, decodeAcc *time.Duration) (bool, error) {
 	data, _, err := s.transformer.TransformFromStorage(ctx, kv.Value, authenticatedDataString(kv.Key))
 	if err != nil {
 		if done := aggregator.Append(string(kv.Key), storage.NewInternalError(fmt.Errorf("unable to transform key %q: %w", kv.Key, err))); done {
@@ -1023,7 +1024,9 @@ func (s *store) processListItem(ctx context.Context, kv *mvccpb.KeyValue, pred s
 	default:
 	}
 
+	decodeStart := time.Now()
 	obj, err := s.decoder.DecodeListItem(ctx, data, uint64(kv.ModRevision), newItemFunc)
+	*decodeAcc += time.Since(decodeStart)
 	if err != nil {
 		recordDecodeError(s.groupResource, string(kv.Key))
 		if done := aggregator.Append(string(kv.Key), err); done {
@@ -1041,7 +1044,7 @@ func (s *store) processListItem(ctx context.Context, kv *mvccpb.KeyValue, pred s
 }
 
 // appendChunk appends the kvs matching pred to v.
-func (s *store) appendChunk(ctx context.Context, kvs []*mvccpb.KeyValue, pred storage.SelectionPredicate, newItemFunc func() runtime.Object, aggregator listItemErrors, v reflect.Value, paging bool) (lastKey []byte, evaluated int, limitReached bool, err error) {
+func (s *store) appendChunk(ctx context.Context, kvs []*mvccpb.KeyValue, pred storage.SelectionPredicate, newItemFunc func() runtime.Object, aggregator listItemErrors, v reflect.Value, paging bool, decodeAcc *time.Duration) (lastKey []byte, evaluated int, limitReached bool, err error) {
 	// avoid small allocations for the result slice, since this can be called in many
 	// different contexts and we don't know how significantly the result will be filtered
 	if pred.Empty() {
@@ -1054,7 +1057,7 @@ func (s *store) appendChunk(ctx context.Context, kvs []*mvccpb.KeyValue, pred st
 			return lastKey, evaluated, true, nil
 		}
 		lastKey = kv.Key
-		ok, err := s.processListItem(ctx, kv, pred, newItemFunc, aggregator, v)
+		ok, err := s.processListItem(ctx, kv, pred, newItemFunc, aggregator, v, decodeAcc)
 		if err != nil {
 			return lastKey, evaluated, false, err
 		}

@@ -146,12 +146,14 @@ var (
 		&compbasemetrics.HistogramOpts{
 			Namespace: "apiserver",
 			Name:      "storage_list_duration_seconds",
-			Help:      "Latency of the storage layer GetList call in seconds, including object decode, split by whether etcd RangeStream was used.",
+			Help: "Latency of the storage layer GetList call in seconds, split by pipeline stage " +
+				"(total end-to-end, object decode, and the derived etcd read = total - decode) and " +
+				"by whether etcd RangeStream was used.",
 			Buckets: []float64{0.005, 0.025, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5, 2, 3,
 				4, 5, 6, 8, 10, 15, 20, 30, 45, 60},
 			StabilityLevel: compbasemetrics.ALPHA,
 		},
-		[]string{"streamed", "group", "resource"},
+		[]string{"stage", "streamed", "group", "resource"},
 	)
 )
 
@@ -217,13 +219,47 @@ func RecordEtcdRequest(verb string, groupResource schema.GroupResource, err erro
 	}
 }
 
-// RecordListLatency sets the storage_list_duration_seconds metric.
-func RecordListLatency(groupResource schema.GroupResource, streamed bool, startTime time.Time) {
+// ListStage identifies a phase of a GetList call. It is the "stage" label value
+// on storage_list_duration_seconds.
+type ListStage int
+
+const (
+	// ListStageTotal is the end-to-end GetList latency (etcd read + decode).
+	ListStageTotal ListStage = iota
+	// ListStageDecode is the cumulative time spent decoding list items.
+	ListStageDecode
+	// ListStageRead is total minus decode, attributing latency to the etcd read.
+	// For streamed lists etcd read and decode interleave in a single goroutine,
+	// so this recovers the read latency that etcd_request_duration_seconds
+	// {operation="listStream"} cannot separate from decode.
+	ListStageRead
+
+	numListStages
+)
+
+var listStageName = [numListStages]string{
+	ListStageTotal:  "total",
+	ListStageDecode: "decode",
+	ListStageRead:   "read",
+}
+
+// RecordListLatency records storage_list_duration_seconds for a GetList call,
+// split into total, decode, and derived read (total - decode) stages.
+func RecordListLatency(groupResource schema.GroupResource, streamed bool, total, decode time.Duration) {
 	streamedLabel := "false"
 	if streamed {
 		streamedLabel = "true"
 	}
-	listLatency.WithLabelValues(streamedLabel, groupResource.Group, groupResource.Resource).Observe(sinceInSeconds(startTime))
+	observeListStage(groupResource, streamedLabel, ListStageTotal, total)
+	observeListStage(groupResource, streamedLabel, ListStageDecode, decode)
+	observeListStage(groupResource, streamedLabel, ListStageRead, total-decode)
+}
+
+func observeListStage(groupResource schema.GroupResource, streamed string, stage ListStage, d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	listLatency.WithLabelValues(listStageName[stage], streamed, groupResource.Group, groupResource.Resource).Observe(d.Seconds())
 }
 
 // RecordEtcdEvent updated the etcd_events_received_total metric.

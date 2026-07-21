@@ -1910,13 +1910,15 @@
     endpoint: /metrics
 - name: storage_list_duration_seconds
   namespace: apiserver
-  help: Latency of the storage layer GetList call in seconds, including object decode,
-    split by whether etcd RangeStream was used.
+  help: Latency of the storage layer GetList call in seconds, split by pipeline stage
+    (total end-to-end, object decode, and the derived etcd read = total - decode)
+    and by whether etcd RangeStream was used.
   type: Histogram
   stabilityLevel: ALPHA
   labels:
   - group
   - resource
+  - stage
   - streamed
   buckets:
   - 0.005
