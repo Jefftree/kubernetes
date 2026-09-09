@@ -19,6 +19,7 @@ package cacher
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -146,6 +147,9 @@ type ImmutableWatchCacheConfig struct {
 	// the encoded form on ingest, and to decode it back on demand.
 	codec runtime.Codec
 
+	// objectType is the concrete type this cacher's codec was verified against.
+	objectType reflect.Type
+
 	// indexers and triggerFunc are evaluated eagerly on ingest for lazy
 	// elements, because both are read on paths that must not decode.
 	indexers    *cache.Indexers
@@ -178,6 +182,7 @@ func newWatchCache(
 		getCurrentRV:      getCurrentRV,
 		lazyDecode:        utilfeature.DefaultFeatureGate.Enabled(features.LazyDecodeWatchCache) && codecRoundTripsCleanly(codec, newFunc, groupResource),
 		codec:             codec,
+		objectType:        objectTypeOf(newFunc),
 		indexers:          indexers,
 		triggerFunc:       triggerFunc,
 	}
@@ -225,6 +230,14 @@ func (w *watchCache) Delete(obj interface{}) error {
 	event := watch.Event{Type: watch.Deleted, Object: object}
 
 	return w.processEvent(event, resourceVersion)
+}
+
+// objectTypeOf is the concrete type a cacher stores, or nil if unknown.
+func objectTypeOf(newFunc func() runtime.Object) reflect.Type {
+	if newFunc == nil {
+		return nil
+	}
+	return reflect.TypeOf(newFunc())
 }
 
 // codecRoundTripsCleanly reports whether storing objects encoded with this
@@ -278,6 +291,17 @@ func (w *watchCache) newElement(key string, object runtime.Object) (*store.Eleme
 		elem.TriggerValue = w.config.triggerFunc(object)
 	}
 	if !w.config.lazyDecode {
+		return elem, nil
+	}
+	// The round-trip guard at construction only proves the codec is faithful
+	// for the type this cacher is configured for. An object of any other type
+	// may still encode "successfully" under that codec and come back as
+	// something else entirely, losing fields with no error anywhere. Retain
+	// such an object decoded rather than convert it silently.
+	if reflect.TypeOf(object) != w.config.objectType {
+		klog.V(2).InfoS("Falling back to storing a decoded object in the watch cache: unexpected type",
+			"groupResource", w.config.groupResource, "got", fmt.Sprintf("%T", object), "want", w.config.objectType)
+		metrics.RecordLazyEncodeFallback(w.config.groupResource)
 		return elem, nil
 	}
 	lazy, err := store.EncodeToLazyObject(w.config.codec, w.config.codec, object)
