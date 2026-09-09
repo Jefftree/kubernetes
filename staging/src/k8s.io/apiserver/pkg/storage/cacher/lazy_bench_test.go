@@ -591,6 +591,92 @@ func TestLazyObjectCacheEncodeRetainsNothing(t *testing.T) {
 	}
 }
 
+// TestLazyGCCostRealWorkload answers the objection that TestLazyGCCost dodges:
+// that test holds a cache live and then allocates identical garbage in both
+// arms, so it measures the mark-cost saving while deliberately excluding the
+// extra garbage the change creates by encoding on ingest.
+//
+// Here the workload IS the cache's own ingest, so both effects are in play at
+// once: the lazy arm allocates roughly 9x more per event and retains far less.
+// Both arms process the same number of events against the same 10,000-pod
+// cache, and this reports GC cost per event.
+//
+// The update pool is deliberately small. Holding 10,000 decoded pods to replay
+// would put ~2.8M objects in the live heap of BOTH arms and swamp the very
+// difference being measured.
+//
+//	go test ./pkg/storage/cacher/ -run TestLazyGCCostRealWorkload -v -count=1
+func TestLazyGCCostRealWorkload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs millions of ingest events")
+	}
+	const podCount = 10000
+	const poolSize = 50
+	const events = 1000000
+
+	wc := newTestWatchCache(2000, DefaultEventFreshDuration, &cache.Indexers{})
+	defer wc.Stop()
+	wc.history.lowerBoundCapacity = 2000
+	wc.history.upperBoundCapacity = 2000
+	versioner := storage.APIObjectVersioner{}
+	wc.config.eventHandler = func(event *watchCacheEvent) {
+		dispatched := *event
+		setCachingObjects(&dispatched, versioner)
+	}
+
+	var pool []*corev1.Pod
+	func() {
+		for i, pod := range benchPods(t, podCount) {
+			if err := wc.Add(pod); err != nil {
+				t.Fatal(err)
+			}
+			if i < poolSize {
+				pool = append(pool, pod.DeepCopy())
+			}
+		}
+	}()
+
+	liveBytes, liveObjs := liveHeap()
+
+	var msBefore, msAfter goruntime.MemStats
+	goruntime.ReadMemStats(&msBefore)
+	gcBefore := gcCPUSeconds()
+	start := time.Now()
+
+	rv := podCount
+	for i := 0; i < events; i++ {
+		u := pool[i%poolSize]
+		rv++
+		u.ResourceVersion = strconv.Itoa(rv)
+		if err := wc.Update(u); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	elapsed := time.Since(start)
+	gcAfter := gcCPUSeconds()
+	goruntime.ReadMemStats(&msAfter)
+	goruntime.KeepAlive(wc)
+	goruntime.KeepAlive(pool)
+
+	d := func(n string) float64 { return gcAfter[n] - gcBefore[n] }
+	nonIdle := d("/cpu/classes/gc/mark/dedicated:cpu-seconds") +
+		d("/cpu/classes/gc/mark/assist:cpu-seconds") +
+		d("/cpu/classes/gc/pause:cpu-seconds")
+	allocMB := float64(msAfter.TotalAlloc-msBefore.TotalAlloc) / (1 << 20)
+	cycles := msAfter.NumGC - msBefore.NumGC
+
+	t.Logf("LazyDecodeWatchCache=%v", lazyEnabled())
+	t.Logf("live heap during the run: %.1f MB / %d objects", float64(liveBytes)/(1<<20), liveObjs)
+	t.Logf("%d ingest events in %v (%.2f µs/event wall)", events, elapsed.Round(time.Millisecond),
+		float64(elapsed.Microseconds())/events)
+	t.Logf("allocated: %.0f MB total, %.1f KiB per event", allocMB, allocMB*1024/events)
+	t.Logf("GC cycles: %d", cycles)
+	t.Logf("GC CPU non-idle: %.3f s total, %.3f µs per event", nonIdle, nonIdle*1e6/events)
+	t.Logf("GC CPU incl idle: %.3f s total, %.3f µs per event",
+		d("/cpu/classes/gc/total:cpu-seconds"), d("/cpu/classes/gc/total:cpu-seconds")*1e6/events)
+}
+
 // gcCPUSeconds reads the process's cumulative GC CPU time by class from
 // runtime/metrics. All are monotonic, so a difference is the cost over a
 // window.
