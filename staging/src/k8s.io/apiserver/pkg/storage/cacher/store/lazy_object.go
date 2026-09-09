@@ -20,8 +20,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"sync"
-	"sync/atomic"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -44,8 +42,8 @@ import (
 //
 // LazyObject is a runtime.CacheableObject, so a request whose encoder produced
 // raw is served the bytes verbatim with no decode and no re-encode. Requests
-// using a different encoder fall back to decode-and-encode and their result is
-// memoized per encoder identity, exactly as cachingObject does.
+// using a different encoder decode and encode without memoizing; see
+// CacheEncode for why nothing is retained.
 type LazyObject struct {
 	// raw is the encoded object. It is immutable; anything that would write to
 	// it is a correctness bug, and there is deliberately no accessor handing
@@ -56,22 +54,7 @@ type LazyObject struct {
 
 	// encodedBy identifies the encoder that produced raw.
 	encodedBy runtime.Identifier
-
-	// serializations memoizes encodings under identities other than
-	// encodedBy. It stays nil until something asks for one, because an eager
-	// empty map would be an extra allocation on every cached object and the
-	// whole point of this type is to hold as few as possible.
-	serializations atomic.Pointer[serializationsCache]
-	lock           sync.Mutex
 }
-
-type serializationResult struct {
-	once sync.Once
-	raw  []byte
-	err  error
-}
-
-type serializationsCache map[runtime.Identifier]*serializationResult
 
 var (
 	_ runtime.Object          = &LazyObject{}
@@ -109,37 +92,40 @@ func (o *LazyObject) GetObject() runtime.Object {
 }
 
 // CacheEncode implements runtime.CacheableObject.
+//
+// A LazyObject lives as long as its cache entry, unlike cachingObject which is
+// created per dispatch and thrown away precisely so its serializations are not
+// retained. So this deliberately never memoizes anything that is not already
+// the stored bytes: a caller whose encoder produced raw gets it for free, and
+// any other caller pays a decode and an encode every time rather than growing
+// the cache by a second representation.
+//
+// That matters more than it looks. The watch path calls CacheEncode with the
+// identifier of the *whole watch event frame*
+// (endpoints/handlers/response.go newWatchEncoder), not of the object, so a
+// memoizing implementation would retain a full framed copy per event type per
+// encoder, for the lifetime of the cache entry.
 func (o *LazyObject) CacheEncode(id runtime.Identifier, encode func(runtime.Object, io.Writer) error, w io.Writer) error {
 	if id == o.encodedBy {
 		return write(w, o.raw)
 	}
-	result := o.getSerializationResult(id)
-	result.once.Do(func() {
-		obj, err := o.Materialize()
-		if err != nil {
-			result.err = err
-			return
-		}
-		buf := runtime.NewSpliceBuffer()
-		if result.err = encode(obj, buf); result.err != nil {
-			return
-		}
-		encoded := buf.Bytes()
-		// The storage encoder and the encoder serving a request for the same
-		// group-version and media type produce identical bytes but report
-		// different runtime.Identifiers, because the storage side targets a
-		// multiGroupVersioner. Detecting that here keeps a second copy of
-		// every cached object out of the heap, which is the whole point.
-		if bytes.Equal(encoded, o.raw) {
-			result.raw = o.raw
-			return
-		}
-		result.raw = encoded
-	})
-	if result.err != nil {
-		return result.err
+	obj, err := o.Materialize()
+	if err != nil {
+		return err
 	}
-	return write(w, result.raw)
+	buf := runtime.NewSpliceBuffer()
+	if err := encode(obj, buf); err != nil {
+		return err
+	}
+	encoded := buf.Bytes()
+	// The storage encoder and a request encoder for the same group-version and
+	// media type produce identical bytes but report different identifiers,
+	// because the storage side targets a multiGroupVersioner. Recognising that
+	// lets the caller share the stored slice instead of holding a duplicate.
+	if bytes.Equal(encoded, o.raw) {
+		return write(w, o.raw)
+	}
+	return write(w, encoded)
 }
 
 func write(w io.Writer, raw []byte) error {
@@ -149,32 +135,6 @@ func write(w io.Writer, raw []byte) error {
 	}
 	_, err := w.Write(raw)
 	return err
-}
-
-func (o *LazyObject) getSerializationResult(id runtime.Identifier) *serializationResult {
-	if cache := o.serializations.Load(); cache != nil {
-		if result, exists := (*cache)[id]; exists {
-			return result
-		}
-	}
-
-	o.lock.Lock()
-	defer o.lock.Unlock()
-
-	// Copy on write: readers hold the old map without a lock.
-	next := serializationsCache{}
-	if cache := o.serializations.Load(); cache != nil {
-		if result, exists := (*cache)[id]; exists {
-			return result
-		}
-		for k, v := range *cache {
-			next[k] = v
-		}
-	}
-	result := &serializationResult{}
-	next[id] = result
-	o.serializations.Store(&next)
-	return result
 }
 
 // GetObjectKind implements runtime.Object. Objects decoded from storage into

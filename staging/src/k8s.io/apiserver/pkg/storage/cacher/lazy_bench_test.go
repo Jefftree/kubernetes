@@ -19,6 +19,7 @@ package cacher
 import (
 	"context"
 	"fmt"
+	"io"
 	goruntime "runtime"
 	"runtime/metrics"
 	"strconv"
@@ -212,50 +213,6 @@ func serveToWire(tb testing.TB, enc runtime.Encoder, obj runtime.Object, buf run
 	}
 	if len(buf.Bytes()) == 0 {
 		tb.Fatal("encoded to zero bytes")
-	}
-}
-
-// BenchmarkLazyServeObjectsToWire measures serving 1000 cached objects to the
-// wire one object at a time, repeatedly.
-//
-// This models the watch-list bootstrap path, where every watcher that attaches
-// is sent the whole store: today each watcher deep copies and re-encodes every
-// object, while a lazy cache encodes once and splices to everyone afterwards.
-//
-// It does NOT model LIST. Cacher.GetList copies items into a typed slice and
-// the streaming collection encoder marshals each item directly
-// (serializer/protobuf/collections.go), so a LIST never reaches
-// runtime.CacheableObject and cannot splice. See BenchmarkLazyListAll for the
-// LIST cost.
-func BenchmarkLazyServeObjectsToWire(b *testing.B) {
-	wc := newBenchWatchCache(b, benchPods(b, 1000))
-	enc := responseEncoder()
-	buf := runtime.NewSpliceBuffer()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		for _, item := range wc.storage.List() {
-			serveToWire(b, enc, item.(*store.Element).Object, buf)
-		}
-	}
-}
-
-// BenchmarkLazyServeObjectsToWireFirstTouch is the same measurement with
-// nothing memoized: the lazy arm's worst case, decode plus encode per object,
-// which is what the very first watcher after a cache rebuild pays.
-func BenchmarkLazyServeObjectsToWireFirstTouch(b *testing.B) {
-	pods := benchPods(b, 1000)
-	enc := responseEncoder()
-	buf := runtime.NewSpliceBuffer()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		wc := newBenchWatchCache(b, pods)
-		b.StartTimer()
-		for _, item := range wc.storage.List() {
-			serveToWire(b, enc, item.(*store.Element).Object, buf)
-		}
 	}
 }
 
@@ -542,60 +499,67 @@ func TestLazyGCCost(t *testing.T) {
 		d("/cpu/classes/total:cpu-seconds"))
 }
 
-// TestLazyServingDoesNotGrowRetention checks the claim that makes the repeated
-// LIST speedup free: the serialization memoized for the response encoder is
-// byte-identical to the stored form, so LazyObject shares the slice instead of
-// keeping a second copy.
+// TestLazyObjectCacheEncodeRetainsNothing guards the invariant that keeps a
+// store-resident LazyObject from becoming a memory leak.
 //
-// If that dedup ever stops firing, serving a LIST would silently double the
-// watch cache's memory, which is exactly the kind of failure that does not
-// show up as a crash.
-func TestLazyServingDoesNotGrowRetention(t *testing.T) {
-	if !lazyEnabled() {
-		t.Skip("requires LAZY_DECODE_WATCH_CACHE=true")
-	}
-	const podCount = 2000
-	wc := newTestWatchCache(podCount*2, DefaultEventFreshDuration, &cache.Indexers{})
-	defer wc.Stop()
+// cachingObject may memoize serializations because it is built per dispatch and
+// discarded; a LazyObject lives as long as its cache entry. Worse, the watch
+// path calls CacheEncode with the identifier of the whole framed watch event,
+// so anything memoized there would be a full extra copy per event type. Encode
+// repeatedly under a non-matching identity and the heap must not move.
+func TestLazyObjectCacheEncodeRetainsNothing(t *testing.T) {
+	const objects = 2000
+	codec := storageLikeCorev1ProtoCodec()
+
+	lazies := make([]*store.LazyObject, 0, objects)
 	func() {
-		for _, pod := range benchPods(t, podCount) {
-			if err := wc.Add(pod); err != nil {
+		for _, pod := range benchPods(t, objects) {
+			l, err := store.EncodeToLazyObject(codec, codec, pod)
+			if err != nil {
 				t.Fatal(err)
 			}
+			lazies = append(lazies, l)
 		}
 	}()
 
 	beforeBytes, beforeObjs := liveHeap()
 
-	enc := responseEncoder()
+	// A watch-shaped identifier, which by construction never equals the one
+	// that produced the stored bytes.
+	watchID := runtime.Identifier(`{"name":"watch","encoder":"protobuf","eventType":"ADDED"}`)
 	buf := runtime.NewSpliceBuffer()
-	served := 0
-	for _, item := range wc.storage.List() {
-		serveToWire(t, enc, item.(*store.Element).Object, buf)
-		served++
-	}
-	if served != podCount {
-		t.Fatalf("served %d, want %d", served, podCount)
+	for round := 0; round < 3; round++ {
+		for _, l := range lazies {
+			buf.Reset()
+			err := l.CacheEncode(watchID, func(obj runtime.Object, w io.Writer) error {
+				return codec.Encode(obj, w)
+			}, buf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(buf.Bytes()) == 0 {
+				t.Fatal("encoded to zero bytes")
+			}
+		}
 	}
 
 	afterBytes, afterObjs := liveHeap()
-	goruntime.KeepAlive(wc)
+	goruntime.KeepAlive(lazies)
 
 	deltaBytes := int64(afterBytes) - int64(beforeBytes)
 	deltaObjs := int64(afterObjs) - int64(beforeObjs)
-	t.Logf("serving %d objects to the wire added %.2f MB / %d heap objects to the cache",
-		podCount, float64(deltaBytes)/(1<<20), deltaObjs)
+	t.Logf("%d objects encoded 3x under a non-matching identity: heap moved %+.2f MB / %+d objects",
+		objects, float64(deltaBytes)/(1<<20), deltaObjs)
 
-	// The memo bookkeeping itself is a handful of objects per served object;
-	// a second copy of the encoded bytes would be ~10 KB each.
-	if perObject := float64(deltaBytes) / podCount; perObject > 1024 {
-		t.Errorf("serving retained %.0f extra bytes per object; a second serialization is being kept (encoded size is ~10 KB)", perObject)
+	// Retaining one encoding each would be ~10 KB per object.
+	if perObject := float64(deltaBytes) / objects; perObject > 256 {
+		t.Errorf("CacheEncode retained %.0f bytes per object; serializations must not be memoized on a cache-resident object", perObject)
 	}
 }
 
-// gcCPUSeconds reads the process's cumulative GC CPU time, and the part of it
-// charged to mutator assists, from runtime/metrics. Both are monotonic, so a
-// difference is the cost over a window.
+// gcCPUSeconds reads the process's cumulative GC CPU time by class from
+// runtime/metrics. All are monotonic, so a difference is the cost over a
+// window.
 func gcCPUSeconds() map[string]float64 {
 	names := []string{
 		"/cpu/classes/gc/total:cpu-seconds",

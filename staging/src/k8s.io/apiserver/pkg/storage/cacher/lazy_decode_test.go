@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/cacher/metrics"
@@ -446,6 +447,104 @@ func TestLazyObjectNeverEscapesTheCacher(t *testing.T) {
 		}
 	case <-time.After(wait.ForeverTestTimeout):
 		t.Fatal("timed out waiting for an initial event")
+	}
+}
+
+// TestLazyDeleteEventCarriesCurrentResourceVersion pins the nastiest failure
+// mode this design can have.
+//
+// When a watcher's selector stops matching an object, the cacher synthesizes a
+// DELETE carrying the object's previous content stamped with the CURRENT
+// resource version. That stamping goes through meta.Accessor, which fails on a
+// wrapper that does not implement metav1.Object. The failure is only logged,
+// so a broken implementation ships a DELETE with a stale resourceVersion and a
+// client resuming from it silently rewinds. Nothing crashes.
+//
+// The same path is taken by real deletes replayed from the history ring
+// buffer, which never go through setCachingObjects.
+func TestLazyDeleteEventCarriesCurrentResourceVersion(t *testing.T) {
+	wc := newTestWatchCache(100, DefaultEventFreshDuration, &cache.Indexers{})
+	defer wc.Stop()
+
+	// The object matches the watcher's selector, then stops matching.
+	if err := wc.Add(newLazyTestPod("p1", "ns", "node-a", "5", "wanted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wc.Update(newLazyTestPod("p1", "ns", "node-a", "9", "other")); err != nil {
+		t.Fatal(err)
+	}
+
+	elem, exists, err := wc.storage.GetByKey("/prefix/ns/p1")
+	if err != nil || !exists {
+		t.Fatalf("GetByKey: exists=%v err=%v", exists, err)
+	}
+	if _, isLazy := elem.(*store.Element).Object.(*store.LazyObject); isLazy != lazyEnabled() {
+		t.Fatalf("stored object lazy=%v, want %v", isLazy, lazyEnabled())
+	}
+
+	// Build the transition event by hand: the previous version is what the
+	// cache held for the matching version, left in whatever form it stores.
+	prev, err := store.EncodeToLazyObject(storageLikeCorev1ProtoCodec(), storageLikeCorev1ProtoCodec(),
+		canonical(t, newLazyTestPod("p1", "ns", "node-a", "5", "wanted")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prevObject runtime.Object = prev
+	if !lazyEnabled() {
+		if prevObject, err = prev.Materialize(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pred := storage.SelectionPredicate{
+		Label: labels.SelectorFromSet(labels.Set{"app": "wanted"}),
+		Field: fields.Everything(),
+	}
+	watcher := newCacheWatcher(
+		10,
+		filterWithAttrsAndPrefixFunction("/prefix/", pred, schema.GroupResource{Resource: "pods"}),
+		func(bool) {}, storage.APIObjectVersioner{}, time.Time{}, false,
+		schema.GroupResource{Resource: "pods"},
+		metrics.NewWatcherMetricsObservers(schema.GroupResource{Resource: "pods"}),
+		testingclock.NewFakeClock(time.Now()), "test",
+	)
+	defer watcher.stopLocked()
+
+	const deleteRV = 9
+	event := watcher.convertToWatchEvent(&watchCacheEvent{
+		Type:            watch.Modified,
+		Object:          nil,
+		ObjLabels:       labels.Set{"app": "other"},
+		ObjFields:       fields.Set{},
+		PrevObject:      prevObject,
+		PrevObjLabels:   labels.Set{"app": "wanted"},
+		PrevObjFields:   fields.Set{},
+		Key:             "/prefix/ns/p1",
+		ResourceVersion: deleteRV,
+	})
+	if event == nil {
+		t.Fatal("expected a synthesized DELETE event, got none")
+	}
+	if event.Type != watch.Deleted {
+		t.Fatalf("got event type %v, want DELETED", event.Type)
+	}
+	if _, bad := event.Object.(*store.LazyObject); bad {
+		t.Fatal("DELETE event carries an internal *store.LazyObject")
+	}
+	got, err := storage.APIObjectVersioner{}.ObjectResourceVersion(event.Object)
+	if err != nil {
+		t.Fatalf("DELETE event object has unreadable metadata: %v", err)
+	}
+	if got != deleteRV {
+		t.Errorf("DELETE event carries resourceVersion %d, want %d; a client resuming from it would rewind", got, deleteRV)
+	}
+	// And the cached previous version must not have been mutated by the stamp.
+	stillPrev, err := prev.Materialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv := stillPrev.(*corev1.Pod).ResourceVersion; rv != "5" {
+		t.Errorf("stamping the delete event mutated the cached object: resourceVersion is now %q, want \"5\"", rv)
 	}
 }
 

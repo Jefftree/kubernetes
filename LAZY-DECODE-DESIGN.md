@@ -47,7 +47,8 @@ honours it, and `watchEmbeddedEncoder.Encode` (`endpoints/handlers/response.go`)
 it *before* transforming, so an object that arrives holding the right bytes is written
 verbatim.
 
-`LazyObject` is the same contract with the map pre-seeded from the cache's own bytes.
+`LazyObject` is the same contract with the stored bytes standing in for the map, and with
+memoization deliberately removed because its lifetime is the cache entry's, not a dispatch's.
 
 ### Two things that do not work, both measured
 
@@ -67,10 +68,10 @@ verbatim.
    response: {"encodeGV":"v1","encoder":"protobuf","name":"versioning"}
    ```
 
-   So the zero-work splice never fires on identity alone. `LazyObject.CacheEncode` falls
-   back to decode-and-encode once, then compares the result with the stored bytes and
-   shares the slice when they match, so the memo costs no second copy. Aligning the two
-   identifiers upstream would remove even the one-off encode.
+   So the zero-work splice never fires on identity alone, and on the watch path it is
+   further out of reach (see the withdrawn claim below). `CacheEncode` decodes and encodes
+   without retaining anything, sharing the stored slice when the bytes match. Aligning the
+   two identifiers upstream would make the splice reachable for GET.
 
 ## Design as built
 
@@ -78,8 +79,8 @@ verbatim.
 bytes, the storage decoder, and the identity of the encoder that produced them.
 
 - `Materialize()` decodes **fresh on every call**. The caller owns the result outright.
-- `CacheEncode` splices on an identity hit, otherwise decodes, encodes, and memoizes,
-  sharing the stored slice when the bytes are equal.
+- `CacheEncode` splices on an identity hit and otherwise decodes and encodes, retaining
+  nothing. It must not memoize: a LazyObject lives as long as its cache entry.
 - `DeepCopyObject()` shares the bytes, which is sound only because `LazyObject` exposes no
   setter.
 
@@ -201,8 +202,6 @@ LazyIngest-32                    2.305µ ±  6%     19.732µ ± 16%     +756.03%
 LazyListAll-32                   11.09µ ±  3%   27873.15µ ±  3%  +251167.89% (p=0.002 n=6)
 LazyListSelector1Pct-32          46.96µ ±  8%     421.54µ ±  7%     +797.68% (p=0.002 n=6)
 LazyListSelectorNoMatch-32       51.71µ ± 12%      50.92µ ± 10%            ~ (p=0.937 n=6)
-LazyServeObjectsToWire-32     12032.08µ ±  6%      71.40µ ± 10%      -99.41% (p=0.002 n=6)
-LazyServeObjectsToWireFirst-32   12.62m ±  4%      47.20m ±  9%     +273.90% (p=0.002 n=6)
 LazyGet-32                       309.5n ±  4%    29225.5n ±  5%    +9344.34% (p=0.002 n=6)
 LazyWatchInitialEvents-32        13.12m ±  7%      28.38m ±  1%     +116.27% (p=0.002 n=6)
 ```
@@ -215,15 +214,70 @@ Reading these honestly:
 - `LazyListAll`, `LazyListSelector1Pct` and `LazyGet` stop at the cache read, so they
   compare "decode a 10 KB pod" against "copy a pointer". They are upper bounds on the added
   cost, not request-level numbers: a real request also encodes, which both arms pay.
-- `LazyServeObjectsToWire` is the watch-list bootstrap shape, repeated per-object serving.
-  Encoding once and splicing beats re-encoding per watcher by 168x, with allocations down
-  66% and bytes down 99.5%.
-- `LazyServeObjectsToWireFirstTouch` is the same path with nothing memoized, the first
-  watcher after a cache rebuild: 3.7x slower.
 - `LazyIngest` is the write path: +17.4 µs and +20.7 KiB per event, the encode. Of that,
   ~10 KB is an avoidable copy, because `runtime.NewCodec`'s wrapper embeds `Encoder` and so
   does not forward `EncodeWithAllocator`; the allocator fast path in `EncodeToLazyObject`
   never fires for a storage codec.
+
+## A claim this design does not get to make
+
+An earlier version of this document reported a 168x speedup on repeated per-object serving,
+from `CacheEncode` splicing stored bytes instead of re-encoding. **That was wrong and has
+been withdrawn.** A review of the delivery path showed the benchmark encoded a `LazyObject`
+directly, which production never does:
+
+- Every watch delivery goes through `getMutableObject`, which materializes, so a decoded
+  object reaches the encoder. `TestLazyObjectNeverEscapesTheCacher` asserts exactly this
+  and fails when the materialization is removed.
+- The watch encoder would not have hit the fast path anyway. `newWatchEncoder`
+  (`endpoints/handlers/response.go`) calls `CacheEncode` with the identifier of the *whole
+  framed watch event*, `{"name":"watch","embeddedEncoder":...,"encoder":...,"eventType":...}`,
+  which can never equal a plain codec identifier.
+
+So `CacheEncode` is currently unreachable through the cacher: latent capability, not an
+active optimization, and the honest number for the watch-list path is
+`LazyWatchInitialEvents` at **+116%**.
+
+The same review found a real hazard in the version that memoized. Because the watch
+identifier keys on the framed event, a memoizing `LazyObject` would have retained a full
+framed copy per event type, for the lifetime of the cache entry -- unlike `cachingObject`,
+which is built per dispatch and deliberately discarded for precisely this reason.
+`CacheEncode` now never memoizes: it shares the stored slice when the bytes match and
+otherwise encodes without retaining. `TestLazyObjectCacheEncodeRetainsNothing` pins it at
++4 heap objects across 6,000 encodes.
+
+## Prior art
+
+Nobody upstream has built a serialized watch cache. The idea is on the record with a named
+blocker, and the nearest working prototype is on the client-go side.
+
+- https://github.com/kubernetes/kubernetes/issues/124680 (closed, 2024-05). wojtek-t
+  proposes this design almost verbatim -- "store a serialized object, potentially with
+  deserialized ObjectMeta for efficient filtering" -- and names the blocker: **CRD field
+  selectors**, "a large effort on its own". This prototype sidesteps it rather than solving
+  it, by keeping the precomputed `Labels`/`Fields` on the element.
+- https://github.com/kubernetes/kubernetes/pull/141683 (open draft, 2026-08-29). justinsb's
+  client-go informer `bytecache`: objects as `[]byte`, decode on Get. Reports informer heap
+  89.4 MB to 2.2 MB and **889k heap objects to ~10k**, independently reproducing the
+  object-count collapse measured here. A KEP is promised.
+- https://github.com/kubernetes/kubernetes/issues/137109 (open, triage/accepted). serathius's
+  interning work, -43% apiserver memory at 50k pods. Carries the bar this design must clear:
+  liggitt's objection that sharing mutable `[]byte` between objects is "really dangerous".
+  Here the `[]byte` is written once, never handed out, and every reader gets a private
+  decode, which is the answer to that objection.
+- https://github.com/kubernetes/kubernetes/issues/90179 (frozen, 2020-04). smarterclayton
+  proposed "decode from storage exactly one time per object revision"; closed at
+  awaiting-more-evidence after wojtek-t judged memory not to be a real problem, a premise
+  the 2026 data has overturned.
+- https://github.com/kubernetes/kubernetes/pull/81914 (merged 2019-10-01). The origin of
+  `cachingObject`. It caches encodings of an already-decoded object so N watchers serialize
+  once: the inverse of lazy decode, not a version of it.
+- KEP-4988 snapshottable cache (shipped 1.34) holds pointers to decoded objects, so it is
+  what this must interoperate with; the prototype does, since snapshots hold `Element`s.
+- KEP-5116 streaming list encoding (GA 1.34) is complementary but is also why LIST cannot
+  splice: it marshals each item directly rather than through `CacheableObject`.
+
+There is no KEP for any of this yet.
 
 ## What this does not settle
 
