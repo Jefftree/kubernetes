@@ -1002,11 +1002,14 @@ func (c *Cacher) dispatchEvents() {
 func setCachingObjects(event *watchCacheEvent, versioner storage.Versioner) {
 	switch event.Type {
 	case watch.Added, watch.Modified:
-		if _, ok := event.Object.(*store.LazyObject); ok {
-			// A lazy object already caches its serializations and needs no
-			// deep copy, so wrapping it would only add work.
+		// event is a shallow copy made for this dispatch, so materializing
+		// here does not put a decoded object back into the history buffer.
+		current, err := store.Materialize(event.Object)
+		if err != nil {
+			klog.Errorf("couldn't materialize object for dispatch: %v", err)
 			return
 		}
+		event.Object = current
 		if object, err := newCachingObject(event.Object); err == nil {
 			event.Object = object
 		} else {

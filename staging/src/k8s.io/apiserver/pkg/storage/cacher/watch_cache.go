@@ -333,11 +333,17 @@ func (w *watchCache) processEvent(event watch.Event, resourceVersion uint64) err
 
 	wcEvent := &watchCacheEvent{
 		Type: event.Type,
-		// The object dispatched to watchers stays typed even when the store
-		// holds it encoded: it was just decoded by the storage layer, so
-		// re-deriving it would be pure waste, and it lives only for the
-		// duration of the history window.
-		Object:          event.Object,
+		// Deliberately the same object the store holds, which is the encoded
+		// form when lazy decoding is on. The history ring buffer keeps this
+		// event for the whole freshness window, so if it held a separate
+		// decoded copy the cache would retain two representations of every
+		// object instead of one, and encoding the store would add memory
+		// rather than save it.
+		//
+		// Dispatch materializes it (see setCachingObjects), and does so on a
+		// shallow copy of this event, so what the ring buffer retains stays
+		// encoded.
+		Object:          elem.Object,
 		ObjLabels:       elem.Labels,
 		ObjFields:       elem.Fields,
 		TriggerValue:    elem.TriggerValue,

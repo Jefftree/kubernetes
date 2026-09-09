@@ -58,9 +58,10 @@ type LazyObject struct {
 	encodedBy runtime.Identifier
 
 	// serializations memoizes encodings under identities other than
-	// encodedBy. It holds a serializationsCache and is empty in the common
-	// case where the requesting encoder is the one that produced raw.
-	serializations atomic.Value
+	// encodedBy. It stays nil until something asks for one, because an eager
+	// empty map would be an extra allocation on every cached object and the
+	// whole point of this type is to hold as few as possible.
+	serializations atomic.Pointer[serializationsCache]
 	lock           sync.Mutex
 }
 
@@ -81,9 +82,7 @@ var (
 // encodedBy. Ownership of raw passes to the returned LazyObject; the caller
 // must not retain or mutate it.
 func NewLazyObject(raw []byte, decoder runtime.Decoder, encodedBy runtime.Identifier) *LazyObject {
-	o := &LazyObject{raw: raw, decoder: decoder, encodedBy: encodedBy}
-	o.serializations.Store(make(serializationsCache))
-	return o
+	return &LazyObject{raw: raw, decoder: decoder, encodedBy: encodedBy}
 }
 
 // Materialize decodes the object. The result is owned solely by the caller.
@@ -153,25 +152,28 @@ func write(w io.Writer, raw []byte) error {
 }
 
 func (o *LazyObject) getSerializationResult(id runtime.Identifier) *serializationResult {
-	cache := o.serializations.Load().(serializationsCache)
-	if result, exists := cache[id]; exists {
-		return result
+	if cache := o.serializations.Load(); cache != nil {
+		if result, exists := (*cache)[id]; exists {
+			return result
+		}
 	}
 
 	o.lock.Lock()
 	defer o.lock.Unlock()
 
-	cache = o.serializations.Load().(serializationsCache)
-	if result, exists := cache[id]; exists {
-		return result
-	}
-	next := make(serializationsCache, len(cache)+1)
-	for k, v := range cache {
-		next[k] = v
+	// Copy on write: readers hold the old map without a lock.
+	next := serializationsCache{}
+	if cache := o.serializations.Load(); cache != nil {
+		if result, exists := (*cache)[id]; exists {
+			return result
+		}
+		for k, v := range *cache {
+			next[k] = v
+		}
 	}
 	result := &serializationResult{}
 	next[id] = result
-	o.serializations.Store(next)
+	o.serializations.Store(&next)
 	return result
 }
 
@@ -197,30 +199,75 @@ func Materialize(obj runtime.Object) (runtime.Object, error) {
 	return obj, nil
 }
 
-// EncodeToLazyObject encodes obj and wraps the result. The encoder must be the
-// one whose Identifier is passed, so that a request using the same encoder can
-// be served the bytes without re-encoding.
+// EncodeToLazyObject encodes obj and wraps the result.
 func EncodeToLazyObject(encoder runtime.Encoder, decoder runtime.Decoder, obj runtime.Object) (*LazyObject, error) {
-	var w exactWriter
-	if err := encoder.Encode(obj, &w); err != nil {
+	w := &captureWriter{}
+	if alloc, ok := encoder.(runtime.EncoderWithAllocator); ok {
+		// The protobuf serializer sizes the object, allocates once and writes
+		// that buffer in a single call. Owning the allocation lets us keep
+		// exactly that buffer instead of copying it into a second one, which
+		// would double the allocation this change adds to the write path.
+		w.owned = true
+		if err := alloc.EncodeWithAllocator(obj, w, w); err != nil {
+			return nil, err
+		}
+	} else if err := encoder.Encode(obj, w); err != nil {
 		return nil, err
 	}
-	return NewLazyObject(w.buf, decoder, encoder.Identifier()), nil
+	return NewLazyObject(w.bytes(), decoder, encoder.Identifier()), nil
 }
 
-// exactWriter captures written bytes into a right-sized buffer. bytes.Buffer
-// would leave slack capacity, and slack is retained for the lifetime of the
-// cache entry, which is exactly what this change exists to shrink.
-type exactWriter struct {
-	buf []byte
+// captureWriter is both the encoder's memory allocator and its writer, so a
+// single-write encoder hands back a slice of a buffer we already own and no
+// copy is needed. Anything that writes more than once, or that writes a buffer
+// we did not allocate, falls back to accumulating into a right-sized slice:
+// slack capacity would be retained for the lifetime of the cache entry, which
+// is what this whole change exists to shrink.
+type captureWriter struct {
+	owned    bool
+	arena    []byte
+	captured []byte
+	spill    []byte
+	writes   int
 }
 
-func (e *exactWriter) Write(p []byte) (int, error) {
-	if e.buf == nil {
-		e.buf = make([]byte, len(p))
-		copy(e.buf, p)
+func (w *captureWriter) Allocate(n uint64) []byte {
+	w.arena = make([]byte, n)
+	return w.arena
+}
+
+func (w *captureWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == 1 && w.owned && len(p) > 0 && sameArray(p, w.arena) {
+		w.captured = p
 		return len(p), nil
 	}
-	e.buf = append(e.buf, p...)
+	if w.writes == 1 {
+		w.spill = make([]byte, 0, len(p))
+	} else if w.captured != nil {
+		// A second write means the first was not the whole encoding.
+		w.spill = append(make([]byte, 0, len(w.captured)+len(p)), w.captured...)
+		w.captured = nil
+	}
+	w.spill = append(w.spill, p...)
 	return len(p), nil
+}
+
+func (w *captureWriter) bytes() []byte {
+	if w.captured == nil {
+		return w.spill
+	}
+	// The allocator sizes from an upper-bound estimate, so the captured slice
+	// can carry a little slack. A little is fine; a lot would be retained for
+	// the life of the cache entry, so right-size it instead.
+	if slack := cap(w.captured) - len(w.captured); slack > 64+len(w.captured)/16 {
+		exact := make([]byte, len(w.captured))
+		copy(exact, w.captured)
+		return exact
+	}
+	return w.captured
+}
+
+func sameArray(p, arena []byte) bool {
+	return len(arena) > 0 && len(p) <= len(arena) && &p[0] == &arena[0]
 }
