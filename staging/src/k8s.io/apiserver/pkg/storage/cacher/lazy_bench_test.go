@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	goruntime "runtime"
+	"runtime/metrics"
 	"strconv"
 	"testing"
 	"time"
@@ -496,6 +497,11 @@ func TestLazyGCCost(t *testing.T) {
 
 	liveBytes, liveObjs := liveHeap()
 
+	// GCCPUFraction is a cumulative average over the whole process lifetime,
+	// which includes building the cache, so it cannot answer "how much GC CPU
+	// did this workload cost". runtime/metrics exposes GC CPU as a monotonic
+	// counter, which differences cleanly over a window.
+	gcCPUBefore, assistBefore := gcCPUSeconds()
 	var before, after goruntime.MemStats
 	goruntime.ReadMemStats(&before)
 	start := time.Now()
@@ -511,16 +517,18 @@ func TestLazyGCCost(t *testing.T) {
 
 	elapsed := time.Since(start)
 	goruntime.ReadMemStats(&after)
+	gcCPUAfter, assistAfter := gcCPUSeconds()
 	goruntime.KeepAlive(wc)
 
 	cycles := after.NumGC - before.NumGC
 	pause := time.Duration(after.PauseTotalNs - before.PauseTotalNs)
+	gcCPU := gcCPUAfter - gcCPUBefore
+	assistCPU := assistAfter - assistBefore
 	t.Logf("LazyDecodeWatchCache=%v", lazyEnabled())
 	t.Logf("live heap while running: %.1f MB / %d heap objects", float64(liveBytes)/(1<<20), liveObjs)
 	t.Logf("allocated %d MB of identical garbage in %v", garbageBytes>>20, elapsed.Round(time.Millisecond))
-	t.Logf("GC cycles=%d  stop-the-world pause total=%v  GCCPUFraction=%.4f",
-		cycles, pause.Round(time.Microsecond), after.GCCPUFraction)
-	t.Logf("estimated GC CPU over the run: %v", time.Duration(after.GCCPUFraction*float64(elapsed)).Round(time.Millisecond))
+	t.Logf("GC cycles=%d  stop-the-world pause total=%v", cycles, pause.Round(time.Microsecond))
+	t.Logf("GC CPU over the window: %.4f s total (%.4f s of it mutator assist)", gcCPU, assistCPU)
 }
 
 // TestLazyServingDoesNotGrowRetention checks the claim that makes the repeated
@@ -572,6 +580,18 @@ func TestLazyServingDoesNotGrowRetention(t *testing.T) {
 	if perObject := float64(deltaBytes) / podCount; perObject > 1024 {
 		t.Errorf("serving retained %.0f extra bytes per object; a second serialization is being kept (encoded size is ~10 KB)", perObject)
 	}
+}
+
+// gcCPUSeconds reads the process's cumulative GC CPU time, and the part of it
+// charged to mutator assists, from runtime/metrics. Both are monotonic, so a
+// difference is the cost over a window.
+func gcCPUSeconds() (total, assist float64) {
+	samples := []metrics.Sample{
+		{Name: "/cpu/classes/gc/total:cpu-seconds"},
+		{Name: "/cpu/classes/gc/mark/assist:cpu-seconds"},
+	}
+	metrics.Read(samples)
+	return samples[0].Value.Float64(), samples[1].Value.Float64()
 }
 
 // measureBareElements reports the live heap held by n Elements carrying only

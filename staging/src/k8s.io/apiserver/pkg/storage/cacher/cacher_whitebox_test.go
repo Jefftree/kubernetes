@@ -2038,8 +2038,12 @@ func testCachingObjects(t *testing.T, watchersCount int) {
 			}
 			object = event.Object.(runtime.CacheableObject).GetObject()
 
-			// The cached PrevObject may be held in encoded form, so read it
-			// through Materialize rather than assuming it is typed.
+			// The cache may hold these in encoded form, so read them through
+			// Materialize rather than assuming they are typed.
+			cachedObject, err := store.Materialize(cacher.watchCache.history.cache[index].Object)
+			if err != nil {
+				t.Fatalf("Failed to materialize cached object: %v", err)
+			}
 			prevObject, err := store.Materialize(cacher.watchCache.history.cache[index].PrevObject)
 			if err != nil {
 				t.Fatalf("Failed to materialize previous object: %v", err)
@@ -2055,7 +2059,7 @@ func testCachingObjects(t *testing.T, watchersCount int) {
 			var e runtime.Object
 			switch event.Type {
 			case watch.Added, watch.Modified:
-				e = cacher.watchCache.history.cache[index].Object
+				e = cachedObject
 			case watch.Deleted:
 				e = prevObject
 			default:
