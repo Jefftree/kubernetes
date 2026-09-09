@@ -214,11 +214,19 @@ func serveToWire(tb testing.TB, enc runtime.Encoder, obj runtime.Object, buf run
 	}
 }
 
-// BenchmarkLazyListAllToWire measures an unfiltered LIST of 1000 realistic
-// pods all the way to wire bytes. The non-lazy arm re-encodes every item on
-// every request; the lazy arm decodes and encodes once per object and splices
-// afterwards, which is what makes the steady state cheaper despite the decode.
-func BenchmarkLazyListAllToWire(b *testing.B) {
+// BenchmarkLazyServeObjectsToWire measures serving 1000 cached objects to the
+// wire one object at a time, repeatedly.
+//
+// This models the watch-list bootstrap path, where every watcher that attaches
+// is sent the whole store: today each watcher deep copies and re-encodes every
+// object, while a lazy cache encodes once and splices to everyone afterwards.
+//
+// It does NOT model LIST. Cacher.GetList copies items into a typed slice and
+// the streaming collection encoder marshals each item directly
+// (serializer/protobuf/collections.go), so a LIST never reaches
+// runtime.CacheableObject and cannot splice. See BenchmarkLazyListAll for the
+// LIST cost.
+func BenchmarkLazyServeObjectsToWire(b *testing.B) {
 	wc := newBenchWatchCache(b, benchPods(b, 1000))
 	enc := responseEncoder()
 	buf := runtime.NewSpliceBuffer()
@@ -231,9 +239,10 @@ func BenchmarkLazyListAllToWire(b *testing.B) {
 	}
 }
 
-// BenchmarkLazyListAllToWireFirstTouch is the same measurement with nothing
-// memoized, which is the lazy arm's worst case: decode plus encode per item.
-func BenchmarkLazyListAllToWireFirstTouch(b *testing.B) {
+// BenchmarkLazyServeObjectsToWireFirstTouch is the same measurement with
+// nothing memoized: the lazy arm's worst case, decode plus encode per object,
+// which is what the very first watcher after a cache rebuild pays.
+func BenchmarkLazyServeObjectsToWireFirstTouch(b *testing.B) {
 	pods := benchPods(b, 1000)
 	enc := responseEncoder()
 	buf := runtime.NewSpliceBuffer()
