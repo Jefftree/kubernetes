@@ -273,6 +273,11 @@ func TestLazyObjectCacheEncodeSplices(t *testing.T) {
 		t.Errorf("spliced %d bytes, want %d equal bytes", len(got), len(want))
 	}
 
+	// A non-matching identity must produce correct bytes every time, and must
+	// NOT be memoized: this object lives as long as its cache entry, and the
+	// watch path keys CacheEncode on the whole framed event, so caching here
+	// would retain a full extra copy per event type forever. See
+	// TestLazyObjectCacheEncodeRetainsNothing.
 	var fallbackCalls int
 	fallback := func(obj runtime.Object, w io.Writer) error {
 		fallbackCalls++
@@ -288,8 +293,8 @@ func TestLazyObjectCacheEncodeSplices(t *testing.T) {
 			t.Errorf("iteration %d: fallback produced different bytes", i)
 		}
 	}
-	if fallbackCalls != 1 {
-		t.Errorf("fallback encode ran %d times, want 1 (the result should be memoized)", fallbackCalls)
+	if fallbackCalls != 3 {
+		t.Errorf("fallback encode ran %d times, want 3: results must not be retained on a cache-resident object", fallbackCalls)
 	}
 }
 
