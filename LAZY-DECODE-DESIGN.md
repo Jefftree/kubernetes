@@ -196,28 +196,38 @@ dedup fires.
 ### CPU (`benchstat`, n=6 per arm, `-benchmem`)
 
 ```
-                               │      off       │                     on                     │
-                               │     sec/op     │    sec/op      vs base                     │
-LazyIngest-32                    2.305µ ±  6%     19.732µ ± 16%     +756.03% (p=0.002 n=6)
-LazyListAll-32                   11.09µ ±  3%   27873.15µ ±  3%  +251167.89% (p=0.002 n=6)
-LazyListSelector1Pct-32          46.96µ ±  8%     421.54µ ±  7%     +797.68% (p=0.002 n=6)
-LazyListSelectorNoMatch-32       51.71µ ± 12%      50.92µ ± 10%            ~ (p=0.937 n=6)
-LazyGet-32                       309.5n ±  4%    29225.5n ±  5%    +9344.34% (p=0.002 n=6)
-LazyWatchInitialEvents-32        13.12m ±  7%      28.38m ±  1%     +116.27% (p=0.002 n=6)
+                           │      off       │                     on                     │
+                           │     sec/op     │    sec/op      vs base                     │
+LazyIngest-32                2.294µ ± 9%     19.852µ ± 16%     +765.20% (p=0.002 n=6)
+LazyListAll-32               11.13µ ± 3%   28424.84µ ±  2%  +255335.27% (p=0.002 n=6)
+LazyListSelector1Pct-32      48.36µ ± 7%     425.27µ ±  6%     +779.34% (p=0.002 n=6)
+LazyListSelectorNoMatch-32   48.56µ ± 5%      50.59µ ±  8%       +4.18% (p=0.041 n=6)
+LazyGet-32                   301.5n ± 2%    29487.0n ±  2%    +9680.10% (p=0.002 n=6)
+LazyWatchInitialEvents-32    13.15m ± 8%      29.10m ±  4%     +121.29% (p=0.002 n=6)
+
+LazyIngest-32               1.872Ki B/op   22.555Ki B/op    19 -> 28 allocs/op
+LazyWatchInitialEvents-32   19.42Mi B/op   41.06Mi B/op    116k -> 413k allocs/op
 ```
 
 Reading these honestly:
 
-- **`LazyListSelectorNoMatch` is the CPU negative control and it did not move**
-  (p=0.937, identical B/op and allocs/op). Neither arm decodes when the selector matches
-  nothing, and the harness confirms it.
+- **`LazyListSelectorNoMatch` is the CPU negative control.** Nothing matches, so neither
+  arm decodes. `B/op` and `allocs/op` are *identical* in every sample. The timing came out
+  at p=0.937 on one run and p=0.041 (+4.2%) on another, on a machine with other work on it;
+  with an identical allocation profile that is noise, not an effect. It is the control that
+  makes the other rows readable.
 - `LazyListAll`, `LazyListSelector1Pct` and `LazyGet` stop at the cache read, so they
-  compare "decode a 10 KB pod" against "copy a pointer". They are upper bounds on the added
-  cost, not request-level numbers: a real request also encodes, which both arms pay.
-- `LazyIngest` is the write path: +17.4 µs and +20.7 KiB per event, the encode. Of that,
-  ~10 KB is an avoidable copy, because `runtime.NewCodec`'s wrapper embeds `Encoder` and so
-  does not forward `EncodeWithAllocator`; the allocator fast path in `EncodeToLazyObject`
-  never fires for a storage codec.
+  compare "decode a 10 KB pod" against "copy a pointer". They are **upper bounds** on the
+  added cost, not request-level numbers: a real request then encodes, which both arms pay
+  and neither benchmark includes.
+- `LazyWatchInitialEvents` is the real watch-list bootstrap cost, decode per object per
+  watcher instead of deep copy per object per watcher: **+121%**.
+- `LazyIngest` is the write path: **+17.6 µs and +20.7 KiB per event**, the encode. Of
+  that, ~10 KB is an avoidable copy, because `runtime.NewCodec`'s wrapper embeds `Encoder`
+  and so does not forward `EncodeWithAllocator`; the allocator fast path in
+  `EncodeToLazyObject` never fires for a storage codec. Forwarding it is an eight-line
+  apimachinery change, not attempted here because the blast radius across the tree was not
+  worth validating tonight.
 
 ## A claim this design does not get to make
 
