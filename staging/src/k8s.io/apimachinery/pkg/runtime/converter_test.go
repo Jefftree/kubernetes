@@ -650,6 +650,41 @@ func TestUnknownFields(t *testing.T) {
 	}
 }
 
+// TestUnknownFieldsNestedExactError pins the exact strict decoding error string
+// for unknown fields at four depths at once, in sibling subtrees, in slice
+// elements, and under keys that are known at one level but unknown at another.
+func TestUnknownFieldsNestedExactError(t *testing.T) {
+	data := `{
+		"a": 1,
+		"zztop": 1,
+		"ia": {"aa": 1, "child": {"aa": 2}},
+		"ha": {"ab": "x", "aaa": 2},
+		"ca": [{"aa": 1}, {"aa": 2, "cc": 3}, {"unknownInSlice": 1, "aa": 4}],
+		"ba": {"ad": 1, "b": 2},
+		"cc": "top",
+		"ul1": {
+			"a": 1, "aa": 2, "aaa": 3, "cc": 9,
+			"child": {
+				"b": 1, "bb": 2, "bbb": 3, "aa": 9,
+				"child": {"c": 1, "cc": 2, "ccc": 3, "b": 9, "a": 9}
+			}
+		}
+	}`
+	const expected = `strict decoding error: unknown field "a", unknown field "ba.b", unknown field "ca[1].cc", unknown field "ca[2].unknownInSlice", unknown field "ha.aaa", unknown field "ia.child", unknown field "ul1.cc", unknown field "ul1.child.aa", unknown field "ul1.child.child.a", unknown field "ul1.child.child.b", unknown field "zztop"`
+
+	unstr := make(map[string]interface{})
+	if err := json.Unmarshal([]byte(data), &unstr); err != nil {
+		t.Fatalf("Error when unmarshaling to unstructured: %v", err)
+	}
+	// Repeated because map iteration order is nondeterministic.
+	for i := 0; i < 20; i++ {
+		err := runtime.NewTestUnstructuredConverterWithValidation(simpleEquality).FromUnstructuredWithValidation(unstr, &I{}, true)
+		if err == nil || err.Error() != expected {
+			t.Fatalf("iteration %d:\n got: %v\nwant: %s", i, err, expected)
+		}
+	}
+}
+
 // BenchmarkFromUnstructuredWithValidation benchmarks
 // the time and memory required to perform FromUnstructured
 // with the various validation directives (Ignore, Warn, Strict)
