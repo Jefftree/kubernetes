@@ -85,8 +85,13 @@ func (c *CacheDelegator) Delete(ctx context.Context, key string, out runtime.Obj
 		klog.Errorf("GetByKey returned error: %v", err)
 	} else if exists {
 		// DeepCopy the object since we modify resource version when serializing the
-		// current object.
-		currObj := elem.(*store.Element).Object.DeepCopyObject()
+		// current object. A lazy element decodes here, which already yields a
+		// private object, but the copy is kept for the non-lazy case.
+		cached, err := elem.(*store.Element).TypedObject()
+		if err != nil {
+			return err
+		}
+		currObj := cached.DeepCopyObject()
 		return c.storage.Delete(ctx, key, out, preconditions, validateDeletion, currObj, opts)
 	}
 	// If we couldn't get the object, fallback to no-suggestion.
@@ -197,8 +202,13 @@ func (c *CacheDelegator) GuaranteedUpdate(ctx context.Context, key string, desti
 		klog.Errorf("GetByKey returned error: %v", err)
 	} else if exists {
 		// DeepCopy the object since we modify resource version when serializing the
-		// current object.
-		currObj := elem.(*store.Element).Object.DeepCopyObject()
+		// current object. A lazy element decodes here, which already yields a
+		// private object, but the copy is kept for the non-lazy case.
+		cached, err := elem.(*store.Element).TypedObject()
+		if err != nil {
+			return err
+		}
+		currObj := cached.DeepCopyObject()
 		return c.storage.GuaranteedUpdate(ctx, key, destination, ignoreNotFound, preconditions, tryUpdate, currObj)
 	}
 	// If we couldn't get the object, fallback to no-suggestion.

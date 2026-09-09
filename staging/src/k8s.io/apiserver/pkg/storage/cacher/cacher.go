@@ -438,9 +438,14 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 	}
 
 	progressRequester := progress.NewConditionalProgressRequester(config.Storage.RequestWatchProgress, config.Clock, contextMetadata)
+	var triggerFunc storage.IndexerFunc
+	if indexedTrigger != nil {
+		triggerFunc = indexedTrigger.indexerFunc
+	}
 	watchCache := newWatchCache(
 		config.KeyFunc, cacher.processEvent, config.GetAttrsFunc, config.Versioner, config.Indexers,
-		config.Clock, eventFreshDuration, config.GroupResource, progressRequester, config.Storage.GetCurrentResourceVersion)
+		config.Clock, eventFreshDuration, config.GroupResource, progressRequester, config.Storage.GetCurrentResourceVersion,
+		config.Codec, config.NewFunc, triggerFunc)
 	listerWatcher := NewListerWatcher(config.Storage, resourcePrefix, config.NewListFunc, contextMetadata)
 	reflectorName := "storage/cacher.go:" + resourcePrefix
 
@@ -720,7 +725,11 @@ func (c *Cacher) Get(ctx context.Context, key string, opts storage.GetOptions, o
 		if !ok {
 			return fmt.Errorf("non *store.Element returned from storage: %v", obj)
 		}
-		objVal.Set(reflect.ValueOf(elem.Object).Elem())
+		cached, err := elem.TypedObject()
+		if err != nil {
+			return err
+		}
+		objVal.Set(reflect.ValueOf(cached).Elem())
 	} else {
 		objVal.Set(reflect.Zero(objVal.Type()))
 		if !opts.IgnoreNotFound {
@@ -807,7 +816,11 @@ func (c *Cacher) GetList(ctx context.Context, key string, opts storage.ListOptio
 			if !ok {
 				return fmt.Errorf("non *store.Element returned from storage: %v", obj)
 			}
-			listVal.Index(i).Set(reflect.ValueOf(elem.Object).Elem())
+			cached, err := elem.TypedObject()
+			if err != nil {
+				return err
+			}
+			listVal.Index(i).Set(reflect.ValueOf(cached).Elem())
 			lastSelectedObjectKey = elem.Key
 		}
 	} else {
@@ -821,18 +834,27 @@ func (c *Cacher) GetList(ctx context.Context, key string, opts storage.ListOptio
 			if !ok {
 				return fmt.Errorf("non *store.Element returned from storage: %v", obj)
 			}
-			shardMatch := true
+			// Attribute matching runs first and against the precomputed labels
+			// and fields, so a selective LIST never decodes an item it is
+			// about to discard.
+			if !opts.Predicate.MatchesObjectAttributes(elem.Labels, elem.Fields) {
+				continue
+			}
+			cached, err := elem.TypedObject()
+			if err != nil {
+				return err
+			}
 			if utilfeature.DefaultFeatureGate.Enabled(features.ShardedListAndWatch) {
-				var err error
-				shardMatch, err = opts.Predicate.MatchesSharding(elem.Object)
+				shardMatch, err := opts.Predicate.MatchesSharding(cached)
 				if err != nil {
 					return fmt.Errorf("shard matching failed: %w", err)
 				}
+				if !shardMatch {
+					continue
+				}
 			}
-			if shardMatch && opts.Predicate.MatchesObjectAttributes(elem.Labels, elem.Fields) {
-				selectedObjects = append(selectedObjects, elem.Object)
-				lastSelectedObjectKey = elem.Key
-			}
+			selectedObjects = append(selectedObjects, cached)
+			lastSelectedObjectKey = elem.Key
 			if limit > 0 && int64(len(selectedObjects)) >= limit {
 				hasMoreListItems = i < len(resp.Items)-1
 				break
@@ -879,6 +901,20 @@ func baseObjectThreadUnsafe(object runtime.Object) runtime.Object {
 func (c *Cacher) triggerValuesThreadUnsafe(event *watchCacheEvent) ([]string, bool) {
 	if c.indexedTrigger == nil {
 		return nil, false
+	}
+	// The watch cache computes the trigger value on ingest, while the decoded
+	// object is in hand. Recomputing it here would force a decode for every
+	// event once objects are stored in their encoded form.
+	if event.HasTriggerValue {
+		result := make([]string, 0, 2)
+		result = append(result, event.TriggerValue)
+		if event.PrevObject == nil {
+			return result, true
+		}
+		if event.PrevTriggerValue != event.TriggerValue {
+			result = append(result, event.PrevTriggerValue)
+		}
+		return result, true
 	}
 
 	result := make([]string, 0, 2)
@@ -966,6 +1002,11 @@ func (c *Cacher) dispatchEvents() {
 func setCachingObjects(event *watchCacheEvent, versioner storage.Versioner) {
 	switch event.Type {
 	case watch.Added, watch.Modified:
+		if _, ok := event.Object.(*store.LazyObject); ok {
+			// A lazy object already caches its serializations and needs no
+			// deep copy, so wrapping it would only add work.
+			return
+		}
 		if object, err := newCachingObject(event.Object); err == nil {
 			event.Object = object
 		} else {
@@ -981,6 +1022,16 @@ func setCachingObjects(event *watchCacheEvent, versioner storage.Versioner) {
 	case watch.Deleted:
 		// Don't wrap Object for delete events - these are not to deliver any
 		// events. Only wrap PrevObject.
+		//
+		// A lazy PrevObject has to be decoded here: the delete event carries
+		// the object's previous content stamped with the *current* resource
+		// version, so the cached bytes are not what goes on the wire.
+		prev, err := store.Materialize(event.PrevObject)
+		if err != nil {
+			klog.Errorf("couldn't materialize previous object for delete event: %v", err)
+			return
+		}
+		event.PrevObject = prev
 		if object, err := newCachingObject(event.PrevObject); err == nil {
 			// Update resource version of the object.
 			// event.PrevObject is used to deliver DELETE watch events and
@@ -1250,7 +1301,15 @@ func filterWithAttrsAndPrefixFunction(prefix string, p storage.SelectionPredicat
 			return false
 		}
 		if isSharded {
-			matches, err := p.MatchesSharding(obj)
+			// Sharding is the only filter that needs the typed object; label
+			// and field selectors run entirely off the precomputed attributes,
+			// which is what lets a lazy cache filter without decoding.
+			typed, err := store.Materialize(obj)
+			if err != nil {
+				utilruntime.HandleError(fmt.Errorf("materializing cached object for shard matching on %v: %w", groupResource, err))
+				return false
+			}
+			matches, err := p.MatchesSharding(typed)
 			if err != nil {
 				utilruntime.HandleError(fmt.Errorf("shard matching failed for %v: %w", groupResource, err))
 				return false

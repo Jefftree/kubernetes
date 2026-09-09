@@ -66,6 +66,7 @@ import (
 	testingclock "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 
+	"k8s.io/apiserver/pkg/storage/cacher/store"
 	cachertesting "k8s.io/apiserver/pkg/storage/cacher/testing"
 )
 
@@ -1932,8 +1933,10 @@ func TestCachingDeleteEvents(t *testing.T) {
 	barEventsWatcher := createWatch(barPredicate)
 	defer barEventsWatcher.Stop()
 
-	makePod := func(labels map[string]string, rv string) *examplev1.Pod {
-		return &examplev1.Pod{
+	// The memory version, which is what the storage layer decodes into and
+	// therefore the only thing the watch cache ever sees in production.
+	makePod := func(labels map[string]string, rv string) *example.Pod {
+		return &example.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:            "pod",
 				Namespace:       "ns",
@@ -1946,9 +1949,9 @@ func TestCachingDeleteEvents(t *testing.T) {
 	pod2 := makePod(map[string]string{"foo": "true"}, "1002")
 	pod3 := makePod(map[string]string{}, "1003")
 	pod4 := makePod(map[string]string{}, "1004")
-	pod1DeletedAt2 := pod1.DeepCopyObject().(*examplev1.Pod)
+	pod1DeletedAt2 := pod1.DeepCopyObject().(*example.Pod)
 	pod1DeletedAt2.ResourceVersion = "1002"
-	pod2DeletedAt3 := pod2.DeepCopyObject().(*examplev1.Pod)
+	pod2DeletedAt3 := pod2.DeepCopyObject().(*example.Pod)
 	pod2DeletedAt3.ResourceVersion = "1003"
 
 	allEvents := []watch.Event{
@@ -2001,8 +2004,8 @@ func testCachingObjects(t *testing.T, watchersCount int) {
 		watchers = append(watchers, w)
 	}
 
-	makePod := func(name, rv string) *examplev1.Pod {
-		return &examplev1.Pod{
+	makePod := func(name, rv string) *example.Pod {
+		return &example.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:            name,
 				Namespace:       "ns",
@@ -2035,8 +2038,14 @@ func testCachingObjects(t *testing.T, watchersCount int) {
 			}
 			object = event.Object.(runtime.CacheableObject).GetObject()
 
+			// The cached PrevObject may be held in encoded form, so read it
+			// through Materialize rather than assuming it is typed.
+			prevObject, err := store.Materialize(cacher.watchCache.history.cache[index].PrevObject)
+			if err != nil {
+				t.Fatalf("Failed to materialize previous object: %v", err)
+			}
 			if event.Type == watch.Deleted {
-				resourceVersion, err := cacher.versioner.ObjectResourceVersion(cacher.watchCache.history.cache[index].PrevObject)
+				resourceVersion, err := cacher.versioner.ObjectResourceVersion(prevObject)
 				if err != nil {
 					t.Fatalf("Failed to parse resource version: %v", err)
 				}
@@ -2048,7 +2057,7 @@ func testCachingObjects(t *testing.T, watchersCount int) {
 			case watch.Added, watch.Modified:
 				e = cacher.watchCache.history.cache[index].Object
 			case watch.Deleted:
-				e = cacher.watchCache.history.cache[index].PrevObject
+				e = prevObject
 			default:
 				t.Errorf("unexpected watch event: %#v", event)
 			}

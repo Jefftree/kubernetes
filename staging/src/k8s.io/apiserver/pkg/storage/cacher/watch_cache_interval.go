@@ -122,10 +122,14 @@ func newCacheIntervalFromLazySnapshot(resourceVersion uint64, snap store.Snapsho
 
 func storeElementToWatchCacheEvent(elem *store.Element, resourceVersion uint64) *watchCacheEvent {
 	return &watchCacheEvent{
-		Type:            watch.Added,
+		Type: watch.Added,
+		// Left lazy on purpose. These events go straight to one watcher's
+		// processInterval and are serialized from there, so a lazy object is
+		// spliced to the wire without ever being decoded or deep copied.
 		Object:          elem.Object,
 		ObjLabels:       elem.Labels,
 		ObjFields:       elem.Fields,
+		TriggerValue:    elem.TriggerValue,
 		Key:             elem.Key,
 		ResourceVersion: resourceVersion,
 	}

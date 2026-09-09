@@ -179,6 +179,12 @@ const (
 	// Enables generating snapshots of watch cache store and using them to serve LIST requests.
 	ListFromCacheSnapshot featuregate.Feature = "ListFromCacheSnapshot"
 
+	// Stores objects in the watch cache in their storage-encoded form and
+	// decodes them only when a reader needs the typed representation. Trades
+	// a decode on the LIST and GET paths for a large reduction in the number
+	// of live heap objects, which is what GC mark cost scales with.
+	LazyDecodeWatchCache featuregate.Feature = "LazyDecodeWatchCache"
+
 	// owner: @aramase @BenTheElder
 	// kep: https://kep.k8s.io/5793
 	//
@@ -410,6 +416,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 	ListFromCacheSnapshot: {
 		{Version: version.MustParse("1.33"), Default: false, PreRelease: featuregate.Alpha},
 		{Version: version.MustParse("1.34"), Default: true, PreRelease: featuregate.Beta},
+	},
+
+	LazyDecodeWatchCache: {
+		{Version: version.MustParse("1.36"), Default: false, PreRelease: featuregate.Alpha},
 	},
 
 	ManifestBasedAdmissionControlConfig: {

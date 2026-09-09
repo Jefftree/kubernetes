@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/cacher/metrics"
+	"k8s.io/apiserver/pkg/storage/cacher/store"
 	utilflowcontrol "k8s.io/apiserver/pkg/util/flowcontrol"
 
 	"k8s.io/klog/v2"
@@ -355,11 +356,21 @@ func (c *cacheWatcher) isDoneChannelClosedLocked() bool {
 }
 
 func getMutableObject(object runtime.Object) runtime.Object {
-	if _, ok := object.(*cachingObject); ok {
+	switch o := object.(type) {
+	case *cachingObject:
 		// It is safe to return without deep-copy, because the underlying
 		// object will lazily perform deep-copy on the first try to change
 		// any of its fields.
 		return object
+	case *store.LazyObject:
+		// Decoding already produces an object owned solely by this caller, so
+		// there is nothing to copy afterwards.
+		decoded, err := o.Materialize()
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("materializing cached object for watch delivery: %w", err))
+			return object
+		}
+		return decoded
 	}
 	return object.DeepCopyObject()
 }

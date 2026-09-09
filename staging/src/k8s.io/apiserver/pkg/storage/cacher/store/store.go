@@ -115,10 +115,32 @@ func NewIndexer(indexers *cache.Indexers) Indexer {
 // in different List/Watch requests), in the underlying store we are
 // keeping structs (key, object, labels, fields).
 type Element struct {
-	Key    string
+	Key string
+	// Object is either the decoded object or a *LazyObject holding its
+	// storage-encoded form. Read it through TypedObject unless you only need
+	// to pass it along untouched.
 	Object runtime.Object
 	Labels labels.Set
 	Fields fields.Set
+
+	// IndexValues and TriggerValue are derived from the object when the element
+	// is built. The indexer reads IndexValues on every store update and the
+	// cacher reads TriggerValue on every watch dispatch, including for the
+	// element being replaced, so a lazy element that did not carry them would
+	// decode on the write path instead of avoiding a decode.
+	// A nil IndexValues means "not precomputed"; fall back to the object.
+	IndexValues  map[string][]string
+	TriggerValue string
+}
+
+// TypedObject returns the element's object in typed form, decoding it if the
+// element is holding a storage-encoded form.
+//
+// For a lazy element the result is a fresh decode owned solely by the caller.
+// For a non-lazy element it is the shared cached object and the pre-existing
+// rule applies: do not mutate it.
+func (e *Element) TypedObject() (runtime.Object, error) {
+	return Materialize(e.Object)
 }
 
 func ElementKey(obj interface{}) (string, error) {
@@ -134,11 +156,14 @@ func ElementObject(obj interface{}) (runtime.Object, error) {
 	if !ok {
 		return nil, fmt.Errorf("not a storeElement: %v", obj)
 	}
-	return elem.Object, nil
+	return elem.TypedObject()
 }
 
-func ElementIndexFunc(objIndexFunc cache.IndexFunc) cache.IndexFunc {
+func ElementIndexFunc(indexName string, objIndexFunc cache.IndexFunc) cache.IndexFunc {
 	return func(obj interface{}) (strings []string, e error) {
+		if elem, ok := obj.(*Element); ok && elem.IndexValues != nil {
+			return elem.IndexValues[indexName], nil
+		}
 		seo, err := ElementObject(obj)
 		if err != nil {
 			return nil, err
@@ -153,7 +178,26 @@ func ElementIndexers(indexers *cache.Indexers) cache.Indexers {
 	}
 	ret := cache.Indexers{}
 	for indexName, indexFunc := range *indexers {
-		ret[indexName] = ElementIndexFunc(indexFunc)
+		ret[indexName] = ElementIndexFunc(indexName, indexFunc)
 	}
 	return ret
+}
+
+// ComputeIndexValues evaluates every configured index function against a
+// decoded object, for storing on an Element built from a lazy object.
+func ComputeIndexValues(indexers *cache.Indexers, obj runtime.Object) (map[string][]string, error) {
+	if indexers == nil {
+		// Distinguishable from "not precomputed": an empty non-nil map means
+		// there are no indexes, so the indexer must not fall back to a decode.
+		return map[string][]string{}, nil
+	}
+	values := make(map[string][]string, len(*indexers))
+	for indexName, indexFunc := range *indexers {
+		v, err := indexFunc(obj)
+		if err != nil {
+			return nil, fmt.Errorf("computing index %q: %w", indexName, err)
+		}
+		values[indexName] = v
+	}
+	return values, nil
 }

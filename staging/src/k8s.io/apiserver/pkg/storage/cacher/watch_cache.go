@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -30,11 +31,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/cacher/delegator"
 	"k8s.io/apiserver/pkg/storage/cacher/metrics"
 	"k8s.io/apiserver/pkg/storage/cacher/progress"
 	"k8s.io/apiserver/pkg/storage/cacher/store"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/component-base/tracing"
 	"k8s.io/klog/v2"
@@ -58,16 +61,24 @@ const (
 // the previous value of the object to enable proper filtering in the
 // upper layers.
 type watchCacheEvent struct {
-	Type            watch.EventType
-	Object          runtime.Object
-	ObjLabels       labels.Set
-	ObjFields       fields.Set
-	PrevObject      runtime.Object
-	PrevObjLabels   labels.Set
-	PrevObjFields   fields.Set
-	Key             string
-	ResourceVersion uint64
-	RecordTime      time.Time
+	Type          watch.EventType
+	Object        runtime.Object
+	ObjLabels     labels.Set
+	ObjFields     fields.Set
+	PrevObject    runtime.Object
+	PrevObjLabels labels.Set
+	PrevObjFields fields.Set
+	// TriggerValue and PrevTriggerValue are the cacher's indexedTrigger value
+	// for Object and PrevObject, computed on ingest. They are precomputed
+	// because dispatch reads them for every event and Object may be a
+	// store.LazyObject that would otherwise have to be decoded for them.
+	// HasTriggerValue distinguishes "no trigger configured" from "empty value".
+	TriggerValue     string
+	PrevTriggerValue string
+	HasTriggerValue  bool
+	Key              string
+	ResourceVersion  uint64
+	RecordTime       time.Time
 	// timeline carries the shared, pre-fan-out dispatch-lifecycle timestamps of
 	// this event (currently PointCacheReceived). Per-watcher points are filled in
 	// on delivery.
@@ -126,6 +137,19 @@ type ImmutableWatchCacheConfig struct {
 	waitingUntilFresh *progress.ConditionalProgressRequester
 
 	getCurrentRV func(context.Context) (uint64, error)
+
+	// lazyDecode makes the cache retain objects in their encoded form and
+	// decode them only when a reader needs the typed representation.
+	lazyDecode bool
+
+	// codec is the storage codec. Only used when lazyDecode is set: to produce
+	// the encoded form on ingest, and to decode it back on demand.
+	codec runtime.Codec
+
+	// indexers and triggerFunc are evaluated eagerly on ingest for lazy
+	// elements, because both are read on paths that must not decode.
+	indexers    *cache.Indexers
+	triggerFunc storage.IndexerFunc
 }
 
 func newWatchCache(
@@ -139,6 +163,9 @@ func newWatchCache(
 	groupResource schema.GroupResource,
 	progressRequester *progress.ConditionalProgressRequester,
 	getCurrentRV func(context.Context) (uint64, error),
+	codec runtime.Codec,
+	newFunc func() runtime.Object,
+	triggerFunc storage.IndexerFunc,
 ) *watchCache {
 	config := &ImmutableWatchCacheConfig{
 		keyFunc:           keyFunc,
@@ -149,6 +176,10 @@ func newWatchCache(
 		groupResource:     groupResource,
 		waitingUntilFresh: progressRequester,
 		getCurrentRV:      getCurrentRV,
+		lazyDecode:        utilfeature.DefaultFeatureGate.Enabled(features.LazyDecodeWatchCache) && codecRoundTripsCleanly(codec, newFunc, groupResource),
+		codec:             codec,
+		indexers:          indexers,
+		triggerFunc:       triggerFunc,
 	}
 
 	wc := &watchCache{
@@ -196,6 +227,77 @@ func (w *watchCache) Delete(obj interface{}) error {
 	return w.processEvent(event, resourceVersion)
 }
 
+// codecRoundTripsCleanly reports whether storing objects encoded with this
+// codec is observationally equivalent to storing them decoded.
+//
+// Everything a reader gets from a lazy cache has been through encode followed
+// by decode. That is only safe if the pair is the identity, which requires the
+// codec's decode target to be the version the cache holds. A codec that
+// decodes into the same version it encodes to skips conversion and leaves
+// TypeMeta populated, for instance, which would silently change what the cache
+// hands out. Probing with an empty object catches that class of asymmetry; it
+// cannot catch a field that only some objects populate.
+func codecRoundTripsCleanly(codec runtime.Codec, newFunc func() runtime.Object, groupResource schema.GroupResource) bool {
+	if codec == nil || newFunc == nil {
+		return false
+	}
+	probe := newFunc()
+	raw, err := runtime.Encode(codec, probe)
+	if err != nil {
+		klog.V(2).InfoS("Disabling lazy watch cache decoding: probe object does not encode", "groupResource", groupResource, "err", err)
+		return false
+	}
+	decoded, err := runtime.Decode(codec, raw)
+	if err != nil {
+		klog.V(2).InfoS("Disabling lazy watch cache decoding: probe object does not decode", "groupResource", groupResource, "err", err)
+		return false
+	}
+	if !apiequality.Semantic.DeepEqual(probe, decoded) {
+		klog.V(2).InfoS("Disabling lazy watch cache decoding: codec does not round trip cleanly", "groupResource", groupResource)
+		return false
+	}
+	return true
+}
+
+// newElement builds the unit the cache retains. When lazy decoding is on it
+// encodes the object and keeps only the bytes, so everything derived from the
+// typed object -- attributes, index values, the trigger value -- has to be
+// computed here, while the decoded object is still in hand.
+func (w *watchCache) newElement(key string, object runtime.Object) (*store.Element, error) {
+	objLabels, objFields, err := w.config.getAttrsFunc(object)
+	if err != nil {
+		return nil, err
+	}
+	elem := &store.Element{
+		Key:    key,
+		Object: object,
+		Labels: objLabels,
+		Fields: objFields,
+	}
+	if w.config.triggerFunc != nil {
+		elem.TriggerValue = w.config.triggerFunc(object)
+	}
+	if !w.config.lazyDecode {
+		return elem, nil
+	}
+	lazy, err := store.EncodeToLazyObject(w.config.codec, w.config.codec, object)
+	if err != nil {
+		// Storing the decoded object is always correct, just more expensive.
+		// Failing the write instead would take the whole cache unready over an
+		// optimization, so degrade rather than break.
+		klog.V(2).ErrorS(err, "Falling back to storing a decoded object in the watch cache", "groupResource", w.config.groupResource)
+		metrics.RecordLazyEncodeFallback(w.config.groupResource)
+		return elem, nil
+	}
+	indexValues, err := store.ComputeIndexValues(w.config.indexers, object)
+	if err != nil {
+		return nil, err
+	}
+	elem.Object = lazy
+	elem.IndexValues = indexValues
+	return elem, nil
+}
+
 func (w *watchCache) objectToVersionedRuntimeObject(obj interface{}) (runtime.Object, uint64, error) {
 	object, ok := obj.(runtime.Object)
 	if !ok {
@@ -224,17 +326,22 @@ func (w *watchCache) processEvent(event watch.Event, resourceVersion uint64) err
 	if err != nil {
 		return fmt.Errorf("couldn't compute key: %v", err)
 	}
-	elem := &store.Element{Key: key, Object: event.Object}
-	elem.Labels, elem.Fields, err = w.config.getAttrsFunc(event.Object)
+	elem, err := w.newElement(key, event.Object)
 	if err != nil {
 		return err
 	}
 
 	wcEvent := &watchCacheEvent{
-		Type:            event.Type,
-		Object:          elem.Object,
+		Type: event.Type,
+		// The object dispatched to watchers stays typed even when the store
+		// holds it encoded: it was just decoded by the storage layer, so
+		// re-deriving it would be pure waste, and it lives only for the
+		// duration of the history window.
+		Object:          event.Object,
 		ObjLabels:       elem.Labels,
 		ObjFields:       elem.Fields,
+		TriggerValue:    elem.TriggerValue,
+		HasTriggerValue: w.config.triggerFunc != nil,
 		Key:             key,
 		ResourceVersion: resourceVersion,
 		RecordTime:      recordTime,
@@ -253,9 +360,14 @@ func (w *watchCache) processEvent(event watch.Event, resourceVersion uint64) err
 	}
 	if exists {
 		previousElem := previous.(*store.Element)
+		// Deliberately not materialized: PrevObject is only needed for the
+		// rare filter transition that turns an update into a delete event, and
+		// its trigger value and attributes are already precomputed. Decoding
+		// it here would put a decode on every write.
 		wcEvent.PrevObject = previousElem.Object
 		wcEvent.PrevObjLabels = previousElem.Labels
 		wcEvent.PrevObjFields = previousElem.Fields
+		wcEvent.PrevTriggerValue = previousElem.TriggerValue
 	}
 
 	if err := func() error {
@@ -584,16 +696,11 @@ func (w *watchCache) Replace(objs []interface{}, resourceVersion string) error {
 		if err != nil {
 			return fmt.Errorf("couldn't compute key: %v", err)
 		}
-		objLabels, objFields, err := w.config.getAttrsFunc(object)
+		elem, err := w.newElement(key, object)
 		if err != nil {
 			return err
 		}
-		toReplace = append(toReplace, &store.Element{
-			Key:    key,
-			Object: object,
-			Labels: objLabels,
-			Fields: objFields,
-		})
+		toReplace = append(toReplace, elem)
 	}
 
 	w.Lock()

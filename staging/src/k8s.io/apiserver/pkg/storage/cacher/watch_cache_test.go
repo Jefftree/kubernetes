@@ -77,6 +77,48 @@ func makeTestStoreElement(pod *v1.Pod) *store.Element {
 	}
 }
 
+// normalizedElement returns a copy of a cached element with its object
+// materialized and the lazy-only bookkeeping cleared, so a test can compare it
+// against a plain expected Element whether or not lazy decoding is on.
+func normalizedElement(t testing.TB, item interface{}) store.Element {
+	t.Helper()
+	elem, ok := item.(*store.Element)
+	if !ok {
+		t.Fatalf("not a store.Element: %T", item)
+	}
+	obj, err := elem.TypedObject()
+	if err != nil {
+		t.Fatalf("materializing cached object: %v", err)
+	}
+	out := *elem
+	out.Object = obj
+	out.IndexValues = nil
+	out.TriggerValue = ""
+	return out
+}
+
+// eventObject reads a watch cache event's object, materializing it when the
+// cache is holding it in encoded form.
+func eventObject(t testing.TB, event *watchCacheEvent) runtime.Object {
+	t.Helper()
+	obj, err := store.Materialize(event.Object)
+	if err != nil {
+		t.Fatalf("materializing event object: %v", err)
+	}
+	return obj
+}
+
+// prevEventObject reads a watch cache event's previous object, which the cache
+// deliberately leaves in encoded form until something needs it.
+func prevEventObject(t testing.TB, event *watchCacheEvent) runtime.Object {
+	t.Helper()
+	obj, err := store.Materialize(event.PrevObject)
+	if err != nil {
+		t.Fatalf("materializing previous event object: %v", err)
+	}
+	return obj
+}
+
 type testWatchCache struct {
 	*watchCache
 
@@ -136,7 +178,12 @@ func newTestWatchCache(capacity int, eventFreshDuration time.Duration, indexers 
 		defer wc.RUnlock()
 		return wc.resourceVersion, nil
 	}
-	wc.watchCache = newWatchCache(keyFunc, mockHandler, getAttrsFunc, versioner, indexers, testingclock.NewFakeClock(time.Now()), eventFreshDuration, schema.GroupResource{Resource: "pods"}, pr, getCurrentRV)
+	codec := testWatchCacheCodec
+	if codec == nil {
+		codec = storageLikeCorev1ProtoCodec()
+	}
+	newFunc := func() runtime.Object { return &v1.Pod{} }
+	wc.watchCache = newWatchCache(keyFunc, mockHandler, getAttrsFunc, versioner, indexers, testingclock.NewFakeClock(time.Now()), eventFreshDuration, schema.GroupResource{Resource: "pods"}, pr, getCurrentRV, codec, newFunc, nil)
 	// To preserve behavior of tests that assume a given capacity,
 	// resize it to th expected size.
 	wc.history.capacity = capacity
@@ -215,8 +262,8 @@ func TestWatchCacheBasic(t *testing.T) {
 		t.Errorf("didn't find pod")
 	} else {
 		expected := makeTestStoreElement(makeTestPod("pod", 1))
-		if !apiequality.Semantic.DeepEqual(expected, item) {
-			t.Errorf("expected %v, got %v", expected, item)
+		if got := normalizedElement(t, item); !apiequality.Semantic.DeepEqual(*expected, got) {
+			t.Errorf("expected %v, got %v", *expected, got)
 		}
 	}
 	pod2 := makeTestPod("pod", 2)
@@ -227,8 +274,8 @@ func TestWatchCacheBasic(t *testing.T) {
 		t.Errorf("didn't find pod")
 	} else {
 		expected := makeTestStoreElement(makeTestPod("pod", 2))
-		if !apiequality.Semantic.DeepEqual(expected, item) {
-			t.Errorf("expected %v, got %v", expected, item)
+		if got := normalizedElement(t, item); !apiequality.Semantic.DeepEqual(*expected, got) {
+			t.Errorf("expected %v, got %v", *expected, got)
 		}
 	}
 	pod3 := makeTestPod("pod", 3)
@@ -251,8 +298,8 @@ func TestWatchCacheBasic(t *testing.T) {
 		}
 		items := make(map[string]store.Element)
 		for _, item := range s.storage.List() {
-			elem := item.(*store.Element)
-			items[elem.Key] = *elem
+			elem := normalizedElement(t, item)
+			items[elem.Key] = elem
 		}
 		if !apiequality.Semantic.DeepEqual(expected, items) {
 			t.Errorf("expected %v, got %v", expected, items)
@@ -271,8 +318,8 @@ func TestWatchCacheBasic(t *testing.T) {
 		}
 		items := make(map[string]store.Element)
 		for _, item := range s.storage.List() {
-			elem := item.(*store.Element)
-			items[elem.Key] = *elem
+			elem := normalizedElement(t, item)
+			items[elem.Key] = elem
 		}
 		if !apiequality.Semantic.DeepEqual(expected, items) {
 			t.Errorf("expected %v, got %v", expected, items)
@@ -312,8 +359,8 @@ func TestEvents(t *testing.T) {
 			t.Errorf("unexpected event type: %v", result[0].Type)
 		}
 		pod := makeTestPod("pod", uint64(3))
-		if !apiequality.Semantic.DeepEqual(pod, result[0].Object) {
-			t.Errorf("unexpected item: %v, expected: %v", result[0].Object, pod)
+		if got := eventObject(t, result[0]); !apiequality.Semantic.DeepEqual(pod, got) {
+			t.Errorf("unexpected item: %v, expected: %v", got, pod)
 		}
 		if result[0].PrevObject != nil {
 			t.Errorf("unexpected item: %v", result[0].PrevObject)
@@ -343,12 +390,12 @@ func TestEvents(t *testing.T) {
 				t.Errorf("unexpected event type: %v", result[i].Type)
 			}
 			pod := makeTestPod("pod", uint64(i+4))
-			if !apiequality.Semantic.DeepEqual(pod, result[i].Object) {
-				t.Errorf("unexpected item: %v, expected: %v", result[i].Object, pod)
+			if got := eventObject(t, result[i]); !apiequality.Semantic.DeepEqual(pod, got) {
+				t.Errorf("unexpected item: %v, expected: %v", got, pod)
 			}
 			prevPod := makeTestPod("pod", uint64(i+3))
-			if !apiequality.Semantic.DeepEqual(prevPod, result[i].PrevObject) {
-				t.Errorf("unexpected item: %v, expected: %v", result[i].PrevObject, prevPod)
+			if got := prevEventObject(t, result[i]); !apiequality.Semantic.DeepEqual(prevPod, got) {
+				t.Errorf("unexpected item: %v, expected: %v", got, prevPod)
 			}
 		}
 	}
@@ -374,8 +421,8 @@ func TestEvents(t *testing.T) {
 		}
 		for i := 0; i < 5; i++ {
 			pod := makeTestPod("pod", uint64(i+5))
-			if !apiequality.Semantic.DeepEqual(pod, result[i].Object) {
-				t.Errorf("unexpected item: %v, expected: %v", result[i].Object, pod)
+			if got := eventObject(t, result[i]); !apiequality.Semantic.DeepEqual(pod, got) {
+				t.Errorf("unexpected item: %v, expected: %v", got, pod)
 			}
 		}
 	}
@@ -395,12 +442,12 @@ func TestEvents(t *testing.T) {
 			t.Errorf("unexpected event type: %v", result[0].Type)
 		}
 		pod := makeTestPod("pod", uint64(10))
-		if !apiequality.Semantic.DeepEqual(pod, result[0].Object) {
-			t.Errorf("unexpected item: %v, expected: %v", result[0].Object, pod)
+		if got := eventObject(t, result[0]); !apiequality.Semantic.DeepEqual(pod, got) {
+			t.Errorf("unexpected item: %v, expected: %v", got, pod)
 		}
 		prevPod := makeTestPod("pod", uint64(9))
-		if !apiequality.Semantic.DeepEqual(prevPod, result[0].PrevObject) {
-			t.Errorf("unexpected item: %v, expected: %v", result[0].PrevObject, prevPod)
+		if got := prevEventObject(t, result[0]); !apiequality.Semantic.DeepEqual(prevPod, got) {
+			t.Errorf("unexpected item: %v, expected: %v", got, prevPod)
 		}
 	}
 }
@@ -436,7 +483,7 @@ func TestMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(result) != 1 || !apiequality.Semantic.DeepEqual(result[0].Object, pod) {
+	if len(result) != 1 || !apiequality.Semantic.DeepEqual(eventObject(t, result[0]), pod) {
 		t.Errorf("unexpected result: %#v, expected %v", result, pod)
 	}
 }
@@ -602,8 +649,8 @@ func TestWaitUntilFreshAndGet(t *testing.T) {
 		t.Fatalf("no results returned: %#v", obj)
 	}
 	expected := makeTestStoreElement(makeTestPod("bar", 5))
-	if !apiequality.Semantic.DeepEqual(expected, obj) {
-		t.Errorf("expected %v, got %v", expected, obj)
+	if got := normalizedElement(t, obj); !apiequality.Semantic.DeepEqual(*expected, got) {
+		t.Errorf("expected %v, got %v", *expected, got)
 	}
 }
 
@@ -1409,7 +1456,7 @@ func testWatchCacheSnapshotConcurrency(t *testing.T, s *testWatchCache, resource
 func getMaxItemRV(t *testing.T, versioner storage.Versioner, items []interface{}) uint64 {
 	var maxRV uint64
 	for _, item := range items {
-		elem := item.(*store.Element)
+		elem := normalizedElement(t, item)
 		itemRV, err := versioner.ObjectResourceVersion(elem.Object)
 		require.NoError(t, err)
 		maxRV = max(maxRV, itemRV)

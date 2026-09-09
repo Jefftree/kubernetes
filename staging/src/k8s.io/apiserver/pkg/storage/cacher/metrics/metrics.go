@@ -141,6 +141,17 @@ var (
 		[]string{"group", "resource"},
 	)
 
+	lazyEncodeFallbackCounter = compbasemetrics.NewCounterVec(
+		&compbasemetrics.CounterOpts{
+			Namespace:      namespace,
+			Subsystem:      subsystem,
+			Name:           "lazy_encode_fallback_total",
+			Help:           "Counter of objects the watch cache could not store in encoded form and retained decoded instead, broken by resource type.",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"group", "resource"},
+	)
+
 	EventsCounter = compbasemetrics.NewCounterVec(
 		&compbasemetrics.CounterOpts{
 			Namespace:      namespace,
@@ -307,6 +318,7 @@ func Register() {
 		legacyregistry.MustRegister(InitCounter)
 		legacyregistry.MustRegister(EventsReceivedCounter)
 		legacyregistry.MustRegister(EventsCounter)
+		legacyregistry.MustRegister(lazyEncodeFallbackCounter)
 		legacyregistry.MustRegister(TerminatedWatchersCounter)
 		legacyregistry.MustRegister(watchCacheResourceVersion)
 		legacyregistry.MustRegister(watchCacheCapacityIncreaseTotal)
@@ -332,6 +344,12 @@ func RecordListCacheMetrics(groupResource schema.GroupResource, indexName string
 	listCacheNumFetched.WithLabelValues(groupResource.Group, groupResource.Resource, indexName).Add(float64(numFetched))
 	listCacheNumReturned.WithLabelValues(groupResource.Group, groupResource.Resource).Add(float64(numReturned))
 	storagemetrics.RecordStorageListMetrics(groupResource, storagemetrics.StorageBackendWatchCache, indexName, numFetched, 0, numReturned)
+}
+
+// RecordLazyEncodeFallback records that an object could not be retained in its
+// encoded form and was kept decoded instead.
+func RecordLazyEncodeFallback(groupResource schema.GroupResource) {
+	lazyEncodeFallbackCounter.WithLabelValues(groupResource.Group, groupResource.Resource).Inc()
 }
 
 // RecordResourceVersion sets the current resource version for a given resource type.
