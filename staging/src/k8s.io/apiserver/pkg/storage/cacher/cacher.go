@@ -892,8 +892,19 @@ func (c *Cacher) GetList(ctx context.Context, key string, opts storage.ListOptio
 
 // baseObjectThreadUnsafe omits locking for cachingObject.
 func baseObjectThreadUnsafe(object runtime.Object) runtime.Object {
-	if co, ok := object.(*cachingObject); ok {
-		return co.object
+	switch o := object.(type) {
+	case *cachingObject:
+		return o.object
+	case *store.LazyObject:
+		// Callers pass the result to an index function that type-asserts to
+		// the concrete API type, so handing back the encoded form would
+		// silently yield an empty index value rather than an error.
+		decoded, err := o.Materialize()
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("materializing cached object for trigger indexing: %w", err))
+			return object
+		}
+		return decoded
 	}
 	return object
 }
