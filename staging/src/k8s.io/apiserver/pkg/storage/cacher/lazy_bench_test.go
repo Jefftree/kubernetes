@@ -514,6 +514,57 @@ func TestLazyGCCost(t *testing.T) {
 	t.Logf("estimated GC CPU over the run: %v", time.Duration(after.GCCPUFraction*float64(elapsed)).Round(time.Millisecond))
 }
 
+// TestLazyServingDoesNotGrowRetention checks the claim that makes the repeated
+// LIST speedup free: the serialization memoized for the response encoder is
+// byte-identical to the stored form, so LazyObject shares the slice instead of
+// keeping a second copy.
+//
+// If that dedup ever stops firing, serving a LIST would silently double the
+// watch cache's memory, which is exactly the kind of failure that does not
+// show up as a crash.
+func TestLazyServingDoesNotGrowRetention(t *testing.T) {
+	if !lazyEnabled() {
+		t.Skip("requires LAZY_DECODE_WATCH_CACHE=true")
+	}
+	const podCount = 2000
+	wc := newTestWatchCache(podCount*2, DefaultEventFreshDuration, &cache.Indexers{})
+	defer wc.Stop()
+	func() {
+		for _, pod := range benchPods(t, podCount) {
+			if err := wc.Add(pod); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}()
+
+	beforeBytes, beforeObjs := liveHeap()
+
+	enc := responseEncoder()
+	buf := runtime.NewSpliceBuffer()
+	served := 0
+	for _, item := range wc.storage.List() {
+		serveToWire(t, enc, item.(*store.Element).Object, buf)
+		served++
+	}
+	if served != podCount {
+		t.Fatalf("served %d, want %d", served, podCount)
+	}
+
+	afterBytes, afterObjs := liveHeap()
+	goruntime.KeepAlive(wc)
+
+	deltaBytes := int64(afterBytes) - int64(beforeBytes)
+	deltaObjs := int64(afterObjs) - int64(beforeObjs)
+	t.Logf("serving %d objects to the wire added %.2f MB / %d heap objects to the cache",
+		podCount, float64(deltaBytes)/(1<<20), deltaObjs)
+
+	// The memo bookkeeping itself is a handful of objects per served object;
+	// a second copy of the encoded bytes would be ~10 KB each.
+	if perObject := float64(deltaBytes) / podCount; perObject > 1024 {
+		t.Errorf("serving retained %.0f extra bytes per object; a second serialization is being kept (encoded size is ~10 KB)", perObject)
+	}
+}
+
 // measureBareElements reports the live heap held by n Elements carrying only
 // the parts of a cache entry that lazy decoding does not change.
 func measureBareElements(t *testing.T, n int) (bytes, objects int64) {

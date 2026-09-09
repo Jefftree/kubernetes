@@ -17,12 +17,14 @@ limitations under the License.
 package cacher
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"reflect"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,11 +33,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
+	"k8s.io/apiserver/pkg/storage/cacher/metrics"
 	"k8s.io/apiserver/pkg/storage/cacher/store"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/cache"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 // testWatchCacheCodec is the codec newTestWatchCache hands to the watch cache.
@@ -386,6 +391,61 @@ func TestLazySelectorListDoesNotDecodeNonMatches(t *testing.T) {
 	}
 	if got := counting.decodes.Load(); got != 1 {
 		t.Errorf("serving a selector LIST matching 1 of %d items decoded %d objects, want 1", podCount, got)
+	}
+}
+
+// TestLazyObjectNeverEscapesTheCacher asserts the containment property the
+// whole design rests on: a *store.LazyObject is an internal representation and
+// must never reach a watch consumer, which may legitimately type-assert to the
+// concrete API type.
+//
+// Every delivery path funnels through getMutableObject, which materializes.
+// This test pins that. Remove the materialization and it goes red.
+func TestLazyObjectNeverEscapesTheCacher(t *testing.T) {
+	wc := newTestWatchCache(100, DefaultEventFreshDuration, &cache.Indexers{})
+	defer wc.Stop()
+	if err := wc.Add(newLazyTestPod("p1", "ns", "node-a", "5", "v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wc.Update(newLazyTestPod("p1", "ns", "node-a", "6", "v2")); err != nil {
+		t.Fatal(err)
+	}
+
+	watcher := newCacheWatcher(
+		10,
+		filterWithAttrsAndPrefixFunction("/prefix/", storage.Everything, schema.GroupResource{Resource: "pods"}),
+		func(bool) {},
+		storage.APIObjectVersioner{},
+		time.Time{},
+		false,
+		schema.GroupResource{Resource: "pods"},
+		metrics.NewWatcherMetricsObservers(schema.GroupResource{Resource: "pods"}),
+		testingclock.NewFakeClock(time.Now()),
+		"test",
+	)
+	defer watcher.stopLocked()
+
+	interval, err := wc.getCacheIntervalForEvents(0, storage.ListOptions{Predicate: storage.Everything, Recursive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go watcher.processInterval(ctx, interval, wc.resourceVersion)
+
+	select {
+	case event, ok := <-watcher.ResultChan():
+		if !ok {
+			t.Fatal("watch channel closed without an event")
+		}
+		if _, bad := event.Object.(*store.LazyObject); bad {
+			t.Fatalf("watch delivered an internal *store.LazyObject to a consumer")
+		}
+		if _, good := event.Object.(*corev1.Pod); !good {
+			t.Fatalf("watch delivered %T, want *corev1.Pod", event.Object)
+		}
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Fatal("timed out waiting for an initial event")
 	}
 }
 
