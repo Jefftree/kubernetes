@@ -220,14 +220,30 @@ Reading these honestly:
   compare "decode a 10 KB pod" against "copy a pointer". They are **upper bounds** on the
   added cost, not request-level numbers: a real request then encodes, which both arms pay
   and neither benchmark includes.
-- `LazyWatchInitialEvents` is the real watch-list bootstrap cost, decode per object per
-  watcher instead of deep copy per object per watcher: **+121%**.
-- `LazyIngest` is the write path: **+17.6 µs and +20.7 KiB per event**, the encode. Of
-  that, ~10 KB is an avoidable copy, because `runtime.NewCodec`'s wrapper embeds `Encoder`
-  and so does not forward `EncodeWithAllocator`; the allocator fast path in
-  `EncodeToLazyObject` never fires for a storage codec. Forwarding it is an eight-line
-  apimachinery change, not attempted here because the blast radius across the tree was not
-  worth validating tonight.
+- `LazyWatchInitialEvents` is the real watch-list bootstrap cost and the **largest
+  remaining cost in the design**: a decode per object per watcher instead of a deep copy per
+  object per watcher, **+121%**. Unlike live dispatch there is nothing to amortize it
+  against, because snapshot events never pass through `setCachingObjects`. At 100 watchers
+  over 5,000 objects that is 500,000 decodes against 500,000 deep copies.
+- **`LazyIngestWithDispatch` is the write-path number that matters**, and it is the one to
+  put beside the GC saving: **2.613 µs -> 21.270 µs, +18.7 µs and +20.7 KiB per watched
+  write**, 21 -> 30 allocs. `LazyIngest` alone understates it, because the test cache uses
+  a no-op event handler and so charges the ingest encode but nothing dispatch does.
+
+  This was 3x worse before a fix. `Cacher.dispatchEvent` calls `setCachingObjects` for
+  every event, which under the first design had to decode the object it had just encoded,
+  costing **+51.7 µs and +62.4 KiB, 442 allocs**. `processEvent` already holds the object
+  the storage layer decoded moments earlier, so it now hands that to dispatch through a
+  `dispatchObject` field that is cleared as soon as the handler has taken its copy, keeping
+  it out of the history buffer. The churn retention sweep is unchanged to 0.2 MB, which is
+  how we know the field does not leak. Dispatch is also skipped entirely when no watcher is
+  interested, so an unwatched resource pays only the encode.
+
+  Of the remaining +20.7 KiB, ~10 KB is an avoidable copy: `runtime.NewCodec`'s wrapper
+  embeds `Encoder` and so does not forward `EncodeWithAllocator`, and the allocator fast
+  path in `EncodeToLazyObject` never fires for a storage codec. Forwarding it is an
+  eight-line apimachinery change, not attempted here because the blast radius across the
+  tree was not worth validating tonight.
 
 ## A claim this design does not get to make
 
@@ -302,8 +318,11 @@ answer:
    `gcDrain` was 38-40% of apiserver CPU after the fieldsv1string fix. If that holds, a 37%
    cut to non-idle GC CPU is worth roughly 14 points of total CPU. That multiplication is
    an accounting model and should be treated as a hypothesis.
-2. **The write-to-read ratio.** Every write pays an encode; only some reads get anything
-   back. The target write-throughput workload is the favourable end.
+2. **The write-to-read ratio, and the added allocation rate.** Every watched write pays
+   +18.7 µs and +20.7 KiB. At a hypothetical 5,000 writes/s that is ~9% of one core and
+   ~100 MB/s of extra allocation against a measured ~4 GB/s baseline, so roughly +2.5% on
+   the allocation rate. Since GC work scales with allocation, that eats into the 37%,
+   and the GC benchmark held allocation fixed so it does not capture the offset.
 3. **Whether idle-mark headroom exists.** On a box with spare cores the win is smaller than
    -56% suggests and larger than -37% suggests; -37% is the pessimistic bound.
 

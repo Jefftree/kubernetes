@@ -77,9 +77,17 @@ type watchCacheEvent struct {
 	TriggerValue     string
 	PrevTriggerValue string
 	HasTriggerValue  bool
-	Key              string
-	ResourceVersion  uint64
-	RecordTime       time.Time
+	// dispatchObject carries the decoded object to the dispatch goroutine so it
+	// does not have to re-decode what the storage layer decoded moments ago.
+	//
+	// It is cleared from the event that the history ring buffer retains, right
+	// after the handler has taken its copy, because retaining it there would
+	// reintroduce exactly the decoded-object retention this change removes.
+	// Events replayed from history therefore have it nil and materialize.
+	dispatchObject  runtime.Object
+	Key             string
+	ResourceVersion uint64
+	RecordTime      time.Time
 	// timeline carries the shared, pre-fan-out dispatch-lifecycle timestamps of
 	// this event (currently PointCacheReceived). Per-watcher points are filled in
 	// on delivery.
@@ -368,6 +376,7 @@ func (w *watchCache) processEvent(event watch.Event, resourceVersion uint64) err
 		// shallow copy of this event, so what the ring buffer retains stays
 		// encoded.
 		Object:          elem.Object,
+		dispatchObject:  event.Object,
 		ObjLabels:       elem.Labels,
 		ObjFields:       elem.Fields,
 		TriggerValue:    elem.TriggerValue,
@@ -425,8 +434,12 @@ func (w *watchCache) processEvent(event watch.Event, resourceVersion uint64) err
 	// UpdateResourceVersion in flight at any point in time, which is true now,
 	// because reflector calls them synchronously from its main thread.
 	if w.config.eventHandler != nil {
+		// The handler takes a copy of the struct, so clearing the field
+		// afterwards releases the decoded object from the copy the history
+		// buffer holds without affecting the one in flight to dispatch.
 		w.config.eventHandler(wcEvent)
 	}
+	wcEvent.dispatchObject = nil
 	metrics.RecordResourceVersion(w.config.groupResource, resourceVersion)
 	return nil
 }

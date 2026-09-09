@@ -1013,12 +1013,17 @@ func (c *Cacher) dispatchEvents() {
 func setCachingObjects(event *watchCacheEvent, versioner storage.Versioner) {
 	switch event.Type {
 	case watch.Added, watch.Modified:
-		// event is a shallow copy made for this dispatch, so materializing
-		// here does not put a decoded object back into the history buffer.
-		current, err := store.Materialize(event.Object)
-		if err != nil {
-			klog.Errorf("couldn't materialize object for dispatch: %v", err)
-			return
+		// Prefer the object the storage layer already decoded on ingest;
+		// only events replayed from the history buffer have to decode.
+		// event is a shallow copy made for this dispatch, so assigning here
+		// does not put a decoded object back into the history buffer.
+		current := event.dispatchObject
+		if current == nil {
+			var err error
+			if current, err = store.Materialize(event.Object); err != nil {
+				klog.Errorf("couldn't materialize object for dispatch: %v", err)
+				return
+			}
 		}
 		event.Object = current
 		if object, err := newCachingObject(event.Object); err == nil {
@@ -1084,10 +1089,16 @@ func (c *Cacher) dispatchEvent(event *watchCacheEvent) {
 		// deep-copying (until some field is explicitly being modified), we create
 		// it unconditionally to ensure safety and reduce deep-copying.
 		//
-		// Make a shallow copy to allow overwriting Object and PrevObject.
-		wcEvent := *event
-		setCachingObjects(&wcEvent, c.versioner)
-		event = &wcEvent
+		// Nothing consumes the event when no watcher is interested, and
+		// preparing it is not free: with lazy decoding setCachingObjects has to
+		// materialize the object, so doing it unconditionally would put a
+		// decode on every write of an unwatched resource.
+		if len(c.watchersBuffer) > 0 {
+			// Make a shallow copy to allow overwriting Object and PrevObject.
+			wcEvent := *event
+			setCachingObjects(&wcEvent, c.versioner)
+			event = &wcEvent
+		}
 
 		c.blockedWatchers = c.blockedWatchers[:0]
 		for _, watcher := range c.watchersBuffer {

@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer/protobuf"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/cacher/store"
@@ -152,6 +153,39 @@ func BenchmarkLazyIngest(b *testing.B) {
 	}
 }
 
+// BenchmarkLazyIngestWithDispatch measures the write path INCLUDING what
+// dispatch costs, which BenchmarkLazyIngest does not: the test watch cache uses
+// a no-op event handler, so it charges the ingest encode and nothing else.
+//
+// The real cacher calls setCachingObjects for every event that has at least one
+// watcher, and with lazy decoding that materializes the object. So a watched
+// resource pays an encode on ingest AND a decode on dispatch. This is the
+// number to put beside the GC saving.
+func BenchmarkLazyIngestWithDispatch(b *testing.B) {
+	pods := benchPods(b, 1000)
+	wc := newBenchWatchCache(b, pods)
+	versioner := storage.APIObjectVersioner{}
+	// Reproduce exactly what Cacher.dispatchEvent does for an event with at
+	// least one interested watcher.
+	wc.config.eventHandler = func(event *watchCacheEvent) {
+		dispatched := *event
+		setCachingObjects(&dispatched, versioner)
+	}
+	updates := make([]*corev1.Pod, len(pods))
+	for i, p := range pods {
+		updates[i] = p.DeepCopy()
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		u := updates[i%len(updates)]
+		u.ResourceVersion = strconv.Itoa(len(pods) + i + 1)
+		if err := wc.Update(u); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkLazyListAll measures an unfiltered LIST of 1000 realistic pods.
 // This is where lazy decoding costs the most: every returned item is decoded.
 func BenchmarkLazyListAll(b *testing.B) {
@@ -261,7 +295,7 @@ func BenchmarkLazyWatchInitialEvents(b *testing.B) {
 				break
 			}
 			// getMutableObject is what the watcher applies before delivery.
-			if getMutableObject(event.Object) == nil {
+			if getMutableObject(event.Object, schema.GroupResource{Resource: "pods"}) == nil {
 				b.Fatal("nil object")
 			}
 			count++

@@ -141,6 +141,17 @@ var (
 		[]string{"group", "resource"},
 	)
 
+	lazyMaterializeFailureCounter = compbasemetrics.NewCounterVec(
+		&compbasemetrics.CounterOpts{
+			Namespace:      namespace,
+			Subsystem:      subsystem,
+			Name:           "lazy_materialize_failure_total",
+			Help:           "Counter of cached objects that could not be decoded from their encoded form, broken by resource type.",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"group", "resource"},
+	)
+
 	lazyEncodeFallbackCounter = compbasemetrics.NewCounterVec(
 		&compbasemetrics.CounterOpts{
 			Namespace:      namespace,
@@ -319,6 +330,7 @@ func Register() {
 		legacyregistry.MustRegister(EventsReceivedCounter)
 		legacyregistry.MustRegister(EventsCounter)
 		legacyregistry.MustRegister(lazyEncodeFallbackCounter)
+		legacyregistry.MustRegister(lazyMaterializeFailureCounter)
 		legacyregistry.MustRegister(TerminatedWatchersCounter)
 		legacyregistry.MustRegister(watchCacheResourceVersion)
 		legacyregistry.MustRegister(watchCacheCapacityIncreaseTotal)
@@ -350,6 +362,13 @@ func RecordListCacheMetrics(groupResource schema.GroupResource, indexName string
 // encoded form and was kept decoded instead.
 func RecordLazyEncodeFallback(groupResource schema.GroupResource) {
 	lazyEncodeFallbackCounter.WithLabelValues(groupResource.Group, groupResource.Resource).Inc()
+}
+
+// RecordLazyMaterializeFailure records a cached object that could not be
+// decoded back from its encoded form. This should never happen; if it does the
+// affected watch is terminated rather than served stale data.
+func RecordLazyMaterializeFailure(groupResource schema.GroupResource) {
+	lazyMaterializeFailureCounter.WithLabelValues(groupResource.Group, groupResource.Resource).Inc()
 }
 
 // RecordResourceVersion sets the current resource version for a given resource type.

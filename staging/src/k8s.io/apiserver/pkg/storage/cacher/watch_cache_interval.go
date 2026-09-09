@@ -126,8 +126,14 @@ func storeElementToWatchCacheEvent(elem *store.Element, resourceVersion uint64) 
 		// Left in whatever form the store holds it, which may be encoded.
 		// These events go to a single watcher's processInterval, and
 		// getMutableObject materializes on delivery, so nothing downstream
-		// sees the encoded form. Keeping it encoded here means the interval
-		// does not deep copy the whole store per watcher.
+		// sees the encoded form.
+		//
+		// Be clear about the trade this makes: it replaces a deep copy per
+		// watcher per object with a DECODE per watcher per object, which is
+		// more expensive (see BenchmarkLazyWatchInitialEvents). Unlike live
+		// dispatch there is nothing to amortize it against, because snapshot
+		// events never pass through setCachingObjects. This is the largest
+		// remaining cost in the design.
 		Object:          elem.Object,
 		ObjLabels:       elem.Labels,
 		ObjFields:       elem.Fields,

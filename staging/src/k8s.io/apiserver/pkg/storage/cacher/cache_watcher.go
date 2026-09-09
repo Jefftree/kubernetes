@@ -355,7 +355,7 @@ func (c *cacheWatcher) isDoneChannelClosedLocked() bool {
 	return false
 }
 
-func getMutableObject(object runtime.Object) runtime.Object {
+func getMutableObject(object runtime.Object, groupResource schema.GroupResource) runtime.Object {
 	switch o := object.(type) {
 	case *cachingObject:
 		// It is safe to return without deep-copy, because the underlying
@@ -367,7 +367,12 @@ func getMutableObject(object runtime.Object) runtime.Object {
 		// there is nothing to copy afterwards.
 		decoded, err := o.Materialize()
 		if err != nil {
-			utilruntime.HandleError(fmt.Errorf("materializing cached object for watch delivery: %w", err))
+			// Returning the undecodable object lets the encoder fail, which
+			// terminates the watch and makes the client re-list. That is the
+			// right failure: silently dropping the event instead would leave
+			// the client permanently diverged with no signal.
+			metrics.RecordLazyMaterializeFailure(groupResource)
+			utilruntime.HandleError(fmt.Errorf("materializing cached object for watch delivery of %v: %w", groupResource, err))
 			return object
 		}
 		return decoded
@@ -405,12 +410,12 @@ func (c *cacheWatcher) convertToWatchEvent(event *watchCacheEvent) *watch.Event 
 
 	switch {
 	case curObjPasses && !oldObjPasses:
-		return &watch.Event{Type: watch.Added, Object: getMutableObject(event.Object)}
+		return &watch.Event{Type: watch.Added, Object: getMutableObject(event.Object, c.groupResource)}
 	case curObjPasses && oldObjPasses:
-		return &watch.Event{Type: watch.Modified, Object: getMutableObject(event.Object)}
+		return &watch.Event{Type: watch.Modified, Object: getMutableObject(event.Object, c.groupResource)}
 	case !curObjPasses && oldObjPasses:
 		// return a delete event with the previous object content, but with the event's resource version
-		oldObj := getMutableObject(event.PrevObject)
+		oldObj := getMutableObject(event.PrevObject, c.groupResource)
 		// We know that if oldObj is cachingObject (which can only be set via
 		// setCachingObjects), its resourceVersion is already set correctly and
 		// we don't need to update it. However, since cachingObject efficiently
