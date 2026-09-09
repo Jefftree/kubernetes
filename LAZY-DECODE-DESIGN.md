@@ -119,21 +119,48 @@ storing the decoded object and increments
 Machine: 32-core Intel Xeon @ 2.80GHz, 125 GB RAM, Go 1.27.0, linux/amd64. Feature switched
 with `LAZY_DECODE_WATCH_CACHE=true`, same binary both arms.
 
-### GC cost, the mechanism claim (n=3 per arm)
+### GC cost, the mechanism claim
 
-`TestLazyGCCost`: hold a 10,000-pod watch cache live, then allocate 4 GB of identical
-garbage in both arms and read off GC CPU. Same workload, so any difference is the cost of
-marking the retained heap.
+`TestLazyGCCost`: hold a 10,000-pod watch cache live, then allocate 4 GiB of identical
+garbage in both arms and difference the `runtime/metrics` GC CPU counters over that window.
+The workload is byte-identical, so the difference is the cost of marking the retained heap.
+Total process CPU over the window agrees to 2.1% between arms, which confirms the workload
+really is the same.
 
-| | live heap | heap objects | GC cycles | GCCPUFraction | GC CPU of run |
-| --- | --- | --- | --- | --- | --- |
-| off | 273.0 MB | 2,993,990 | 15 | .0354 / .0358 / .0354 | 32 / 32 / 32 ms |
-| on | 133.4 MB | 454,018 | 31 | .0223 / .0212 / .0208 | 19 / 18 / 17 ms |
+Live heap while running: **273.0 MB / 2,993,995 objects** off versus **133.4 MB / 454,000
+objects** on, a 6.59x reduction in objects. GC cycles rise from 15 to 31, because the
+smaller live heap lowers the GOGC trigger.
 
-**GC CPU falls 40% while the collector runs twice as many cycles.** The smaller live heap
-lowers the GOGC trigger, so cycles get more frequent; each is far cheaper because there are
-6.6x fewer objects to mark. Total stop-the-world pause rises from 1.6 ms to 3.2 ms over the
-run, which is the cost of the extra cycles.
+GC CPU seconds over the window, by class, n=3 per arm:
+
+| class | off | on | change |
+| --- | --- | --- | --- |
+| total | 3.9715 | 1.7457 | **-56.0%** |
+| mark, dedicated | 1.1447 | 0.6873 | -40.0% |
+| mark, assist | 0.0052 | 0.0030 | -42.0% |
+| mark, idle | 2.7859 | 0.9976 | -64.2% |
+| pause | 0.0357 | 0.0576 | **+61.6%** |
+| **non-idle (dedicated + assist + pause)** | **1.1856** | **0.7480** | **-36.9%** |
+
+**The number to quote is -37%, not -56%.** Seventy percent of the "total" is the *idle*
+class: GC work scheduled onto otherwise-idle Ps. This box has 32 cores and the benchmark
+allocates on one goroutine, so idle-mark is nearly free in wall-clock terms and inflates
+the total. A saturated apiserver has no idle Ps and that work reappears as dedicated and
+assist. Non-idle GC CPU, the part that is actually taken away from request serving, falls
+from 4.19% to 2.70% of process CPU.
+
+An earlier version of this measurement used `MemStats.GCCPUFraction` and reported -40%.
+That metric is a cumulative average over the whole process lifetime, including building the
+cache, so it could not answer "what did this workload cost"; the counters above can.
+
+Stop-the-world pause is the one regression: 36 ms to 58 ms over the window, the price of
+running twice as many cycles. Small in absolute terms here, worth watching at scale.
+
+The accounting model, "GC CPU is proportional to live heap objects per live byte", predicts
+10,967 objects/MB against 3,403 objects/MB, so a 3.22x gain and a 69% reduction. Measured
+total was 2.22x and 56%; measured non-idle was 1.59x and 37%. **The model overpredicted by
+1.45x on the most generous reading and by 2.0x on the defensible one** -- consistent with
+every accounting model on the `ladder` rig having overpredicted, now five for five.
 
 ### Retention (n=1 each, deterministic; negative control flat)
 
@@ -201,8 +228,22 @@ Reading these honestly:
 ## What this does not settle
 
 The local numbers say: 5.6x to 9.3x fewer live heap objects, 1.8x to 2.1x fewer live bytes,
-40% less GC CPU for a fixed allocation workload, against +17 µs and +21 KiB per write and a
-decode per LIST item. Whether that nets out positive on a real apiserver depends on the
-ratio of writes to LISTs and on how much of the process's CPU is actually GC, and only an
-end-to-end run answers it. Every accounting model on the `ladder` rig has overpredicted,
-four for four, and there is no reason to think this one is different.
+and 37% less non-idle GC CPU for a fixed allocation workload, against +17 µs and +21 KiB
+per write, a decode per LIST item, and 60% more stop-the-world pause.
+
+Whether that nets out positive on a real apiserver depends on three things this box cannot
+answer:
+
+1. **How much of the apiserver's CPU is actually GC.** The profile that motivated this said
+   `gcDrain` was 38-40% of apiserver CPU after the fieldsv1string fix. If that holds, a 37%
+   cut to non-idle GC CPU is worth roughly 14 points of total CPU. That multiplication is
+   an accounting model and should be treated as a hypothesis.
+2. **The write-to-read ratio.** Every write pays an encode; only some reads get anything
+   back. The target write-throughput workload is the favourable end.
+3. **Whether idle-mark headroom exists.** On a box with spare cores the win is smaller than
+   -56% suggests and larger than -37% suggests; -37% is the pessimistic bound.
+
+An end-to-end run on `ladder-c4-144` with `--feature-gates=LazyDecodeWatchCache=true`
+against the ClusterLoader2 write-throughput test would settle all three, reading delivered
+throughput, apiserver CPU, `gcDrain` share in the profile, and RSS. That box is serialized
+and was in use, so it was not touched.

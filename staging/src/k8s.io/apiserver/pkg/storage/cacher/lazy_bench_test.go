@@ -501,7 +501,7 @@ func TestLazyGCCost(t *testing.T) {
 	// which includes building the cache, so it cannot answer "how much GC CPU
 	// did this workload cost". runtime/metrics exposes GC CPU as a monotonic
 	// counter, which differences cleanly over a window.
-	gcCPUBefore, assistBefore := gcCPUSeconds()
+	gcBefore := gcCPUSeconds()
 	var before, after goruntime.MemStats
 	goruntime.ReadMemStats(&before)
 	start := time.Now()
@@ -517,18 +517,29 @@ func TestLazyGCCost(t *testing.T) {
 
 	elapsed := time.Since(start)
 	goruntime.ReadMemStats(&after)
-	gcCPUAfter, assistAfter := gcCPUSeconds()
+	gcAfter := gcCPUSeconds()
 	goruntime.KeepAlive(wc)
 
 	cycles := after.NumGC - before.NumGC
 	pause := time.Duration(after.PauseTotalNs - before.PauseTotalNs)
-	gcCPU := gcCPUAfter - gcCPUBefore
-	assistCPU := assistAfter - assistBefore
+	d := func(name string) float64 { return gcAfter[name] - gcBefore[name] }
 	t.Logf("LazyDecodeWatchCache=%v", lazyEnabled())
 	t.Logf("live heap while running: %.1f MB / %d heap objects", float64(liveBytes)/(1<<20), liveObjs)
 	t.Logf("allocated %d MB of identical garbage in %v", garbageBytes>>20, elapsed.Round(time.Millisecond))
 	t.Logf("GC cycles=%d  stop-the-world pause total=%v", cycles, pause.Round(time.Microsecond))
-	t.Logf("GC CPU over the window: %.4f s total (%.4f s of it mutator assist)", gcCPU, assistCPU)
+	// The idle class is GC work done on otherwise-idle Ps. On a 32-core box
+	// running a single-threaded allocator almost every P is idle, so idle-mark
+	// is nearly free in wall-clock terms and inflates the total. Report the
+	// breakdown so the ratio is not read as a wall-clock saving.
+	t.Logf("GC CPU over the window (seconds): total=%.4f dedicated=%.4f assist=%.4f idle=%.4f pause=%.4f",
+		d("/cpu/classes/gc/total:cpu-seconds"),
+		d("/cpu/classes/gc/mark/dedicated:cpu-seconds"),
+		d("/cpu/classes/gc/mark/assist:cpu-seconds"),
+		d("/cpu/classes/gc/mark/idle:cpu-seconds"),
+		d("/cpu/classes/gc/pause:cpu-seconds"))
+	t.Logf("non-idle GC CPU (dedicated+assist+pause): %.4f s of %.4f s total process CPU",
+		d("/cpu/classes/gc/mark/dedicated:cpu-seconds")+d("/cpu/classes/gc/mark/assist:cpu-seconds")+d("/cpu/classes/gc/pause:cpu-seconds"),
+		d("/cpu/classes/total:cpu-seconds"))
 }
 
 // TestLazyServingDoesNotGrowRetention checks the claim that makes the repeated
@@ -585,13 +596,25 @@ func TestLazyServingDoesNotGrowRetention(t *testing.T) {
 // gcCPUSeconds reads the process's cumulative GC CPU time, and the part of it
 // charged to mutator assists, from runtime/metrics. Both are monotonic, so a
 // difference is the cost over a window.
-func gcCPUSeconds() (total, assist float64) {
-	samples := []metrics.Sample{
-		{Name: "/cpu/classes/gc/total:cpu-seconds"},
-		{Name: "/cpu/classes/gc/mark/assist:cpu-seconds"},
+func gcCPUSeconds() map[string]float64 {
+	names := []string{
+		"/cpu/classes/gc/total:cpu-seconds",
+		"/cpu/classes/gc/mark/dedicated:cpu-seconds",
+		"/cpu/classes/gc/mark/assist:cpu-seconds",
+		"/cpu/classes/gc/mark/idle:cpu-seconds",
+		"/cpu/classes/gc/pause:cpu-seconds",
+		"/cpu/classes/total:cpu-seconds",
+	}
+	samples := make([]metrics.Sample, len(names))
+	for i, n := range names {
+		samples[i] = metrics.Sample{Name: n}
 	}
 	metrics.Read(samples)
-	return samples[0].Value.Float64(), samples[1].Value.Float64()
+	out := make(map[string]float64, len(names))
+	for _, s := range samples {
+		out[s.Name] = s.Value.Float64()
+	}
+	return out
 }
 
 // measureBareElements reports the live heap held by n Elements carrying only
