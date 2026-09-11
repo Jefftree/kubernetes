@@ -18,6 +18,7 @@ package fieldmanager_test
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -75,28 +76,59 @@ func TestAdmission(t *testing.T) {
 	}
 
 	for name, mutate := range managedFieldsMutators {
-		t.Run(name, func(t *testing.T) {
-			mutated, shouldReset := mutate(validManagedFieldsEntry)
-			validEntries := []metav1.ManagedFieldsEntry{validManagedFieldsEntry}
-			mutatedEntries := []metav1.ManagedFieldsEntry{mutated}
+		for _, inPlace := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/inPlace=%v", name, inPlace), func(t *testing.T) {
+				mutated, shouldReset := mutate(validManagedFieldsEntry)
+				validEntries := []metav1.ManagedFieldsEntry{validManagedFieldsEntry}
+				mutatedEntries := []metav1.ManagedFieldsEntry{mutated}
 
-			obj := &v1.ConfigMap{}
-			obj.SetManagedFields(validEntries)
+				obj := &v1.ConfigMap{}
+				obj.SetManagedFields([]metav1.ManagedFieldsEntry{validManagedFieldsEntry})
 
-			wrap.admit = replaceManagedFields(mutatedEntries)
+				if inPlace {
+					wrap.admit = mutateManagedFieldsInPlace(mutated)
+				} else {
+					wrap.admit = replaceManagedFields(mutatedEntries)
+				}
 
-			attrs := admission.NewAttributesRecord(obj, obj, schema.GroupVersionKind{}, "default", "", schema.GroupVersionResource{}, "", admission.Update, nil, false, nil)
-			if err := ac.(admission.MutationInterface).Admit(context.TODO(), attrs, nil); err != nil {
-				t.Fatal(err)
-			}
+				attrs := admission.NewAttributesRecord(obj, obj, schema.GroupVersionKind{}, "default", "", schema.GroupVersionResource{}, "", admission.Update, nil, false, nil)
+				if err := ac.(admission.MutationInterface).Admit(context.TODO(), attrs, nil); err != nil {
+					t.Fatal(err)
+				}
 
-			if shouldReset && !reflect.DeepEqual(obj.GetManagedFields(), validEntries) {
-				t.Fatalf("expected: \n%v\ngot:\n%v", validEntries, obj.GetManagedFields())
-			}
-			if !shouldReset && reflect.DeepEqual(obj.GetManagedFields(), validEntries) {
-				t.Fatalf("expected: \n%v\ngot:\n%v", mutatedEntries, obj.GetManagedFields())
-			}
-		})
+				if shouldReset && !reflect.DeepEqual(obj.GetManagedFields(), validEntries) {
+					t.Fatalf("expected: \n%v\ngot:\n%v", validEntries, obj.GetManagedFields())
+				}
+				if !shouldReset && reflect.DeepEqual(obj.GetManagedFields(), validEntries) {
+					t.Fatalf("expected: \n%v\ngot:\n%v", mutatedEntries, obj.GetManagedFields())
+				}
+			})
+		}
+	}
+
+	// Nothing touched managedFields, so the decode must not run at all.
+	obj := &v1.ConfigMap{}
+	obj.SetManagedFields([]metav1.ManagedFieldsEntry{validManagedFieldsEntry})
+	wrap.admit = func(context.Context, admission.Attributes, admission.ObjectInterfaces) error { return nil }
+	attrs := admission.NewAttributesRecord(obj, obj, schema.GroupVersionKind{}, "default", "", schema.GroupVersionResource{}, "", admission.Update, nil, false, nil)
+	allocs := testing.AllocsPerRun(100, func() {
+		if err := ac.(admission.MutationInterface).Admit(context.TODO(), attrs, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 5 {
+		t.Errorf("Admit allocated %v objects for unchanged managedFields, want the decode skipped", allocs)
+	}
+}
+
+func mutateManagedFieldsInPlace(to metav1.ManagedFieldsEntry) func(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
+	return func(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
+		objectMeta, err := meta.Accessor(a.GetObject())
+		if err != nil {
+			return err
+		}
+		objectMeta.GetManagedFields()[0] = to
+		return nil
 	}
 }
 
