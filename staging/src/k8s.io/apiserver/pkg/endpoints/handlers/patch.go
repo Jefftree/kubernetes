@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -562,13 +563,9 @@ func strategicPatchObject(
 	schemaReferenceObj runtime.Object,
 	validationDirective string,
 ) error {
-	originalObjMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(originalObject)
-	if err != nil {
-		return err
-	}
-
 	patchMap := make(map[string]interface{})
 	var strictErrs []error
+	var err error
 	if validationDirective == metav1.FieldValidationWarn || validationDirective == metav1.FieldValidationStrict {
 		strictErrs, err = kjson.UnmarshalStrict(patchBytes, &patchMap)
 		if err != nil {
@@ -580,10 +577,119 @@ func strategicPatchObject(
 		}
 	}
 
+	if done, err := prunedStrategicPatchObject(requestContext, defaulter, originalObject, patchMap, objToUpdate, schemaReferenceObj, strictErrs, validationDirective); done {
+		return err
+	}
+
+	originalObjMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(originalObject)
+	if err != nil {
+		return err
+	}
+
 	if err := applyPatchToObject(requestContext, defaulter, originalObjMap, patchMap, objToUpdate, schemaReferenceObj, strictErrs, validationDirective); err != nil {
 		return err
 	}
 	return nil
+}
+
+// prunedStrategicPatchObject converts only the top-level fields the patch names and
+// deep-copies the rest of the original across. Reports done=false when a precondition
+// fails, in which case the caller must run the unpruned path.
+//
+// Sound because mergeMap only writes keys that appear in the patch, so an untouched
+// top-level key survives the merge unchanged. Strict and warn are eligible too: unknown
+// fields are only reported for keys present in the map being walked, and the omitted keys
+// come from a typed struct, so they cannot carry one. That last step holds only while no
+// type implements json.Marshaler without json.Unmarshaler, which
+// TestMarshalerUnmarshalerSymmetry in k8s.io/api enforces.
+func prunedStrategicPatchObject(
+	requestContext context.Context,
+	defaulter runtime.ObjectDefaulter,
+	originalObject runtime.Object,
+	patchMap map[string]interface{},
+	objToUpdate runtime.Object,
+	schemaReferenceObj runtime.Object,
+	strictErrs []error,
+	validationDirective string,
+) (done bool, err error) {
+	origVal, updateVal := reflect.ValueOf(originalObject), reflect.ValueOf(objToUpdate)
+	if origVal.Kind() != reflect.Pointer || origVal.IsNil() || updateVal.Kind() != reflect.Pointer || updateVal.IsNil() {
+		return false, nil
+	}
+	structType := origVal.Elem().Type()
+	if structType.Kind() != reflect.Struct || updateVal.Elem().Type() != structType {
+		return false, nil
+	}
+	fields, ok := implicatedFields(patchMap, structType)
+	if !ok {
+		return false, nil
+	}
+
+	scratch := reflect.New(structType)
+	for _, idx := range fields {
+		scratch.Elem().Field(idx).Set(origVal.Elem().Field(idx))
+	}
+	partialMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(scratch.Interface())
+	if err != nil {
+		return false, nil
+	}
+
+	// merged is the original's own pointer type, so the assertion cannot fail.
+	// Defaulting is deferred to after reassembly: a defaulter may read fields that the
+	// pruned merge target does not carry, so running it here could differ from stock.
+	merged := reflect.New(structType)
+	if err := applyPatchToObject(requestContext, noopDefaulter{}, partialMap, patchMap, merged.Interface().(runtime.Object), schemaReferenceObj, strictErrs, validationDirective); err != nil {
+		return true, err
+	}
+
+	// Deep copy so the result never aliases the original's maps and slices.
+	updateVal.Elem().Set(reflect.ValueOf(originalObject.DeepCopyObject()).Elem())
+	for _, idx := range fields {
+		updateVal.Elem().Field(idx).Set(merged.Elem().Field(idx))
+	}
+	defaulter.Default(objToUpdate)
+
+	return true, nil
+}
+
+type noopDefaulter struct{}
+
+func (noopDefaulter) Default(runtime.Object) {}
+
+// implicatedFields maps the top-level keys a strategic merge patch can reach onto struct
+// field indexes of structType. Reports ok=false for a whole-object directive, or a key
+// that is not a distinct top-level field (apiVersion and kind, on the inlined TypeMeta),
+// since neither can be pruned per-field.
+func implicatedFields(patchMap map[string]interface{}, structType reflect.Type) (_ []int, ok bool) {
+	keys := make(map[string]bool, len(patchMap))
+	for k := range patchMap {
+		name := k
+		if strings.HasPrefix(k, "$") {
+			// A prefixed directive names the field it acts on after the "/". A bare one
+			// ($patch, $retainKeys) acts on the whole object.
+			_, after, found := strings.Cut(k, "/")
+			if !found {
+				return nil, false
+			}
+			name = after
+		}
+		keys[name] = true
+	}
+
+	fields := make([]int, 0, len(keys))
+	for i := 0; i < structType.NumField(); i++ {
+		f := structType.Field(i)
+		if f.PkgPath != "" {
+			continue // unexported, and reflect cannot set it
+		}
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if name != "" && name != "-" && keys[name] {
+			fields = append(fields, i)
+			delete(keys, name)
+		}
+	}
+	// A leftover key named no distinct top-level field.
+	return fields, len(keys) == 0
 }
 
 // applyPatch is called every time GuaranteedUpdate asks for the updated object,
