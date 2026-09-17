@@ -18,6 +18,7 @@ package internal
 
 import (
 	"fmt"
+	"reflect"
 
 	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
 	"sigs.k8s.io/structured-merge-diff/v7/merge"
@@ -25,6 +26,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -39,6 +41,10 @@ type structuredMergeManager struct {
 }
 
 var _ Manager = &structuredMergeManager{}
+
+// Constant at runtime. Only the differential test flips it, to run both
+// conversions in one binary.
+var stripLiveManagedFieldsForUpdate = true
 
 // NewStructuredMergeManager creates a new Manager that merges apply requests
 // and update managed fields for other types of requests.
@@ -97,6 +103,15 @@ func (f *structuredMergeManager) Update(liveObj, newObj runtime.Object, managed 
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to convert live object (%v) to proper version: %v", objectGVKNN(liveObj), err)
 	}
+	// newObj arrives with managedFields already cleared by FieldManager.Update,
+	// so leaving them on the live object only makes ObjectToTyped reparse every
+	// fieldsV1 blob to produce a diff that is discarded again below. Apply is
+	// left alone: there the asymmetry against the applied object is real.
+	if stripLiveManagedFieldsForUpdate {
+		if stripped, ok := shallowCopyWithoutManagedFields(liveObjVersioned); ok {
+			liveObjVersioned = stripped
+		}
+	}
 	newObjTyped, err := f.typeConverter.ObjectToTyped(newObjVersioned, typed.AllowDuplicates)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to convert new object (%v) to smd typed: %v", objectGVKNN(newObjVersioned), err)
@@ -115,6 +130,34 @@ func (f *structuredMergeManager) Update(liveObj, newObj runtime.Object, managed 
 	managed = NewManaged(managedFields, managed.Times())
 
 	return newObj, managed, nil
+}
+
+// The copy shares everything the struct points at, so it is read-only. obj
+// itself must not be touched: it can be an object the watch cache is serving
+// concurrently. ObjectMetaAccessor is the gate that makes a struct copy
+// sufficient, since implementors embed ObjectMeta by value, and it excludes
+// unstructured objects, whose metadata lives in a map the copy would share.
+func shallowCopyWithoutManagedFields(obj runtime.Object) (runtime.Object, bool) {
+	accessor, ok := obj.(metav1.ObjectMetaAccessor)
+	if !ok || len(accessor.GetObjectMeta().GetManagedFields()) == 0 {
+		return nil, false
+	}
+	v := reflect.ValueOf(obj)
+	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+		return nil, false
+	}
+	cp := reflect.New(v.Elem().Type())
+	cp.Elem().Set(v.Elem())
+	cpObj, ok := cp.Interface().(runtime.Object)
+	if !ok {
+		return nil, false
+	}
+	cpMeta := cpObj.(metav1.ObjectMetaAccessor).GetObjectMeta()
+	if cpMeta == accessor.GetObjectMeta() {
+		return nil, false
+	}
+	cpMeta.SetManagedFields(nil)
+	return cpObj, true
 }
 
 // Apply implements Manager.
