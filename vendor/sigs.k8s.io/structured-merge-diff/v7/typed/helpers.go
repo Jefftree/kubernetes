@@ -77,13 +77,10 @@ func (errs ValidationErrors) WithPrefix(prefix string) ValidationErrors {
 // This is useful when unwinding the stack on errors. Prefix is
 // computed lazily only if there is an error.
 func (errs ValidationErrors) WithLazyPrefix(fn func() string) ValidationErrors {
-	if len(errs) == 0 {
+	if len(errs) == 0 || fn == nil {
 		return errs
 	}
-	prefix := ""
-	if fn != nil {
-		prefix = fn()
-	}
+	prefix := fn()
 	for i := range errs {
 		errs[i].Path = prefix + errs[i].Path
 	}
@@ -206,7 +203,9 @@ func keyedAssociativeListItemToPathElement(a value.Allocator, s *schema.Schema, 
 	if !child.IsMap() {
 		return pe, errors.New("associative list with keys may not have non-map elements")
 	}
-	keyMap := value.FieldList{}
+	// One allocation holds both the list and, for up to two keys, its fields.
+	storage := &keyFieldListStorage{}
+	keyMap := value.FieldList(storage.fields[:0])
 	m := child.AsMapUsing(a)
 	defer a.Free(m)
 	for _, fieldName := range list.Keys {
@@ -228,8 +227,14 @@ func keyedAssociativeListItemToPathElement(a value.Allocator, s *schema.Schema, 
 	}
 
 	keyMap.Sort()
-	pe.Key = &keyMap
+	storage.list = keyMap
+	pe.Key = &storage.list
 	return pe, nil
+}
+
+type keyFieldListStorage struct {
+	list   value.FieldList
+	fields [2]value.Field
 }
 
 func setItemToPathElement(child value.Value) (fieldpath.PathElement, error) {
@@ -250,6 +255,40 @@ func setItemToPathElement(child value.Value) (fieldpath.PathElement, error) {
 		pe.Value = &child
 		return pe, nil
 	}
+}
+
+// validateListItemKey fails exactly when listItemToPathElement would, without
+// building the path element.
+func validateListItemKey(a value.Allocator, s *schema.Schema, list *schema.List, child value.Value) error {
+	if list.ElementRelationship != schema.Associative {
+		return errors.New("invalid indexing of non-associative list")
+	}
+	if len(list.Keys) == 0 {
+		_, err := setItemToPathElement(child)
+		return err
+	}
+	if child.IsNull() {
+		return errors.New("associative list with keys may not have a null element")
+	}
+	if !child.IsMap() {
+		return errors.New("associative list with keys may not have non-map elements")
+	}
+	m := child.AsMapUsing(a)
+	defer a.Free(m)
+	hasKey := false
+	for _, fieldName := range list.Keys {
+		if m.Has(fieldName) {
+			hasKey = true
+		} else if def, err := getAssociativeKeyDefault(s, list, fieldName); err != nil {
+			return fmt.Errorf("couldn't find default value for %v: %v", fieldName, err)
+		} else if def != nil {
+			hasKey = true
+		}
+	}
+	if !hasKey {
+		return fmt.Errorf("associative list with keys has an element that omits all key fields %q (and doesn't have default values for any key fields)", list.Keys)
+	}
+	return nil
 }
 
 func listItemToPathElement(a value.Allocator, s *schema.Schema, list *schema.List, child value.Value) (fieldpath.PathElement, error) {

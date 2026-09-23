@@ -210,6 +210,15 @@ func (e TypeReflectCacheEntry) CanConvertToUnstructured() bool {
 	return e.isJsonMarshaler || e.ptrIsJsonMarshaler || e.isUnstructuredConverter || e.ptrIsUnstructuredConverter || e.isUnstructuredConverterWithError || e.ptrIsUnstructuredConverterWithError
 }
 
+// convertsWithValueMethodsOnly reports whether every method that converts the
+// type to unstructured has a value receiver. Conversion then picks the same
+// method whether or not the value is addressable.
+func (e TypeReflectCacheEntry) convertsWithValueMethodsOnly() bool {
+	return e.isJsonMarshaler == e.ptrIsJsonMarshaler &&
+		e.isUnstructuredConverter == e.ptrIsUnstructuredConverter &&
+		e.isUnstructuredConverterWithError == e.ptrIsUnstructuredConverterWithError
+}
+
 // ToUnstructured converts the provided value to unstructured and returns it.
 func (e TypeReflectCacheEntry) ToUnstructured(sv reflect.Value) (interface{}, error) {
 	// This is based on https://github.com/kubernetes/kubernetes/blob/82c9e5c814eb7acc6cc0a090c057294d0667ad66/staging/src/k8s.io/apimachinery/pkg/runtime/converter.go#L505
@@ -222,8 +231,8 @@ func (e TypeReflectCacheEntry) ToUnstructured(sv reflect.Value) (interface{}, er
 	}
 	// Check if the object has a custom string converter and use it if available, since it is much more efficient
 	// than round tripping through json.
-	if converter, ok := e.getUnstructuredConverter(sv); ok {
-		return converter.ToUnstructuredWithError()
+	if u, err, ok := e.toUnstructuredWithConverter(sv); ok {
+		return u, err
 	}
 	// Check if the object has a custom JSON marshaller/unmarshaller.
 	if marshaler, ok := e.getJsonMarshaler(sv); ok {
@@ -335,28 +344,33 @@ func (e TypeReflectCacheEntry) getJsonUnmarshaler(v reflect.Value) (json.Unmarsh
 	return v.Addr().Interface().(json.Unmarshaler), true
 }
 
-type unstructuredConverterWithNilError struct {
-	UnstructuredConverter
-}
-
-func (c unstructuredConverterWithNilError) ToUnstructuredWithError() (any, error) {
-	return c.UnstructuredConverter.ToUnstructured(), nil
-}
-
-func (e TypeReflectCacheEntry) getUnstructuredConverter(v reflect.Value) (UnstructuredConverterWithError, bool) {
+// toUnstructuredWithConverter converts v with its custom unstructured converter,
+// reporting ok=false if it has none.
+func (e TypeReflectCacheEntry) toUnstructuredWithConverter(v reflect.Value) (u any, err error, ok bool) {
+	// Boxing an addressable value's pointer does not allocate, unlike boxing the
+	// value itself, and the pointer method set includes the value methods.
+	if v.Kind() != reflect.Ptr && v.CanAddr() {
+		switch {
+		case e.ptrIsUnstructuredConverterWithError:
+			u, err = v.Addr().Interface().(UnstructuredConverterWithError).ToUnstructuredWithError()
+			return u, err, true
+		case e.ptrIsUnstructuredConverter:
+			return v.Addr().Interface().(UnstructuredConverter).ToUnstructured(), nil, true
+		}
+	}
 	switch {
 	case e.isUnstructuredConverterWithError:
-		return v.Interface().(UnstructuredConverterWithError), true
+		u, err = v.Interface().(UnstructuredConverterWithError).ToUnstructuredWithError()
+		return u, err, true
 	case e.ptrIsUnstructuredConverterWithError && v.CanAddr():
-		// Check pointer receivers if v is not a pointer
-		return v.Addr().Interface().(UnstructuredConverterWithError), true
+		u, err = v.Addr().Interface().(UnstructuredConverterWithError).ToUnstructuredWithError()
+		return u, err, true
 	case e.isUnstructuredConverter:
-		return unstructuredConverterWithNilError{v.Interface().(UnstructuredConverter)}, true
+		return v.Interface().(UnstructuredConverter).ToUnstructured(), nil, true
 	case e.ptrIsUnstructuredConverter && v.CanAddr():
-		// Check pointer receivers if v is not a pointer
-		return unstructuredConverterWithNilError{v.Addr().Interface().(UnstructuredConverter)}, true
+		return v.Addr().Interface().(UnstructuredConverter).ToUnstructured(), nil, true
 	}
-	return nil, false
+	return nil, nil, false
 }
 
 type typeReflectCache struct {

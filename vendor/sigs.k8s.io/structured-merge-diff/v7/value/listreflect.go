@@ -69,9 +69,16 @@ func (r listReflect) Equals(other List) bool {
 }
 func (r listReflect) EqualsUsing(a Allocator, other List) bool {
 	if otherReflectList, ok := other.(*listReflect); ok {
+		// Comparing through pointers is equivalent, and boxing a pointer does
+		// not allocate, unlike boxing a slice.
+		if r.Value.CanAddr() && otherReflectList.Value.CanAddr() {
+			return reflect.DeepEqual(r.Value.Addr().Interface(), otherReflectList.Value.Addr().Interface())
+		}
 		return reflect.DeepEqual(r.Value.Interface(), otherReflectList.Value.Interface())
 	}
-	return ListEqualsUsing(a, &r, other)
+	// Taking the address of a copy keeps r itself off the heap on the fast path.
+	rr := r
+	return ListEqualsUsing(a, &rr, other)
 }
 
 type listReflectRange struct {

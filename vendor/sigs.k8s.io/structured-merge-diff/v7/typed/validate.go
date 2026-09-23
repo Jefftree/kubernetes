@@ -57,6 +57,13 @@ type validatingObjectWalker struct {
 	// Allocate only as many walkers as needed for the depth by storing them here.
 	spareWalkers *[]*validatingObjectWalker
 	allocator    value.Allocator
+
+	// visitMapItems state. The callback is bound to this walker once, rather
+	// than a closure being allocated for every map.
+	mapItemFn func(key string, val value.Value) bool
+	boundTo   *validatingObjectWalker
+	curMap    *schema.Map
+	curErrs   ValidationErrors
 }
 
 func (v *validatingObjectWalker) prepareDescent(tr schema.TypeRef) *validatingObjectWalker {
@@ -70,7 +77,9 @@ func (v *validatingObjectWalker) prepareDescent(tr schema.TypeRef) *validatingOb
 	} else {
 		v2 = &validatingObjectWalker{}
 	}
+	fn, boundTo := v2.mapItemFn, v2.boundTo
 	*v2 = *v
+	v2.mapItemFn, v2.boundTo = fn, boundTo
 	v2.typeRef = tr
 	return v2
 }
@@ -124,14 +133,19 @@ func (v *validatingObjectWalker) doScalar(t *schema.Scalar) ValidationErrors {
 }
 
 func (v *validatingObjectWalker) visitListItems(t *schema.List, list value.List) (errs ValidationErrors) {
-	observedKeys := fieldpath.MakePathElementSet(list.Length())
+	associative := t.ElementRelationship == schema.Associative
+	// Path elements are only needed to detect duplicates, and to prefix errors.
+	trackKeys := associative && !v.allowDuplicates
+	var observedKeys fieldpath.PathElementSet
+	if trackKeys {
+		observedKeys = fieldpath.MakePathElementSet(list.Length())
+	}
 	for i := 0; i < list.Length(); i++ {
 		child := list.AtUsing(v.allocator, i)
-		defer v.allocator.Free(child)
 		var pe fieldpath.PathElement
-		if t.ElementRelationship != schema.Associative {
-			pe.Index = &i
-		} else {
+		if trackKeys {
+			// observedKeys can refer into child, so it has to outlive the loop.
+			defer v.allocator.Free(child)
 			var err error
 			pe, err = listItemToPathElement(v.allocator, v.schema, t, child)
 			if err != nil {
@@ -141,15 +155,35 @@ func (v *validatingObjectWalker) visitListItems(t *schema.List, list value.List)
 				// this element.
 				return
 			}
-			if observedKeys.Has(pe) && !v.allowDuplicates {
+			if observedKeys.Has(pe) {
 				errs = append(errs, errorf("duplicate entries for key %v", pe.String())...)
 			}
 			observedKeys.Insert(pe)
+		} else if associative {
+			if err := validateListItemKey(v.allocator, v.schema, t, child); err != nil {
+				v.allocator.Free(child)
+				errs = append(errs, errorf("element %v: %v", i, err.Error())...)
+				return
+			}
 		}
 		v2 := v.prepareDescent(t.ElementType)
 		v2.value = child
-		errs = append(errs, v2.validate(pe.String)...)
+		if childErrs := v2.validate(nil); len(childErrs) > 0 {
+			switch {
+			case trackKeys:
+			case associative:
+				// The key was validated above, so this cannot fail.
+				pe, _ = listItemToPathElement(v.allocator, v.schema, t, child)
+			default:
+				idx := i
+				pe.Index = &idx
+			}
+			errs = append(errs, childErrs.WithLazyPrefix(pe.String)...)
+		}
 		v.finishDescent(v2)
+		if !trackKeys {
+			v.allocator.Free(child)
+		}
 	}
 	return errs
 }
@@ -171,23 +205,39 @@ func (v *validatingObjectWalker) doList(t *schema.List) (errs ValidationErrors) 
 }
 
 func (v *validatingObjectWalker) visitMapItems(t *schema.Map, m value.Map) (errs ValidationErrors) {
-	m.IterateUsing(v.allocator, func(key string, val value.Value) bool {
-		pe := fieldpath.PathElement{FieldName: &key}
-		tr := t.ElementType
-		if sf, ok := t.FindField(key); ok {
-			tr = sf.Type
-		} else if (t.ElementType == schema.TypeRef{}) {
-			errs = append(errs, errorf("field not declared in schema").WithPrefix(pe.String())...)
-			return false
-		}
-		v2 := v.prepareDescent(tr)
-		v2.value = val
-		// Giving pe.String as a parameter actually increases the allocations.
-		errs = append(errs, v2.validate(func() string { return pe.String() })...)
-		v.finishDescent(v2)
-		return true
-	})
+	if v.boundTo != v {
+		v.mapItemFn = v.visitCurrentMapItem
+		v.boundTo = v
+	}
+	prevMap, prevErrs := v.curMap, v.curErrs
+	v.curMap, v.curErrs = t, nil
+	m.IterateUsing(v.allocator, v.mapItemFn)
+	errs = v.curErrs
+	v.curMap, v.curErrs = prevMap, prevErrs
 	return errs
+}
+
+func (v *validatingObjectWalker) visitCurrentMapItem(key string, val value.Value) bool {
+	t := v.curMap
+	tr := t.ElementType
+	if sf, ok := t.FindFieldRef(key); ok {
+		tr = sf.Type
+	} else if (t.ElementType == schema.TypeRef{}) {
+		// Taking the address of a copy keeps key itself off the heap.
+		k := key
+		pe := fieldpath.PathElement{FieldName: &k}
+		v.curErrs = append(v.curErrs, errorf("field not declared in schema").WithPrefix(pe.String())...)
+		return false
+	}
+	v2 := v.prepareDescent(tr)
+	v2.value = val
+	if childErrs := v2.validate(nil); len(childErrs) > 0 {
+		k := key
+		pe := fieldpath.PathElement{FieldName: &k}
+		v.curErrs = append(v.curErrs, childErrs.WithLazyPrefix(pe.String)...)
+	}
+	v.finishDescent(v2)
+	return true
 }
 
 func (v *validatingObjectWalker) doMap(t *schema.Map) (errs ValidationErrors) {

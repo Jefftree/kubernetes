@@ -149,16 +149,25 @@ type Map struct {
 	ElementRelationship ElementRelationship `yaml:"elementRelationship,omitempty"`
 
 	once sync.Once
-	m    atomic.Pointer[map[string]StructField]
+	m    atomic.Pointer[map[string]*StructField]
 }
 
 // FindField is a convenience function that returns the referenced StructField,
 // if it exists, or (nil, false) if it doesn't.
 func (m *Map) FindField(name string) (StructField, bool) {
+	if sf, ok := m.FindFieldRef(name); ok {
+		return *sf, true
+	}
+	return StructField{}, false
+}
+
+// FindFieldRef is like FindField, but returns a pointer into Fields, which
+// must not be modified. The pointer stays valid for the lifetime of the Map.
+func (m *Map) FindFieldRef(name string) (*StructField, bool) {
 	m.once.Do(func() {
-		mm := make(map[string]StructField, len(m.Fields))
-		for _, field := range m.Fields {
-			mm[field.Name] = field
+		mm := make(map[string]*StructField, len(m.Fields))
+		for i := range m.Fields {
+			mm[m.Fields[i].Name] = &m.Fields[i]
 		}
 		m.m.Store(&mm)
 	})

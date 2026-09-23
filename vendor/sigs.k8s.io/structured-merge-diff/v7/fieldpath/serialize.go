@@ -17,6 +17,7 @@ limitations under the License.
 package fieldpath
 
 import (
+	"bytes"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
@@ -25,6 +26,9 @@ import (
 )
 
 func (s *Set) ToJSON() ([]byte, error) {
+	if b, ok := s.toJSONFast(); ok {
+		return b, nil
+	}
 	return json.Marshal((*setContentsV1)(s), allowInvalidUTF8)
 }
 
@@ -147,7 +151,7 @@ func (s *setContentsV1) emitContentsV1(includeSelf bool, enc *jsontext.Encoder) 
 }
 
 func (s *setContentsV1) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
-	found, _, err := readIterV1(dec)
+	found, _, err := readIterV1(dec, nil)
 	if err != nil {
 		return err
 	} else if found == nil {
@@ -160,12 +164,22 @@ func (s *setContentsV1) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 
 // FromJSON clears s and reads a JSON formatted set structure.
 func (s *Set) FromJSON(r io.Reader) error {
+	if br, ok := r.(*bytes.Reader); ok {
+		data := make([]byte, br.Len())
+		if _, err := io.ReadFull(br, data); err != nil {
+			return err
+		}
+		if s.fromJSONFast(data) {
+			return nil
+		}
+		r = bytes.NewReader(data)
+	}
 	return json.UnmarshalRead(r, (*setContentsV1)(s), allowInvalidUTF8, allowDuplicates)
 }
 
 // returns true if this subtree is also (or only) a member of parent; s is nil
 // if there are no further children.
-func readIterV1(parser *jsontext.Decoder) (children *Set, isMember bool, err error) {
+func readIterV1(parser *jsontext.Decoder, sr *setReader) (children *Set, isMember bool, err error) {
 	objStart, err := parser.ReadToken()
 	if err != nil {
 		return nil, false, fmt.Errorf("parsing JSON: %v", err)
@@ -182,6 +196,7 @@ func readIterV1(parser *jsontext.Decoder) (children *Set, isMember bool, err err
 	}
 
 	for {
+		keyStart := parser.InputOffset()
 		rawKey, err := parser.ReadToken()
 		if err == io.EOF {
 			return nil, false, fmt.Errorf("unexpected EOF")
@@ -193,15 +208,18 @@ func readIterV1(parser *jsontext.Decoder) (children *Set, isMember bool, err err
 			break
 		}
 
-		k := rawKey.String()
-		if k == "." {
-			isMember = true
-			if err := parser.SkipValue(); err != nil {
-				return nil, false, fmt.Errorf("parsing JSON: %v", err)
+		pe, err := sr.escapedKeyPathElement(parser, keyStart)
+		if err != nil {
+			k := sr.keyString(parser, rawKey, keyStart)
+			if k == "." {
+				isMember = true
+				if err := parser.SkipValue(); err != nil {
+					return nil, false, fmt.Errorf("parsing JSON: %v", err)
+				}
+				continue
 			}
-			continue
+			pe, err = sr.deserializePathElement(k)
 		}
-		pe, err := DeserializePathElement(k)
 		if err == ErrUnknownPathElementType {
 			// Ignore these-- a future version maybe knows what
 			// they are. We drop these completely rather than try
@@ -214,14 +232,14 @@ func readIterV1(parser *jsontext.Decoder) (children *Set, isMember bool, err err
 			return nil, false, fmt.Errorf("parsing key as path element: %v", err)
 		}
 
-		grandchildren, childIsMember, err := readIterV1(parser)
+		grandchildren, childIsMember, err := readIterV1(parser, sr)
 		if err != nil {
 			return nil, false, fmt.Errorf("parsing value as set: %v", err)
 		}
 
 		if childIsMember {
 			if children == nil {
-				children = &Set{}
+				children = sr.beginSet()
 			}
 
 			m := &children.Members.members
@@ -237,7 +255,7 @@ func readIterV1(parser *jsontext.Decoder) (children *Set, isMember bool, err err
 
 		if grandchildren != nil {
 			if children == nil {
-				children = &Set{}
+				children = sr.beginSet()
 			}
 			// Since we expect that most of the time these will have been
 			// serialized in the right order, we just verify that and append.
@@ -253,6 +271,8 @@ func readIterV1(parser *jsontext.Decoder) (children *Set, isMember bool, err err
 
 	if children == nil {
 		isMember = true
+	} else {
+		children = sr.finishSet(children)
 	}
 
 	return children, isMember, nil

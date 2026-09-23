@@ -176,7 +176,9 @@ func (r structReflect) ZipUsing(a Allocator, other Map, order MapTraverseOrder, 
 		defer a.Free(rhsvr)
 		return r.structZip(otherStruct, lhsvr, rhsvr, fn)
 	}
-	return defaultMapZip(a, &r, other, order, fn)
+	// Taking the address of a copy keeps r itself off the heap on the fast path.
+	rr := r
+	return defaultMapZip(a, &rr, other, order, fn)
 }
 
 // structZip provides an optimized zip for structReflect types. The zip is always lexical key ordered since there is

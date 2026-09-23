@@ -86,24 +86,74 @@ func (r mapReflect) IterateUsing(a Allocator, fn func(string, Value) bool) bool 
 	}
 	v := a.allocValueReflect()
 	defer a.Free(v)
-	return eachMapEntry(r.Value, func(e *TypeReflectCacheEntry, key reflect.Value, value reflect.Value) bool {
-		return fn(key.String(), v.mustReuse(value, e, &r.Value, &key))
-	})
-}
-
-func eachMapEntry(val reflect.Value, fn func(*TypeReflectCacheEntry, reflect.Value, reflect.Value) bool) bool {
-	iter := val.MapRange()
-	entry := TypeReflectEntryOf(val.Type().Elem())
+	entry := TypeReflectEntryOf(r.Value.Type().Elem())
+	// Reading keys into one reused value, rather than with iter.Key, avoids an
+	// allocation per entry. Like v, it is only valid during the callback.
+	key := reflect.New(r.Value.Type().Key()).Elem()
+	val, reuseVal := reusableElem(r.Value.Type().Elem(), entry)
+	var parent elemParent
+	iter := r.Value.MapRange()
 	for iter.Next() {
-		next := iter.Value()
-		if !next.IsValid() {
+		key.SetIterKey(iter)
+		var elem Value
+		if reuseVal {
+			val.SetIterValue(iter)
+			elem = v.mustReuse(val, entry, nil, nil)
+		} else if next := iter.Value(); !next.IsValid() {
 			continue
+		} else {
+			m, k := parent.of(r.Value, key)
+			elem = v.mustReuse(next, entry, m, k)
 		}
-		if !fn(entry, iter.Key(), next) {
+		if !fn(key.String(), elem) {
 			return false
 		}
 	}
 	return true
+}
+
+// elemParent provides the map and key that a struct read out of a map needs,
+// to replace itself in the map when it is modified, since map elements cannot
+// be modified in place. Rather than pointers to locals, which would move them
+// to the heap in every call, it hands out pointers it allocates once, and only
+// when asked. They hold the key most recently asked for.
+//
+// Elements read into the value reusableElem returns never need them, as they
+// are never structs.
+type elemParent struct {
+	m, key *reflect.Value
+}
+
+func (p *elemParent) of(m, key reflect.Value) (*reflect.Value, *reflect.Value) {
+	if p.m == nil {
+		p.m, p.key = new(reflect.Value), new(reflect.Value)
+		*p.m = m
+	}
+	*p.key = key
+	return p.m, p.key
+}
+
+// reusableElem returns a value to read map elements of type t into, and true,
+// when t is a plain scalar type, or converts to unstructured only with value
+// methods. Reading into one reused value avoids an allocation per element. It
+// is safe for these types because nothing writes back through them, and their
+// conversion does not depend on addressability. Value methods also get a copy
+// of their receiver, so nothing they return can refer to the reused value.
+func reusableElem(t reflect.Type, entry *TypeReflectCacheEntry) (reflect.Value, bool) {
+	if entry.CanConvertToUnstructured() {
+		if entry.convertsWithValueMethodsOnly() {
+			return reflect.New(t).Elem(), true
+		}
+		return reflect.Value{}, false
+	}
+	switch t.Kind() {
+	case reflect.Bool, reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return reflect.New(t).Elem(), true
+	}
+	return reflect.Value{}, false
 }
 
 func (r mapReflect) Unstructured() interface{} {
@@ -148,7 +198,9 @@ func (r mapReflect) ZipUsing(a Allocator, other Map, order MapTraverseOrder, fn 
 	if otherMapReflect, ok := other.(*mapReflect); ok && order == Unordered {
 		return r.unorderedReflectZip(a, otherMapReflect, fn)
 	}
-	return defaultMapZip(a, &r, other, order, fn)
+	// Taking the address of a copy keeps r itself off the heap on the fast path.
+	rr := r
+	return defaultMapZip(a, &rr, other, order, fn)
 }
 
 // unorderedReflectZip provides an optimized unordered zip for mapReflect types.
@@ -166,24 +218,41 @@ func (r mapReflect) unorderedReflectZip(a Allocator, other *mapReflect, fn func(
 	vlhs, vrhs := a.allocValueReflect(), a.allocValueReflect()
 	defer a.Free(vlhs)
 	defer a.Free(vrhs)
+	var lhsParent elemParent
 
 	if other != nil {
 		rhs := other.Value
 		rhsEntry := TypeReflectEntryOf(rhs.Type().Elem())
 		iter := rhs.MapRange()
+		key := reflect.New(rhs.Type().Key()).Elem()
+		val, reuseVal := reusableElem(rhs.Type().Elem(), rhsEntry)
+		sameType := lhs.Type() == rhs.Type()
 
+		var rhsParent elemParent
 		for iter.Next() {
-			key := iter.Key()
+			key.SetIterKey(iter)
 			keyString := key.String()
-			next := iter.Value()
-			if !next.IsValid() {
+			var rhsVal Value
+			if reuseVal {
+				val.SetIterValue(iter)
+				rhsVal = vrhs.mustReuse(val, rhsEntry, nil, nil)
+			} else if next := iter.Value(); !next.IsValid() {
 				continue
+			} else {
+				m, k := rhsParent.of(rhs, key)
+				rhsVal = vrhs.mustReuse(next, rhsEntry, m, k)
 			}
-			rhsVal := vrhs.mustReuse(next, rhsEntry, &rhs, &key)
 			visited[keyString] = struct{}{}
 			var lhsVal Value
-			if _, v, ok := r.get(keyString); ok {
-				lhsVal = vlhs.mustReuse(v, lhsEntry, &lhs, &key)
+			if sameType {
+				// The key read from rhs indexes lhs directly.
+				if v := lhs.MapIndex(key); v.IsValid() {
+					m, k := lhsParent.of(lhs, key)
+					lhsVal = vlhs.mustReuse(v, lhsEntry, m, k)
+				}
+			} else if mk, v, ok := r.get(keyString); ok {
+				m, k := lhsParent.of(lhs, mk)
+				lhsVal = vlhs.mustReuse(v, lhsEntry, m, k)
 			}
 			if !fn(keyString, lhsVal, rhsVal) {
 				return false
@@ -192,8 +261,9 @@ func (r mapReflect) unorderedReflectZip(a Allocator, other *mapReflect, fn func(
 	}
 
 	iter := lhs.MapRange()
+	key := reflect.New(lhs.Type().Key()).Elem()
 	for iter.Next() {
-		key := iter.Key()
+		key.SetIterKey(iter)
 		if _, ok := visited[key.String()]; ok {
 			continue
 		}
@@ -201,7 +271,8 @@ func (r mapReflect) unorderedReflectZip(a Allocator, other *mapReflect, fn func(
 		if !next.IsValid() {
 			continue
 		}
-		if !fn(key.String(), vlhs.mustReuse(next, lhsEntry, &lhs, &key), nil) {
+		m, k := lhsParent.of(lhs, key)
+		if !fn(key.String(), vlhs.mustReuse(next, lhsEntry, m, k), nil) {
 			return false
 		}
 	}

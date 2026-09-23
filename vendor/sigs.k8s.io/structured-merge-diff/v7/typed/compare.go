@@ -101,7 +101,22 @@ type compareWalker struct {
 	spareWalkers *[]*compareWalker
 
 	allocator value.Allocator
+
+	// visitMapItems state. The callback is bound to this walker once, rather
+	// than a closure being allocated for every map.
+	mapItemFn func(key string, lhs, rhs value.Value) bool
+	boundTo   *compareWalker
+	curMap    *schema.Map
+	curErrs   ValidationErrors
+
+	// Buffers visitListItems reuses. Each walker keeps its own, since a
+	// descent runs while its parent's are in use.
+	peScratch   []fieldpath.PathElement
+	itemScratch []value.Value
 }
+
+// skipIdenticalValues is only turned off by tests, to compare against.
+var skipIdenticalValues = true
 
 // compare compares stuff.
 func (w *compareWalker) compare(prefixFn func() string) (errs ValidationErrors) {
@@ -112,6 +127,10 @@ func (w *compareWalker) compare(prefixFn func() string) (errs ValidationErrors) 
 	a, ok := w.schema.Resolve(w.typeRef)
 	if !ok {
 		return errorf("schema error: no type found matching: %v", *w.typeRef.NamedType)
+	}
+	// Identical values have nothing to compare, however large.
+	if skipIdenticalValues && value.ReflectDeepEqual(w.lhs, w.rhs) {
+		return nil
 	}
 
 	alhs := deduceAtom(a, w.lhs)
@@ -186,7 +205,9 @@ func (w *compareWalker) prepareDescent(pe fieldpath.PathElement, tr schema.TypeR
 	} else {
 		w2 = &compareWalker{}
 	}
+	fn, boundTo, peScratch, itemScratch := w2.mapItemFn, w2.boundTo, w2.peScratch, w2.itemScratch
 	*w2 = *w
+	w2.mapItemFn, w2.boundTo, w2.peScratch, w2.itemScratch = fn, boundTo, peScratch, itemScratch
 	w2.typeRef = tr
 	w2.path = append(w2.path, pe)
 	w2.lhs = nil
@@ -223,18 +244,32 @@ func (w *compareWalker) visitListItems(t *schema.List, lhs, rhs value.List) (err
 		lLen = lhs.Length()
 	}
 
-	maxLength := rLen
-	if lLen > maxLength {
-		maxLength = lLen
-	}
 	// Contains all the unique PEs between lhs and rhs, exactly once.
 	// Order doesn't matter since we're just tracking ownership in a set.
-	allPEs := make([]fieldpath.PathElement, 0, maxLength)
+	allPEs := w.peScratch[:0]
+	// Every item read, to be freed once the comparison is done. The items of a
+	// set cannot be, since their path elements, which can end up in the
+	// comparison, point at them.
+	items := w.itemScratch[:0]
+	defer func() {
+		if len(t.Keys) > 0 {
+			for _, item := range items {
+				w.allocator.Free(item)
+			}
+		}
+		clear(items)
+		w.itemScratch = items[:0]
+		clear(allPEs)
+		w.peScratch = allPEs[:0]
+	}()
 
-	// Gather all the elements from lhs, indexed by PE, in a list for duplicates.
-	lValues := fieldpath.MakePathElementMap(lLen)
+	// Gather all the elements from lhs, indexed by PE. Duplicates are rare, so
+	// only their extra occurrences go in a separate map.
+	lValues := fieldpath.MakePathElementValueMap(lLen)
+	var lDups *fieldpath.PathElementMap
 	for i := 0; i < lLen; i++ {
-		child := lhs.At(i)
+		child := lhs.AtUsing(w.allocator, i)
+		items = append(items, child)
 		pe, err := listItemToPathElement(w.allocator, w.schema, t, child)
 		if err != nil {
 			errs = append(errs, errorf("element %v: %v", i, err.Error())...)
@@ -243,20 +278,20 @@ func (w *compareWalker) visitListItems(t *schema.List, lhs, rhs value.List) (err
 			// this element.
 			continue
 		}
-
-		if v, found := lValues.Get(pe); found {
-			list := v.([]value.Value)
-			lValues.Insert(pe, append(list, child))
+		if first, found := lValues.Get(pe); found {
+			lDups = addDuplicate(lDups, pe, first, child)
 		} else {
-			lValues.Insert(pe, []value.Value{child})
+			lValues.Insert(pe, child)
 			allPEs = append(allPEs, pe)
 		}
 	}
 
-	// Gather all the elements from rhs, indexed by PE, in a list for duplicates.
-	rValues := fieldpath.MakePathElementMap(rLen)
+	// Gather all the elements from rhs, indexed by PE.
+	rValues := fieldpath.MakePathElementValueMap(rLen)
+	var rDups *fieldpath.PathElementMap
 	for i := 0; i < rLen; i++ {
-		rValue := rhs.At(i)
+		rValue := rhs.AtUsing(w.allocator, i)
+		items = append(items, rValue)
 		pe, err := listItemToPathElement(w.allocator, w.schema, t, rValue)
 		if err != nil {
 			errs = append(errs, errorf("element %v: %v", i, err.Error())...)
@@ -265,11 +300,10 @@ func (w *compareWalker) visitListItems(t *schema.List, lhs, rhs value.List) (err
 			// this element.
 			continue
 		}
-		if v, found := rValues.Get(pe); found {
-			list := v.([]value.Value)
-			rValues.Insert(pe, append(list, rValue))
+		if first, found := rValues.Get(pe); found {
+			rDups = addDuplicate(rDups, pe, first, rValue)
 		} else {
-			rValues.Insert(pe, []value.Value{rValue})
+			rValues.Insert(pe, rValue)
 			if _, found := lValues.Get(pe); !found {
 				allPEs = append(allPEs, pe)
 			}
@@ -277,34 +311,20 @@ func (w *compareWalker) visitListItems(t *schema.List, lhs, rhs value.List) (err
 	}
 
 	for _, pe := range allPEs {
-		lList := []value.Value(nil)
-		if l, ok := lValues.Get(pe); ok {
-			lList = l.([]value.Value)
-		}
-		rList := []value.Value(nil)
-		if l, ok := rValues.Get(pe); ok {
-			rList = l.([]value.Value)
-		}
+		lValue, lCount, lList := occurrences(lValues, lDups, pe)
+		rValue, rCount, rList := occurrences(rValues, rDups, pe)
 
 		switch {
-		case len(lList) == 0 && len(rList) == 0:
+		case lCount == 0 && rCount == 0:
 			// We shouldn't be here anyway.
 			return
 		// Normal use-case:
 		// We have no duplicates for this PE, compare items one-to-one.
-		case len(lList) <= 1 && len(rList) <= 1:
-			lValue := value.Value(nil)
-			if len(lList) != 0 {
-				lValue = lList[0]
-			}
-			rValue := value.Value(nil)
-			if len(rList) != 0 {
-				rValue = rList[0]
-			}
+		case lCount <= 1 && rCount <= 1:
 			errs = append(errs, w.compareListItem(t, pe, lValue, rValue)...)
 		// Duplicates before & after use-case:
 		// Compare the duplicates lists as if they were atomic, mark modified if they changed.
-		case len(lList) >= 2 && len(rList) >= 2:
+		case lCount >= 2 && rCount >= 2:
 			listEqual := func(lList, rList []value.Value) bool {
 				if len(lList) != len(rList) {
 					return false
@@ -321,22 +341,52 @@ func (w *compareWalker) visitListItems(t *schema.List, lhs, rhs value.List) (err
 			}
 		// Duplicates before & not anymore use-case:
 		// Rcursively add new non-duplicate items, Remove duplicate marker,
-		case len(lList) >= 2:
-			if len(rList) != 0 {
-				errs = append(errs, w.compareListItem(t, pe, nil, rList[0])...)
+		case lCount >= 2:
+			if rCount != 0 {
+				errs = append(errs, w.compareListItem(t, pe, nil, rValue)...)
 			}
 			w.comparison.Removed.Insert(append(w.path, pe))
 		// New duplicates use-case:
 		// Recursively remove old non-duplicate items, add duplicate marker.
-		case len(rList) >= 2:
-			if len(lList) != 0 {
-				errs = append(errs, w.compareListItem(t, pe, lList[0], nil)...)
+		case rCount >= 2:
+			if lCount != 0 {
+				errs = append(errs, w.compareListItem(t, pe, lValue, nil)...)
 			}
 			w.comparison.Added.Insert(append(w.path, pe))
 		}
 	}
 
 	return
+}
+
+// addDuplicate records another occurrence of pe, whose first occurrence is first.
+func addDuplicate(dups *fieldpath.PathElementMap, pe fieldpath.PathElement, first, v value.Value) *fieldpath.PathElementMap {
+	if dups == nil {
+		m := fieldpath.MakePathElementMap(1)
+		dups = &m
+	}
+	if list, ok := dups.Get(pe); ok {
+		dups.Insert(pe, append(list.([]value.Value), v))
+	} else {
+		dups.Insert(pe, []value.Value{first, v})
+	}
+	return dups
+}
+
+// occurrences returns the first occurrence of pe, how many there are, and all
+// of them when there is more than one.
+func occurrences(values fieldpath.PathElementValueMap, dups *fieldpath.PathElementMap, pe fieldpath.PathElement) (value.Value, int, []value.Value) {
+	first, ok := values.Get(pe)
+	if !ok {
+		return nil, 0, nil
+	}
+	if dups != nil {
+		if list, ok := dups.Get(pe); ok {
+			all := list.([]value.Value)
+			return first, len(all), all
+		}
+	}
+	return first, 1, nil
 }
 
 func (w *compareWalker) indexListPathElements(t *schema.List, list value.List) ([]fieldpath.PathElement, fieldpath.PathElementValueMap, ValidationErrors) {
@@ -371,8 +421,11 @@ func (w *compareWalker) compareListItem(t *schema.List, pe fieldpath.PathElement
 	w2 := w.prepareDescent(pe, t.ElementType, w.comparison)
 	w2.lhs = lChild
 	w2.rhs = rChild
-	errs := w2.compare(pe.String)
+	errs := w2.compare(nil)
 	w.finishDescent(w2)
+	if len(errs) > 0 {
+		errs = errs.WithPrefix(pe.String())
+	}
 	return errs
 }
 
@@ -416,29 +469,46 @@ func (w *compareWalker) doList(t *schema.List) (errs ValidationErrors) {
 	return errs
 }
 
-func (w *compareWalker) visitMapItem(t *schema.Map, out map[string]interface{}, key string, lhs, rhs value.Value) (errs ValidationErrors) {
+func (w *compareWalker) visitMapItem(t *schema.Map, key string, lhs, rhs value.Value) (errs ValidationErrors) {
 	fieldType := t.ElementType
-	if sf, ok := t.FindField(key); ok {
+	// The path element outlives this call, so it needs a stable pointer to the
+	// name. For a declared field the schema has one.
+	var name *string
+	if sf, ok := t.FindFieldRef(key); ok {
 		fieldType = sf.Type
+		name = &sf.Name
+	} else {
+		k := key
+		name = &k
 	}
-	pe := fieldpath.PathElement{FieldName: &key}
+	pe := fieldpath.PathElement{FieldName: name}
 	w2 := w.prepareDescent(pe, fieldType, w.comparison)
 	w2.lhs = lhs
 	w2.rhs = rhs
-	errs = append(errs, w2.compare(pe.String)...)
+	errs = w2.compare(nil)
 	w.finishDescent(w2)
+	if len(errs) > 0 {
+		errs = errs.WithPrefix(pe.String())
+	}
 	return errs
 }
 
 func (w *compareWalker) visitMapItems(t *schema.Map, lhs, rhs value.Map) (errs ValidationErrors) {
-	out := map[string]interface{}{}
-
-	value.MapZipUsing(w.allocator, lhs, rhs, value.Unordered, func(key string, lhsValue, rhsValue value.Value) bool {
-		errs = append(errs, w.visitMapItem(t, out, key, lhsValue, rhsValue)...)
-		return true
-	})
-
+	if w.boundTo != w {
+		w.mapItemFn = w.visitCurrentMapItem
+		w.boundTo = w
+	}
+	prevMap, prevErrs := w.curMap, w.curErrs
+	w.curMap, w.curErrs = t, nil
+	value.MapZipUsing(w.allocator, lhs, rhs, value.Unordered, w.mapItemFn)
+	errs = w.curErrs
+	w.curMap, w.curErrs = prevMap, prevErrs
 	return errs
+}
+
+func (w *compareWalker) visitCurrentMapItem(key string, lhs, rhs value.Value) bool {
+	w.curErrs = append(w.curErrs, w.visitMapItem(w.curMap, key, lhs, rhs)...)
+	return true
 }
 
 func (w *compareWalker) doMap(t *schema.Map) (errs ValidationErrors) {

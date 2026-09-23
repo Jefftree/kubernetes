@@ -68,9 +68,12 @@ func (v *reconcileWithSchemaWalker) prepareDescent(pe fieldpath.PathElement, tr 
 	} else {
 		v2 = &reconcileWithSchemaWalker{}
 	}
+	// Build the path in v2's own recycled buffer. Appending to v.path would
+	// allocate whenever it is full, which is on every descent at a new depth.
+	path := v2.path[:0]
 	*v2 = *v
 	v2.typeRef = tr
-	v2.path = append(v.path, pe)
+	v2.path = append(append(path, v.path...), pe)
 	v2.value = v.value
 	return v2
 }
