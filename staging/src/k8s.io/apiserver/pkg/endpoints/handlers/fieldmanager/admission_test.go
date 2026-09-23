@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/endpoints/handlers/fieldmanager"
+	"k8s.io/apiserver/pkg/warning"
 )
 
 func TestAdmission(t *testing.T) {
@@ -95,6 +96,62 @@ func TestAdmission(t *testing.T) {
 			}
 			if !shouldReset && reflect.DeepEqual(obj.GetManagedFields(), validEntries) {
 				t.Fatalf("expected: \n%v\ngot:\n%v", mutatedEntries, obj.GetManagedFields())
+			}
+		})
+	}
+}
+
+type recordingWarnings struct{ warnings []string }
+
+func (r *recordingWarnings) AddWarning(_, text string) { r.warnings = append(r.warnings, text) }
+
+// Validation is skipped when admission leaves managedFields alone, so a change
+// made in place, where the slice itself is untouched, must still be caught.
+func TestAdmissionValidatesInPlaceMutations(t *testing.T) {
+	raw, err := fieldpath.NewSet(fieldpath.MakePathOrDie("metadata", "labels", "test-label")).ToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := metav1.Now()
+	newEntries := func() []metav1.ManagedFieldsEntry {
+		return []metav1.ManagedFieldsEntry{{
+			APIVersion: "v1",
+			Operation:  metav1.ManagedFieldsOperationApply,
+			Time:       &now,
+			Manager:    "test",
+			FieldsType: "FieldsV1",
+			FieldsV1:   &metav1.FieldsV1{Raw: append([]byte(nil), raw...)},
+		}}
+	}
+
+	cases := map[string]struct {
+		mutate      func(entries []metav1.ManagedFieldsEntry)
+		wantWarning bool
+	}{
+		"unchanged":            {mutate: func([]metav1.ManagedFieldsEntry) {}},
+		"valid change":         {mutate: func(e []metav1.ManagedFieldsEntry) { e[0].Manager = "other" }},
+		"operation in place":   {mutate: func(e []metav1.ManagedFieldsEntry) { e[0].Operation = "invalid" }, wantWarning: true},
+		"fieldsType in place":  {mutate: func(e []metav1.ManagedFieldsEntry) { e[0].FieldsType = "invalid" }, wantWarning: true},
+		"fieldsV1 bytes":       {mutate: func(e []metav1.ManagedFieldsEntry) { copy(e[0].FieldsV1.Raw, "{invalid") }, wantWarning: true},
+		"fieldsV1 raw pointer": {mutate: func(e []metav1.ManagedFieldsEntry) { *e[0].FieldsV1 = metav1.FieldsV1{Raw: []byte("{invalid}")} }, wantWarning: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			obj := &v1.ConfigMap{}
+			obj.SetManagedFields(newEntries())
+			wrap := &mockAdmissionController{admit: func(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
+				tc.mutate(a.GetObject().(*v1.ConfigMap).ManagedFields)
+				return nil
+			}}
+			ac := fieldmanager.NewManagedFieldsValidatingAdmissionController(wrap)
+			recorder := &recordingWarnings{}
+			ctx := warning.WithWarningRecorder(context.Background(), recorder)
+			attrs := admission.NewAttributesRecord(obj, obj, schema.GroupVersionKind{}, "default", "", schema.GroupVersionResource{}, "", admission.Update, nil, false, nil)
+			if err := ac.(admission.MutationInterface).Admit(ctx, attrs, nil); err != nil {
+				t.Fatal(err)
+			}
+			if gotWarning := len(recorder.warnings) > 0; gotWarning != tc.wantWarning {
+				t.Errorf("warnings = %v, want a warning: %v", recorder.warnings, tc.wantWarning)
 			}
 		})
 	}

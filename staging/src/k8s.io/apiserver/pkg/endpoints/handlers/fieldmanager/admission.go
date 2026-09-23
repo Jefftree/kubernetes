@@ -17,10 +17,12 @@ limitations under the License.
 package fieldmanager
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/managedfields"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/warning"
@@ -67,10 +69,19 @@ func (admit *managedFieldsValidatingAdmissionController) Admit(ctx context.Conte
 		return mutationInterface.Admit(ctx, a, o)
 	}
 	managedFieldsBeforeAdmission := objectMeta.GetManagedFields()
+	snapshot := make([]metav1.ManagedFieldsEntry, len(managedFieldsBeforeAdmission))
+	for i := range managedFieldsBeforeAdmission {
+		managedFieldsBeforeAdmission[i].DeepCopyInto(&snapshot[i])
+	}
 	if err := mutationInterface.Admit(ctx, a, o); err != nil {
 		return err
 	}
 	managedFieldsAfterAdmission := objectMeta.GetManagedFields()
+	// Decoding managedFields to validate them is costly, so skip it when
+	// admission left them as they were.
+	if managedFieldsEqual(snapshot, managedFieldsAfterAdmission) {
+		return nil
+	}
 	if err := managedfields.ValidateManagedFields(managedFieldsAfterAdmission); err != nil {
 		objectMeta.SetManagedFields(managedFieldsBeforeAdmission)
 		warning.AddWarning(ctx, "",
@@ -87,4 +98,24 @@ func (admit *managedFieldsValidatingAdmissionController) Validate(ctx context.Co
 		return validationInterface.Validate(ctx, a, o)
 	}
 	return nil
+}
+
+func managedFieldsEqual(a, b []metav1.ManagedFieldsEntry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		x, y := &a[i], &b[i]
+		if x.Manager != y.Manager || x.Operation != y.Operation || x.APIVersion != y.APIVersion ||
+			x.FieldsType != y.FieldsType || x.Subresource != y.Subresource {
+			return false
+		}
+		if (x.Time == nil) != (y.Time == nil) || x.Time != nil && x.Time.Time != y.Time.Time {
+			return false
+		}
+		if (x.FieldsV1 == nil) != (y.FieldsV1 == nil) || x.FieldsV1 != nil && !bytes.Equal(x.FieldsV1.Raw, y.FieldsV1.Raw) {
+			return false
+		}
+	}
+	return true
 }
