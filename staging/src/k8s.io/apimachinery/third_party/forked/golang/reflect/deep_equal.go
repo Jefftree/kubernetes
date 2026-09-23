@@ -257,8 +257,17 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 				return true
 			}
 		}
-		for _, k := range v1.MapKeys() {
-			if !e.deepValueEqual(v1.MapIndex(k), v2.MapIndex(k), visited, equateNilAndEmpty, depth+1) {
+		// Reading the entries of v1 into reused values, rather than with
+		// MapKeys and MapIndex, saves allocating for every entry. The reused
+		// values are addressable, but v2's entries are not, so the pairs they
+		// form never enter visited, where a reused address would collide.
+		key := reflect.New(v1.Type().Key()).Elem()
+		val := reflect.New(v1.Type().Elem()).Elem()
+		iter := v1.MapRange()
+		for iter.Next() {
+			key.SetIterKey(iter)
+			val.SetIterValue(iter)
+			if !e.deepValueEqual(val, v2.MapIndex(key), visited, equateNilAndEmpty, depth+1) {
 				return false
 			}
 		}

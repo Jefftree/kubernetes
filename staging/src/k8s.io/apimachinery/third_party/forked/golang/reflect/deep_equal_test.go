@@ -223,3 +223,34 @@ func TestStringMaps(t *testing.T) {
 		t.Error("expected the registered string equality to be used")
 	}
 }
+
+func TestMapsOfStructs(t *testing.T) {
+	type val struct {
+		X int
+		P *int
+		S []int
+		A [2]int
+	}
+	one, two, otherOne := 1, 2, 1
+	cases := []struct {
+		a, b map[string]val
+		want bool
+	}{
+		{map[string]val{"a": {X: 1}, "b": {X: 2}}, map[string]val{"a": {X: 1}, "b": {X: 2}}, true},
+		{map[string]val{"a": {X: 1}, "b": {X: 2}}, map[string]val{"a": {X: 1}, "b": {X: 3}}, false},
+		{map[string]val{"a": {P: &one}, "b": {P: &two}}, map[string]val{"a": {P: &otherOne}, "b": {P: &two}}, true},
+		{map[string]val{"a": {P: &one}, "b": {P: &two}}, map[string]val{"a": {P: &one}, "b": {P: &one}}, false},
+		{map[string]val{"a": {S: []int{1}}, "b": {S: []int{2}}}, map[string]val{"a": {S: []int{1}}, "b": {S: []int{3}}}, false},
+		{map[string]val{"a": {A: [2]int{1, 2}}, "b": {A: [2]int{3, 4}}}, map[string]val{"a": {A: [2]int{1, 2}}, "b": {A: [2]int{3, 5}}}, false},
+		{map[string]val{"a": {}}, map[string]val{"b": {}}, false},
+	}
+	e := Equalities{}
+	for i, tc := range cases {
+		if got := e.DeepEqual(tc.a, tc.b); got != tc.want {
+			t.Errorf("%d: DeepEqual = %v, want %v", i, got, tc.want)
+		}
+		if got := e.DeepEqual(tc.b, tc.a); got != tc.want {
+			t.Errorf("%d: reversed DeepEqual = %v, want %v", i, got, tc.want)
+		}
+	}
+}
