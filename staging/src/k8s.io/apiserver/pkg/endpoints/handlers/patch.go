@@ -562,28 +562,40 @@ func strategicPatchObject(
 	schemaReferenceObj runtime.Object,
 	validationDirective string,
 ) error {
-	originalObjMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(originalObject)
+	patchMap, strictErrs, err := decodePatchMap(patchBytes, validationDirective)
 	if err != nil {
 		return err
 	}
 
-	patchMap := make(map[string]interface{})
-	var strictErrs []error
-	if validationDirective == metav1.FieldValidationWarn || validationDirective == metav1.FieldValidationStrict {
-		strictErrs, err = kjson.UnmarshalStrict(patchBytes, &patchMap)
-		if err != nil {
-			return errors.NewBadRequest(err.Error())
-		}
-	} else {
-		if err = kjson.UnmarshalCaseSensitivePreserveInts(patchBytes, &patchMap); err != nil {
-			return errors.NewBadRequest(err.Error())
-		}
+	if plan, ok := planPrunedPatch(originalObject, objToUpdate, patchMap); ok {
+		return plan.apply(requestContext, defaulter, patchMap, schemaReferenceObj, strictErrs, validationDirective)
 	}
 
+	originalObjMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(originalObject)
+	if err != nil {
+		return err
+	}
 	if err := applyPatchToObject(requestContext, defaulter, originalObjMap, patchMap, objToUpdate, schemaReferenceObj, strictErrs, validationDirective); err != nil {
 		return err
 	}
 	return nil
+}
+
+func decodePatchMap(patchBytes []byte, validationDirective string) (map[string]interface{}, []error, error) {
+	patchMap := make(map[string]interface{})
+	var strictErrs []error
+	var err error
+	if validationDirective == metav1.FieldValidationWarn || validationDirective == metav1.FieldValidationStrict {
+		strictErrs, err = kjson.UnmarshalStrict(patchBytes, &patchMap)
+		if err != nil {
+			return nil, nil, errors.NewBadRequest(err.Error())
+		}
+	} else {
+		if err = kjson.UnmarshalCaseSensitivePreserveInts(patchBytes, &patchMap); err != nil {
+			return nil, nil, errors.NewBadRequest(err.Error())
+		}
+	}
+	return patchMap, strictErrs, nil
 }
 
 // applyPatch is called every time GuaranteedUpdate asks for the updated object,
