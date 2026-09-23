@@ -29,25 +29,33 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-// A strategic merge patch only writes the keys it names, so every top-level field
-// the patch does not name comes out of the merge exactly as it went in. A pruned
-// patch converts only the named fields to and from unstructured and deep copies
-// the rest across, instead of round tripping the whole object. Within metadata the
-// same holds for managedFields, whose fieldsV1 are the most expensive part of the
-// round trip, as long as the metadata patch neither names it nor carries a
-// directive.
+// A strategic merge patch only writes the keys it names, so every field the patch
+// does not name comes out of the merge exactly as it went in. A pruned patch
+// converts only the named fields to and from unstructured and deep copies the
+// rest across, instead of round tripping the whole object. It descends into a
+// named struct field when the patch for it is a plain object, so a patch of
+// metadata.labels converts only the labels. Within metadata the same holds for
+// managedFields, whose fieldsV1 are the most expensive part of the round trip.
 type prunedPatch struct {
-	fields   *topLevelFields
+	root     *pruneNode
 	original reflect.Value
 	target   reflect.Value
-	// named holds the struct field indexes the patch reaches.
-	named []bool
-	// keepManagedFields is set when metadata is named but managedFields is not.
+}
+
+// pruneNode is the plan for one struct.
+type pruneNode struct {
+	fields *structFields
+	// whole marks the fields that take the round trip.
+	whole []bool
+	// nested holds the plans for the fields pruned further, by field index.
+	nested []*pruneNode
+	// keepManagedFields is set on the root when metadata takes the round trip
+	// but managedFields need not.
 	keepManagedFields bool
 }
 
-type topLevelFields struct {
-	// byName maps a top-level JSON key onto a struct field index. The keys of an
+type structFields struct {
+	// byName maps a JSON key onto a struct field index. The keys of an
 	// inlined TypeMeta map onto the TypeMeta field itself.
 	byName     map[string]int
 	numFields  int
@@ -56,59 +64,67 @@ type topLevelFields struct {
 	// mayBeOpaque marks the fields whose values have to be checked with
 	// containsOpaque before they can skip the round trip.
 	mayBeOpaque []bool
+	// omitZero marks the fields tagged omitzero. The partial struct built for a
+	// nested plan is mostly zero, so it could be dropped from the conversion.
+	omitZero []bool
 }
 
 var (
-	topLevelFieldsCache sync.Map // reflect.Type -> *topLevelFields, nil if unsupported
-	typeMetaType        = reflect.TypeFor[metav1.TypeMeta]()
-	objectMetaType      = reflect.TypeFor[metav1.ObjectMeta]()
+	structFieldsCache sync.Map // reflect.Type -> *structFields, nil if unsupported
+	typeMetaType      = reflect.TypeFor[metav1.TypeMeta]()
+	objectMetaType    = reflect.TypeFor[metav1.ObjectMeta]()
 )
 
-// fieldsOf reports the top-level layout of t, or nil when t is anything other
-// than a struct of exported, JSON named fields with an inlined TypeMeta and an
-// embedded ObjectMeta. That is the shape of every built-in API type.
-func fieldsOf(t reflect.Type) *topLevelFields {
-	if cached, ok := topLevelFieldsCache.Load(t); ok {
-		return cached.(*topLevelFields)
+// fieldsOf reports the layout of struct type t, or nil unless every field is
+// exported and has a JSON name, apart from an inlined TypeMeta.
+func fieldsOf(t reflect.Type) *structFields {
+	if cached, ok := structFieldsCache.Load(t); ok {
+		return cached.(*structFields)
 	}
-	fields := computeTopLevelFields(t)
-	topLevelFieldsCache.Store(t, fields)
+	fields := computeStructFields(t)
+	structFieldsCache.Store(t, fields)
 	return fields
 }
 
-func computeTopLevelFields(t reflect.Type) *topLevelFields {
-	fields := &topLevelFields{byName: map[string]int{}, numFields: t.NumField(), typeMeta: -1, objectMeta: -1, mayBeOpaque: make([]bool, t.NumField())}
+func computeStructFields(t reflect.Type) *structFields {
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+	fields := &structFields{
+		byName:      map[string]int{},
+		numFields:   t.NumField(),
+		typeMeta:    -1,
+		objectMeta:  -1,
+		mayBeOpaque: make([]bool, t.NumField()),
+		omitZero:    make([]bool, t.NumField()),
+	}
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 		if !f.IsExported() {
 			return nil
 		}
-		// ObjectMeta is exempt: its only opaque content is the fieldsV1 of
-		// managedFields, which the field manager decodes and re-encodes after
-		// every patch, so how their JSON was laid out never reaches the result.
-		fields.mayBeOpaque[i] = f.Type != objectMetaType && roundTripInfoOf(f.Type).mayBeOpaque
-		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		fields.mayBeOpaque[i] = roundTripInfoOf(f.Type).mayBeOpaque
+		name, opts, _ := strings.Cut(f.Tag.Get("json"), ",")
+		for _, opt := range strings.Split(opts, ",") {
+			if opt == "omitzero" {
+				fields.omitZero[i] = true
+			}
+		}
 		switch {
 		case f.Anonymous && f.Type == typeMetaType && name == "":
 			fields.typeMeta = i
 			fields.byName["apiVersion"] = i
 			fields.byName["kind"] = i
 			continue
-		case name == "" || name == "-" || f.Anonymous && f.Type != objectMetaType:
+		case name == "" || name == "-":
 			return nil
-		case f.Type == objectMetaType:
-			if name != "metadata" {
-				return nil
-			}
+		case f.Type == objectMetaType && name == "metadata":
 			fields.objectMeta = i
 		}
 		if _, dup := fields.byName[name]; dup {
 			return nil
 		}
 		fields.byName[name] = i
-	}
-	if fields.typeMeta < 0 || fields.objectMeta < 0 {
-		return nil
 	}
 	return fields
 }
@@ -255,49 +271,103 @@ func planPrunedPatch(originalObject, objToUpdate runtime.Object, patchMap map[st
 		return nil, false
 	}
 	fields := fieldsOf(t)
-	if fields == nil {
+	if fields == nil || fields.typeMeta < 0 || fields.objectMeta < 0 {
 		return nil, false
 	}
-
-	p := &prunedPatch{fields: fields, original: original.Elem(), target: target.Elem(), named: make([]bool, fields.numFields)}
-	p.named[fields.typeMeta] = true
-	for i, mayBeOpaque := range fields.mayBeOpaque {
-		if mayBeOpaque && containsOpaque(p.original.Field(i)) {
-			p.named[i] = true
+	root, ok := planNode(fields, original.Elem(), patchMap, true, -1)
+	if !ok {
+		return nil, false
+	}
+	root.whole[fields.typeMeta] = true
+	if root.whole[fields.objectMeta] {
+		// managedFields can skip the round trip as long as the metadata patch
+		// neither names them nor carries a directive.
+		if metadataPatch, ok := patchMap["metadata"].(map[string]interface{}); ok {
+			root.keepManagedFields = true
+			for k := range metadataPatch {
+				if k == "managedFields" || strings.HasPrefix(k, "$") {
+					root.keepManagedFields = false
+					break
+				}
+			}
+			for k := range patchMap {
+				if strings.HasPrefix(k, "$") && strings.HasSuffix(k, "/metadata") {
+					root.keepManagedFields = false
+				}
+			}
 		}
 	}
-	metadataDirective := false
+	return &prunedPatch{root: root, original: original.Elem(), target: target.Elem()}, true
+}
+
+// planNode plans the pruned conversion of struct value v under patchMap. It
+// reports ok=false when some key of patchMap is not a field of v, or is a bare
+// directive such as $patch or $retainKeys, which acts on the whole struct. Field
+// exempt, if not -1, skips the round trip unless named, even if it is opaque.
+func planNode(fields *structFields, v reflect.Value, patchMap map[string]interface{}, isRoot bool, exempt int) (*pruneNode, bool) {
+	n := &pruneNode{fields: fields, whole: make([]bool, fields.numFields)}
+	directed := map[int]bool{}
 	for k := range patchMap {
 		name := k
 		if strings.HasPrefix(k, "$") {
-			// A bare directive such as $patch or $retainKeys acts on the whole object.
 			_, after, found := strings.Cut(k, "/")
 			if !found {
 				return nil, false
 			}
 			name = after
-			if name == "metadata" {
-				metadataDirective = true
-			}
 		}
 		i, ok := fields.byName[name]
-		if !ok {
+		if !ok || (!isRoot && i == fields.typeMeta) {
 			return nil, false
 		}
-		p.named[i] = true
+		if name != k {
+			directed[i] = true
+		}
+		n.whole[i] = true
 	}
-	if p.named[fields.objectMeta] && !metadataDirective {
-		if metadataPatch, ok := patchMap["metadata"].(map[string]interface{}); ok {
-			p.keepManagedFields = true
-			for k := range metadataPatch {
-				if k == "managedFields" || strings.HasPrefix(k, "$") {
-					p.keepManagedFields = false
-					break
-				}
-			}
+
+	// Descend into a named struct field whose patch is a plain object.
+	for k, fieldPatch := range patchMap {
+		i, ok := fields.byName[k]
+		if !ok || i == fields.typeMeta || directed[i] || fields.omitZero[i] {
+			continue
+		}
+		fieldPatchMap, ok := fieldPatch.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		child := fieldsOf(v.Type().Field(i).Type)
+		if child == nil || child.typeMeta >= 0 {
+			continue
+		}
+		childExempt := -1
+		if isRoot && i == fields.objectMeta {
+			childExempt = child.byName["managedFields"]
+		}
+		childNode, ok := planNode(child, v.Field(i), fieldPatchMap, false, childExempt)
+		if !ok {
+			continue
+		}
+		if n.nested == nil {
+			n.nested = make([]*pruneNode, fields.numFields)
+		}
+		n.nested[i] = childNode
+		n.whole[i] = false
+	}
+
+	// An opaque field has to take the round trip even when not named. The
+	// root's metadata is exempt, and so are the managedFields within it: the
+	// field manager decodes and re-encodes managedFields after every patch, so
+	// how the JSON of their fieldsV1 was laid out never reaches the result.
+	for i, mayBeOpaque := range fields.mayBeOpaque {
+		if !mayBeOpaque || n.whole[i] || n.nested != nil && n.nested[i] != nil || i == exempt || isRoot && i == fields.objectMeta {
+			continue
+		}
+		if containsOpaque(v.Field(i)) {
+			n.whole[i] = true
 		}
 	}
-	return p, true
+	return n, true
 }
 
 func (p *prunedPatch) apply(
@@ -308,16 +378,12 @@ func (p *prunedPatch) apply(
 	strictErrs []error,
 	validationDirective string,
 ) error {
-	scratch := reflect.New(p.original.Type())
-	for i, named := range p.named {
-		if named {
-			scratch.Elem().Field(i).Set(p.original.Field(i))
-		}
+	scratch := reflect.New(p.original.Type()).Elem()
+	p.root.copyConverted(scratch, p.original)
+	if p.root.keepManagedFields {
+		objectMeta(scratch, p.root.fields).ManagedFields = nil
 	}
-	if p.keepManagedFields {
-		objectMeta(scratch.Elem(), p.fields).ManagedFields = nil
-	}
-	partialMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(scratch.Interface())
+	partialMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(scratch.Addr().Interface())
 	if err != nil {
 		return err
 	}
@@ -331,30 +397,51 @@ func (p *prunedPatch) apply(
 
 	// Deep copy the fields carried across, so the result never aliases the
 	// original, which can be shared with a cache.
-	scratch.Elem().SetZero()
-	for i, named := range p.named {
-		if !named {
-			scratch.Elem().Field(i).Set(p.original.Field(i))
-		}
+	scratch.Set(p.original)
+	p.root.zeroConverted(scratch)
+	if p.root.keepManagedFields {
+		objectMeta(scratch, p.root.fields).ManagedFields = objectMeta(p.original, p.root.fields).ManagedFields
 	}
-	if p.keepManagedFields {
-		objectMeta(scratch.Elem(), p.fields).ManagedFields = objectMeta(p.original, p.fields).ManagedFields
+	rest := reflect.ValueOf(scratch.Addr().Interface().(runtime.Object).DeepCopyObject()).Elem()
+	var managedFields []metav1.ManagedFieldsEntry
+	if p.root.keepManagedFields {
+		managedFields = objectMeta(rest, p.root.fields).ManagedFields
 	}
-	rest := reflect.ValueOf(scratch.Interface().(runtime.Object).DeepCopyObject()).Elem()
-	for i, named := range p.named {
-		if !named {
-			p.target.Field(i).Set(rest.Field(i))
-		}
+	p.root.copyConverted(rest, p.target)
+	if p.root.keepManagedFields {
+		objectMeta(rest, p.root.fields).ManagedFields = managedFields
 	}
-	if p.keepManagedFields {
-		objectMeta(p.target, p.fields).ManagedFields = objectMeta(rest, p.fields).ManagedFields
-	}
+	p.target.Set(rest)
 
 	defaulter.Default(objToUpdate)
 	return nil
 }
 
-func objectMeta(v reflect.Value, fields *topLevelFields) *metav1.ObjectMeta {
+// copyConverted copies the fields n converts from src to dst.
+func (n *pruneNode) copyConverted(dst, src reflect.Value) {
+	for i, whole := range n.whole {
+		switch {
+		case whole:
+			dst.Field(i).Set(src.Field(i))
+		case n.nested != nil && n.nested[i] != nil:
+			n.nested[i].copyConverted(dst.Field(i), src.Field(i))
+		}
+	}
+}
+
+// zeroConverted zeroes the fields n converts in v.
+func (n *pruneNode) zeroConverted(v reflect.Value) {
+	for i, whole := range n.whole {
+		switch {
+		case whole:
+			v.Field(i).SetZero()
+		case n.nested != nil && n.nested[i] != nil:
+			n.nested[i].zeroConverted(v.Field(i))
+		}
+	}
+}
+
+func objectMeta(v reflect.Value, fields *structFields) *metav1.ObjectMeta {
 	return v.Field(fields.objectMeta).Addr().Interface().(*metav1.ObjectMeta)
 }
 

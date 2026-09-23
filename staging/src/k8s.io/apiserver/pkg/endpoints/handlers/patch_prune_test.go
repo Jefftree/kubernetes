@@ -24,11 +24,13 @@ import (
 	"math/rand"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"sigs.k8s.io/randfill"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/apitesting/fuzzer"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -293,16 +295,124 @@ func TestPrunedStrategicPatchConvertsNestedFieldsV1(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a pruned plan")
 	}
-	if !plan.named[2] {
+	if !plan.root.whole[2] {
 		t.Error("spec carries a nested fieldsV1 and must take the round trip")
 	}
-	if plan.named[3] {
+	if plan.root.whole[3] {
 		t.Error("status should not take the round trip")
 	}
 	want := runPatch(t, false, pod, patch, "")
 	got := runPatch(t, true, pod, patch, "")
 	if !reflect.DeepEqual(want.obj.(*corev1.Pod).Spec, got.obj.(*corev1.Pod).Spec) {
 		t.Errorf("spec mismatch: %s", cmp.Diff(want.obj.(*corev1.Pod).Spec, got.obj.(*corev1.Pod).Spec))
+	}
+}
+
+// An opaque value that the patch does not reach still takes the round trip,
+// at any depth, so the result matches the unpruned path.
+func TestPrunedStrategicPatchConvertsUntouchedOpaqueSiblings(t *testing.T) {
+	replicas := int32(1)
+	deployment := &appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{Name: "d", Namespace: "ns"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{ManagedFields: []metav1.ManagedFieldsEntry{{
+				Manager:  "m",
+				FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:spec":{},"f:metadata":{}}`)},
+			}}}},
+		},
+	}
+	for _, patch := range []string{
+		`{"spec":{"replicas":3}}`,
+		`{"spec":{"template":{"spec":{"hostname":"h"}}}}`,
+		`{"spec":{"template":{"metadata":{"labels":{"a":"b"}}}}}`,
+	} {
+		t.Run(patch, func(t *testing.T) {
+			if !comparePatchOutcomesExact(t, deployment, []byte(patch)) {
+				t.Fatal("expected a pruned plan")
+			}
+		})
+	}
+
+	revision := &appsv1.ControllerRevision{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "ControllerRevision"},
+		ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns"},
+		Data:       runtime.RawExtension{Raw: []byte(`{"b":1,"a":2}`)},
+		Revision:   1,
+	}
+	if !comparePatchOutcomesExact(t, revision, []byte(`{"revision":2}`)) {
+		t.Fatal("expected a pruned plan")
+	}
+}
+
+// comparePatchOutcomesExact compares the results without canonicalizing any
+// fieldsV1, since those outside the root's managedFields are not re-encoded.
+func comparePatchOutcomesExact(t *testing.T, original runtime.Object, patch []byte) bool {
+	t.Helper()
+	want := runPatch(t, false, original, patch, "")
+	got := runPatch(t, true, original, patch, "")
+	if want.err != "" || got.err != "" {
+		t.Fatalf("errors: unpruned %v, pruned %v", want.err, got.err)
+	}
+	if !reflect.DeepEqual(want.obj, got.obj) {
+		t.Fatalf("result mismatch (-unpruned +pruned):\n%s", cmp.Diff(want.obj, got.obj))
+	}
+	patchMap, _, err := decodePatchMap(patch, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ok := planPrunedPatch(original, reflect.New(reflect.TypeOf(original).Elem()).Interface().(runtime.Object), patchMap)
+	return ok
+}
+
+func TestPrunedStrategicPatchPlan(t *testing.T) {
+	cases := []struct {
+		patch string
+		// want lists the converted fields, as JSON paths.
+		want []string
+	}{
+		{`{"metadata":{"labels":{"a":"c"}}}`, []string{"metadata.labels"}},
+		{`{"metadata":{"labels":{"a":"c"},"annotations":null}}`, []string{"metadata.annotations", "metadata.labels"}},
+		{`{"status":{"conditions":[{"type":"Ready","status":"False"}]}}`, []string{"status.conditions"}},
+		{`{"status":{"$setElementOrder/conditions":[{"type":"Ready"}]}}`, []string{"status.conditions"}},
+		{`{"status":{"$patch":"replace"}}`, []string{"status"}},
+		{`{"status":{"unknown":1}}`, []string{"status"}},
+		{`{"status":null}`, []string{"status"}},
+		{`{"$setElementOrder/status":[],"status":{"phase":"x"}}`, []string{"status"}},
+		{`{"metadata":{"$retainKeys":["name"]}}`, []string{"metadata"}},
+		{`{"spec":{"securityContext":{"runAsUser":1}}}`, []string{"spec.securityContext"}},
+		{`{}`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.patch, func(t *testing.T) {
+			patchMap, _, err := decodePatchMap([]byte(tc.patch), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, ok := planPrunedPatch(testPod(), &corev1.Pod{}, patchMap)
+			if !ok {
+				t.Fatal("expected a pruned plan")
+			}
+			var got []string
+			var walk func(n *pruneNode, typ reflect.Type, prefix string)
+			walk = func(n *pruneNode, typ reflect.Type, prefix string) {
+				for i := range n.whole {
+					name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
+					switch {
+					case n.whole[i] && i != n.fields.typeMeta:
+						got = append(got, prefix+name)
+					case n.nested != nil && n.nested[i] != nil:
+						walk(n.nested[i], typ.Field(i).Type, prefix+name+".")
+					}
+				}
+			}
+			walk(plan.root, reflect.TypeFor[corev1.Pod](), "")
+			sort.Strings(got)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("converted %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -326,7 +436,7 @@ func TestPrunedStrategicPatchMatchesUnprunedFuzzed(t *testing.T) {
 
 	gvks := []schema.GroupVersionKind{}
 	for gvk, typ := range scheme.AllKnownTypes() {
-		if gvk.Version == runtime.APIVersionInternal || fieldsOf(typ) == nil {
+		if fields := fieldsOf(typ); gvk.Version == runtime.APIVersionInternal || fields == nil || fields.typeMeta < 0 || fields.objectMeta < 0 {
 			continue
 		}
 		if _, ok := reflect.New(typ).Interface().(interface{ Marshal() ([]byte, error) }); !ok {
@@ -361,7 +471,7 @@ func TestPrunedStrategicPatchMatchesUnprunedFuzzed(t *testing.T) {
 		return out
 	}
 
-	prunedCount := 0
+	prunedCount, nestedCount := 0, 0
 	for _, gvk := range gvks {
 		for i := 0; i < 5; i++ {
 			original, modified := storedForm(gvk), storedForm(gvk)
@@ -393,10 +503,23 @@ func TestPrunedStrategicPatchMatchesUnprunedFuzzed(t *testing.T) {
 					target["metadata"] = md
 				}
 			}
+			if r.Intn(2) == 0 {
+				// Change a single leaf instead, so the patch leaves most of the
+				// object, including anything opaque, untouched.
+				target = deepCopyJSON(originalMap).(map[string]interface{})
+				if !changeRandomLeaf(r, target) {
+					continue
+				}
+			}
 			targetJSON, _ := json.Marshal(target)
 			patch, err := strategicpatch.CreateTwoWayMergePatch(originalJSON, targetJSON, original)
 			if err != nil {
 				continue
+			}
+			if patchMap, _, err := decodePatchMap(patch, ""); err == nil {
+				if plan, ok := planPrunedPatch(original, reflect.New(reflect.TypeOf(original).Elem()).Interface().(runtime.Object), patchMap); ok && plan.root.nested != nil {
+					nestedCount++
+				}
 			}
 			for _, directive := range []string{"", metav1.FieldValidationStrict} {
 				if comparePatchOutcomes(t, original, patch, directive) {
@@ -405,10 +528,59 @@ func TestPrunedStrategicPatchMatchesUnprunedFuzzed(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("%d kinds, %d pruned patches compared", len(gvks), prunedCount)
-	if prunedCount == 0 {
+	t.Logf("%d kinds, %d pruned patches compared, %d patches pruned below the top level", len(gvks), prunedCount, nestedCount)
+	if prunedCount == 0 || nestedCount == 0 {
 		t.Fatal("no patch took the pruned path")
 	}
+}
+
+func deepCopyJSON(v interface{}) interface{} {
+	switch v := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(v))
+		for k, e := range v {
+			out[k] = deepCopyJSON(e)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(v))
+		for i, e := range v {
+			out[i] = deepCopyJSON(e)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// changeRandomLeaf changes one scalar reachable from m through maps only.
+func changeRandomLeaf(r *rand.Rand, m map[string]interface{}) bool {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		if k != "apiVersion" && k != "kind" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	r.Shuffle(len(keys), func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
+	for _, k := range keys {
+		switch v := m[k].(type) {
+		case map[string]interface{}:
+			if changeRandomLeaf(r, v) {
+				return true
+			}
+		case string:
+			m[k] = v + "x"
+			return true
+		case float64:
+			m[k] = v + 1
+			return true
+		case bool:
+			m[k] = !v
+			return true
+		}
+	}
+	return false
 }
 
 func copyMap(m map[string]interface{}) map[string]interface{} {
