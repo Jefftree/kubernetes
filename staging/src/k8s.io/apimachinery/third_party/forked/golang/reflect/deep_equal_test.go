@@ -5,6 +5,7 @@
 package reflect
 
 import (
+	"math"
 	"testing"
 )
 
@@ -160,4 +161,41 @@ func TestDerivatives(t *testing.T) {
 			t.Errorf("Expected (%+v ~ %+v) == %v, but got %v", item.a, item.b, e, a)
 		}
 	}
+}
+
+func TestScalarKindsMatchInterfaceEquality(t *testing.T) {
+	type named string
+	type namedInt int16
+	nan := math.NaN()
+	values := []interface{}{
+		"", "a", "b", named("a"), named("b"),
+		true, false,
+		int(1), int(2), int8(-1), int8(1), int16(3), namedInt(3), namedInt(4), int32(5), int64(-6), int64(6),
+		uint(1), uint(2), uint8(1), uint16(3), uint32(5), uint64(6), uintptr(7), uintptr(8),
+		float32(1.5), float32(2.5), float64(0), math.Copysign(0, -1), nan, math.Inf(1), float32(nan),
+		complex64(1 + 2i), complex64(1 + 3i), complex128(complex(nan, 0)), complex128(1 + 2i),
+	}
+	e := Equalities{}
+	for _, a := range values {
+		for _, b := range values {
+			want := a == b
+			if got := e.DeepEqual(a, b); got != want {
+				t.Errorf("DeepEqual(%#v, %#v) = %v, want %v", a, b, got, want)
+			}
+			type wrapper struct{ V interface{} }
+			if got := e.DeepEqual(wrapper{a}, wrapper{b}); got != want {
+				t.Errorf("DeepEqual(wrapper{%#v}, wrapper{%#v}) = %v, want %v", a, b, got, want)
+			}
+		}
+	}
+}
+
+func TestUnexportedFieldPanics(t *testing.T) {
+	type hidden struct{ s string }
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected a panic for an unexported field")
+		}
+	}()
+	Equalities{}.DeepEqual(hidden{"a"}, hidden{"a"})
 }
