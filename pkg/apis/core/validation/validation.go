@@ -1444,8 +1444,7 @@ func validateLocalDescendingPath(targetPath string, fldPath *field.Path) field.E
 // on the node to ensure there are no backsteps.
 func validatePathNoBacksteps(targetPath string, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
-	parts := strings.Split(filepath.ToSlash(targetPath), "/")
-	for _, item := range parts {
+	for item := range strings.SplitSeq(filepath.ToSlash(targetPath), "/") {
 		if item == ".." {
 			allErrs = append(allErrs, field.Invalid(fldPath, targetPath, "must not contain '..'"))
 			break // even for `../../..`, one error is sufficient to make the point
@@ -7871,7 +7870,7 @@ func validateResourceName(value core.ResourceName, fldPath *field.Path) field.Er
 		return allErrs
 	}
 
-	if len(strings.Split(string(value), "/")) == 1 {
+	if !strings.Contains(string(value), "/") {
 		if !helper.IsStandardResourceName(value) {
 			return append(allErrs, field.Invalid(fldPath, value, "must be a standard resource type or fully qualified"))
 		}
@@ -7885,7 +7884,7 @@ func validateResourceName(value core.ResourceName, fldPath *field.Path) field.Er
 func ValidateContainerResourceName(value core.ResourceName, fldPath *field.Path) field.ErrorList {
 	allErrs := validateResourceName(value, fldPath)
 
-	if len(strings.Split(string(value), "/")) == 1 {
+	if !strings.Contains(string(value), "/") {
 		if !helper.IsStandardContainerResourceName(value) {
 			return append(allErrs, field.Invalid(fldPath, value, "must be a standard resource for containers"))
 		}
@@ -7918,7 +7917,7 @@ func validatePodResourceName(resourceName core.ResourceName, fldPath *field.Path
 func ValidateResourceQuotaResourceName(value core.ResourceName, fldPath *field.Path) field.ErrorList {
 	allErrs := validateResourceName(value, fldPath)
 
-	if len(strings.Split(string(value), "/")) == 1 {
+	if !strings.Contains(string(value), "/") {
 		if !helper.IsStandardQuotaResourceName(value) {
 			return append(allErrs, field.Invalid(fldPath, value, isInvalidQuotaResource))
 		}
@@ -7936,7 +7935,7 @@ func validateLimitRangeTypeName(value core.LimitType, fldPath *field.Path) field
 		return allErrs
 	}
 
-	if len(strings.Split(string(value), "/")) == 1 {
+	if !strings.Contains(string(value), "/") {
 		if !helper.IsStandardLimitRangeType(value) {
 			return append(allErrs, field.Invalid(fldPath, value, "must be a standard limit type or fully qualified"))
 		}
