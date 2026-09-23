@@ -72,6 +72,7 @@ func newFieldsCache() *fieldsCache {
 
 var (
 	mapStringInterfaceType = reflect.TypeOf(map[string]interface{}{})
+	mapStringStringType    = reflect.TypeOf(map[string]string{})
 	stringType             = reflect.TypeOf(string(""))
 	fieldCache             = newFieldsCache()
 
@@ -439,6 +440,14 @@ func mapFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) err
 		dv.Set(reflect.Zero(dt))
 		return nil
 	}
+	if st == mapStringInterfaceType && dt == mapStringStringType && sv.CanInterface() {
+		// Labels and annotations are common enough to skip reflecting over.
+		src := sv.Interface().(map[string]interface{})
+		if dst, ok := stringMapFromUnstructured(src); ok {
+			dv.Set(reflect.ValueOf(dst))
+			return nil
+		}
+	}
 	dv.Set(reflect.MakeMap(dt))
 	for _, key := range sv.MapKeys() {
 		value := reflect.New(dt.Elem()).Elem()
@@ -456,6 +465,21 @@ func mapFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) err
 		}
 	}
 	return nil
+}
+
+// stringMapFromUnstructured copies src, reporting false unless every value in it
+// is a string.
+func stringMapFromUnstructured(src map[string]interface{}) (map[string]string, bool) {
+	for _, v := range src {
+		if _, ok := v.(string); !ok {
+			return nil, false
+		}
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v.(string)
+	}
+	return dst, true
 }
 
 func sliceFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) error {
@@ -730,6 +754,15 @@ func mapToUnstructured(sv, dv reflect.Value) error {
 
 	if !st.Key().AssignableTo(dt.Key()) && !st.Key().ConvertibleTo(dt.Key()) {
 		return fmt.Errorf("cannot copy map with non-assignable keys: %v %v", st.Key(), dt.Key())
+	}
+
+	if st == mapStringStringType && dt == mapStringInterfaceType && sv.CanInterface() {
+		// Labels and annotations are common enough to skip reflecting over.
+		dst := dv.Interface().(map[string]interface{})
+		for k, v := range sv.Interface().(map[string]string) {
+			dst[k] = v
+		}
+		return nil
 	}
 
 	for _, key := range sv.MapKeys() {

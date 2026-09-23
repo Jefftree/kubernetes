@@ -1211,3 +1211,57 @@ func TestInline(t *testing.T) {
 		})
 	}
 }
+
+func TestStringMapConversion(t *testing.T) {
+	type withMaps struct {
+		Labels map[string]string `json:"labels"`
+		Named  map[string]string `json:"named,omitempty"`
+	}
+	for _, labels := range []map[string]string{nil, {}, {"a": "b", "": "", "c": "d"}} {
+		in := &withMaps{Labels: labels, Named: labels}
+		u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if labels != nil {
+			m, ok := u["labels"].(map[string]interface{})
+			if !ok || len(m) != len(labels) {
+				t.Fatalf("labels %v converted to %#v", labels, u["labels"])
+			}
+			for k, v := range labels {
+				if m[k] != v {
+					t.Errorf("labels[%q] = %#v, want %q", k, m[k], v)
+				}
+			}
+		}
+		out := &withMaps{}
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u, out); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(in.Labels, out.Labels) {
+			t.Errorf("round trip of %#v gave %#v", in.Labels, out.Labels)
+		}
+	}
+
+	// Values that are not all strings take the general path, and fail or
+	// convert just as they did before.
+	cases := []struct {
+		labels  map[string]interface{}
+		want    map[string]string
+		wantErr bool
+	}{
+		{labels: map[string]interface{}{"a": "b", "c": nil}, want: map[string]string{"a": "b", "c": ""}},
+		{labels: map[string]interface{}{"a": "b", "c": int64(1)}, wantErr: true},
+		{labels: map[string]interface{}{"a": map[string]interface{}{}}, wantErr: true},
+	}
+	for _, tc := range cases {
+		out := &withMaps{}
+		err := runtime.DefaultUnstructuredConverter.FromUnstructured(map[string]interface{}{"labels": tc.labels}, out)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%v: error %v, want error: %v", tc.labels, err, tc.wantErr)
+		}
+		if err == nil && !reflect.DeepEqual(out.Labels, tc.want) {
+			t.Errorf("%v: got %#v, want %#v", tc.labels, out.Labels, tc.want)
+		}
+	}
+}
