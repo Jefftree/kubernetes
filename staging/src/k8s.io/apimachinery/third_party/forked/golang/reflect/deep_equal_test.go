@@ -6,6 +6,7 @@ package reflect
 
 import (
 	"math"
+	"reflect"
 	"testing"
 )
 
@@ -304,5 +305,50 @@ func TestEqualityFuncMatchesPlainFunc(t *testing.T) {
 	a, b := &holder{N: num{1, 1}}, &holder{N: num{2, 2}}
 	if allocs := testing.AllocsPerRun(10, func() { typed.DeepEqual(a, b) }); allocs != 0 {
 		t.Errorf("DeepEqual with an EqualityFunc allocated %v times, want 0", allocs)
+	}
+}
+
+func TestCycles(t *testing.T) {
+	type node struct {
+		V    int
+		Next *node
+		Kids []node
+		Arr  [1]*node
+	}
+	ring := func(vs ...int) *node {
+		nodes := make([]*node, len(vs))
+		for i, v := range vs {
+			nodes[i] = &node{V: v}
+		}
+		for i := range nodes {
+			nodes[i].Next = nodes[(i+1)%len(nodes)]
+		}
+		return nodes[0]
+	}
+	selfKids := func(v int) *node {
+		n := &node{V: v, Kids: make([]node, 1)}
+		n.Kids[0].V = v
+		n.Kids[0].Kids = n.Kids
+		return n
+	}
+	viaArray := func(v int) *node {
+		n := &node{V: v}
+		n.Arr[0] = n
+		return n
+	}
+	values := []*node{
+		ring(1), ring(1), ring(2), ring(1, 2), ring(1, 2), ring(2, 1), ring(1, 2, 1, 2), ring(1, 1),
+		selfKids(1), selfKids(1), selfKids(2), viaArray(1), viaArray(1), viaArray(2),
+	}
+	for i, a := range values {
+		for j, b := range values {
+			want := reflect.DeepEqual(a, b)
+			if got := (Equalities{}).DeepEqualWithNilDifferentFromEmpty(a, b); got != want {
+				t.Errorf("%d, %d: DeepEqual = %v, want %v", i, j, got, want)
+			}
+			if got := (Equalities{}).DeepEqualWithNilDifferentFromEmpty(*a, *b); got != want {
+				t.Errorf("%d, %d: DeepEqual of values = %v, want %v", i, j, got, want)
+			}
+		}
 	}
 }

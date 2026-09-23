@@ -136,7 +136,9 @@ func makeUsefulPanic(v reflect.Value) {
 // comparisons that have already been seen, which allows short circuiting on
 // recursive types.
 // equateNilAndEmpty controls whether empty maps/slices are equivalent to nil
-func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool, equateNilAndEmpty bool, depth int) bool {
+// track is set for values reached through a pointer or a slice. Every cycle
+// passes through one of those, so only they need to enter visited.
+func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool, equateNilAndEmpty bool, depth int, track bool) bool {
 	defer makeUsefulPanic(v1)
 
 	if !v1.IsValid() || !v2.IsValid() {
@@ -157,7 +159,7 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 		return false
 	}
 
-	if v1.CanAddr() && v2.CanAddr() && hard(v1.Kind()) {
+	if track && v1.CanAddr() && v2.CanAddr() && hard(v1.Kind()) {
 		addr1 := v1.UnsafeAddr()
 		addr2 := v2.UnsafeAddr()
 		if addr1 > addr2 {
@@ -186,7 +188,7 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 		// We don't need to check length here because length is part of
 		// an array's type, which has already been filtered for.
 		for i := 0; i < v1.Len(); i++ {
-			if !e.deepValueEqual(v1.Index(i), v2.Index(i), visited, equateNilAndEmpty, depth+1) {
+			if !e.deepValueEqual(v1.Index(i), v2.Index(i), visited, equateNilAndEmpty, depth+1, false) {
 				return false
 			}
 		}
@@ -224,7 +226,7 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 			return true
 		}
 		for i := 0; i < v1.Len(); i++ {
-			if !e.deepValueEqual(v1.Index(i), v2.Index(i), visited, equateNilAndEmpty, depth+1) {
+			if !e.deepValueEqual(v1.Index(i), v2.Index(i), visited, equateNilAndEmpty, depth+1, true) {
 				return false
 			}
 		}
@@ -233,12 +235,12 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 		if v1.IsNil() || v2.IsNil() {
 			return v1.IsNil() == v2.IsNil()
 		}
-		return e.deepValueEqual(v1.Elem(), v2.Elem(), visited, equateNilAndEmpty, depth+1)
+		return e.deepValueEqual(v1.Elem(), v2.Elem(), visited, equateNilAndEmpty, depth+1, false)
 	case reflect.Pointer:
-		return e.deepValueEqual(v1.Elem(), v2.Elem(), visited, equateNilAndEmpty, depth+1)
+		return e.deepValueEqual(v1.Elem(), v2.Elem(), visited, equateNilAndEmpty, depth+1, true)
 	case reflect.Struct:
 		for i, n := 0, v1.NumField(); i < n; i++ {
-			if !e.deepValueEqual(v1.Field(i), v2.Field(i), visited, equateNilAndEmpty, depth+1) {
+			if !e.deepValueEqual(v1.Field(i), v2.Field(i), visited, equateNilAndEmpty, depth+1, false) {
 				return false
 			}
 		}
@@ -297,7 +299,7 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 		for iter.Next() {
 			key.SetIterKey(iter)
 			val.SetIterValue(iter)
-			if !e.deepValueEqual(val, v2.MapIndex(key), visited, equateNilAndEmpty, depth+1) {
+			if !e.deepValueEqual(val, v2.MapIndex(key), visited, equateNilAndEmpty, depth+1, false) {
 				return false
 			}
 		}
@@ -359,7 +361,7 @@ func (e Equalities) deepEqual(a1, a2 interface{}, equateNilAndEmpty bool) bool {
 	if v1.Type() != v2.Type() {
 		return false
 	}
-	return e.deepValueEqual(v1, v2, make(map[visit]bool), equateNilAndEmpty, 0)
+	return e.deepValueEqual(v1, v2, make(map[visit]bool), equateNilAndEmpty, 0, true)
 }
 
 func (e Equalities) deepValueDerive(v1, v2 reflect.Value, visited map[visit]bool, depth int) bool {
