@@ -22,6 +22,7 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -134,10 +135,13 @@ type fromUnstructuredContext struct {
 	// This should only be set from `structFromUnstructured`
 	isInlined bool
 	// matchedKeys is a stack of the set of all fields that exist in the
-	// concrete go type of the object being converted into.
+	// concrete go type of the object being converted into. The keys of every
+	// level are kept in one slice, with each level starting at the index
+	// recorded in matchedKeysStarts.
 	// This should only be manipulated via `pushMatchedKeyTracker`,
 	// `recordMatchedKey`, or `popAndVerifyMatchedKeys`
-	matchedKeys []map[string]struct{}
+	matchedKeys       []string
+	matchedKeysStarts []int
 	// parentPath collects the path that the conversion
 	// takes as it traverses the unstructured json map.
 	// It is used to report the full path to any unknown
@@ -161,7 +165,7 @@ func (c *fromUnstructuredContext) pushMatchedKeyTracker() {
 		return
 	}
 
-	c.matchedKeys = append(c.matchedKeys, nil)
+	c.matchedKeysStarts = append(c.matchedKeysStarts, len(c.matchedKeys))
 }
 
 // recordMatchedKey initializes the last element of matchedKeys
@@ -172,11 +176,7 @@ func (c *fromUnstructuredContext) recordMatchedKey(key string) {
 		return
 	}
 
-	last := len(c.matchedKeys) - 1
-	if c.matchedKeys[last] == nil {
-		c.matchedKeys[last] = map[string]struct{}{}
-	}
-	c.matchedKeys[last][key] = struct{}{}
+	c.matchedKeys = append(c.matchedKeys, key)
 }
 
 // popAndVerifyMatchedKeys pops the last element of matchedKeys,
@@ -191,15 +191,26 @@ func (c *fromUnstructuredContext) popAndVerifyMatchedKeys(mapValue reflect.Value
 		return
 	}
 
-	last := len(c.matchedKeys) - 1
-	curMatchedKeys := c.matchedKeys[last]
-	c.matchedKeys[last] = nil
-	c.matchedKeys = c.matchedKeys[:last]
-	for _, key := range mapValue.MapKeys() {
-		if _, ok := curMatchedKeys[key.String()]; !ok {
-			c.recordUnknownField(key.String())
+	last := len(c.matchedKeysStarts) - 1
+	start := c.matchedKeysStarts[last]
+	c.matchedKeysStarts = c.matchedKeysStarts[:last]
+	curMatchedKeys := c.matchedKeys[start:]
+	// A struct has few enough fields that a linear search beats building a set.
+	if m, ok := mapValue.Interface().(map[string]interface{}); ok {
+		for key := range m {
+			if !slices.Contains(curMatchedKeys, key) {
+				c.recordUnknownField(key)
+			}
+		}
+	} else {
+		iter := mapValue.MapRange()
+		for iter.Next() {
+			if key := iter.Key().String(); !slices.Contains(curMatchedKeys, key) {
+				c.recordUnknownField(key)
+			}
 		}
 	}
+	c.matchedKeys = c.matchedKeys[:start]
 }
 
 func (c *fromUnstructuredContext) recordUnknownField(field string) {
