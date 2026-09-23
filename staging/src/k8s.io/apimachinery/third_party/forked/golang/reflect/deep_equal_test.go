@@ -199,3 +199,27 @@ func TestUnexportedFieldPanics(t *testing.T) {
 	}()
 	Equalities{}.DeepEqual(hidden{"a"}, hidden{"a"})
 }
+
+func TestStringMaps(t *testing.T) {
+	type holder struct{ M map[string]string }
+	maps := []map[string]string{nil, {}, {"a": "b"}, {"a": "c"}, {"b": "b"}, {"a": "b", "c": "d"}, {"a": "", "c": "d"}}
+	for _, equateNilAndEmpty := range []bool{true, false} {
+		for i, a := range maps {
+			for j, b := range maps {
+				want := i == j || equateNilAndEmpty && len(a) == 0 && len(b) == 0
+				if got := (Equalities{}).deepEqual(holder{a}, holder{b}, equateNilAndEmpty); got != want {
+					t.Errorf("deepEqual(%v, %v, %v) = %v, want %v", a, b, equateNilAndEmpty, got, want)
+				}
+			}
+		}
+	}
+
+	// A registered string equality still applies to map values.
+	e := Equalities{}
+	if err := e.AddFunc(func(a, b string) bool { return len(a) == len(b) }); err != nil {
+		t.Fatal(err)
+	}
+	if !e.DeepEqual(map[string]string{"a": "x"}, map[string]string{"a": "y"}) {
+		t.Error("expected the registered string equality to be used")
+	}
+}

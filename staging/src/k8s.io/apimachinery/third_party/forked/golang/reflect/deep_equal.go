@@ -61,6 +61,11 @@ func (e Equalities) AddFunc(eqFunc interface{}) error {
 	return nil
 }
 
+var (
+	stringType          = reflect.TypeFor[string]()
+	mapStringStringType = reflect.TypeFor[map[string]string]()
+)
+
 // Below here is forked from go's reflect/deepequal.go
 
 // During deepValueEqual, must keep track of checks that are
@@ -238,6 +243,19 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 		}
 		if v1.Pointer() == v2.Pointer() {
 			return true
+		}
+		// Labels and annotations are compared often, and MapKeys and MapIndex
+		// allocate for every entry.
+		if v1.Type() == mapStringStringType && v1.CanInterface() && v2.CanInterface() {
+			if _, ok := e[stringType]; !ok {
+				m2 := v2.Interface().(map[string]string)
+				for k, val1 := range v1.Interface().(map[string]string) {
+					if val2, ok := m2[k]; !ok || val1 != val2 {
+						return false
+					}
+				}
+				return true
+			}
 		}
 		for _, k := range v1.MapKeys() {
 			if !e.deepValueEqual(v1.MapIndex(k), v2.MapIndex(k), visited, equateNilAndEmpty, depth+1) {

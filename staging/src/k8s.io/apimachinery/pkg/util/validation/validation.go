@@ -134,8 +134,7 @@ func IsDomainPrefixedKey(fldPath *field.Path, key string) field.ErrorList {
 		return allErrs
 	}
 
-	segments := strings.Split(key, "/")
-	if len(segments) != 2 {
+	if strings.Count(key, "/") != 1 {
 		return append(allErrs, field.Invalid(fldPath, key, "must be a domain-prefixed key (such as \"acme.io/foo\")"))
 	}
 

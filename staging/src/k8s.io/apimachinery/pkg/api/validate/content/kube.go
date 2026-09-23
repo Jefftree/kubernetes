@@ -42,14 +42,11 @@ var IsQualifiedName = IsLabelKey
 // empty list (or nil) is returned.
 func IsLabelKey(value string) []string {
 	var errs []string
-	parts := strings.Split(value, "/")
-	var name string
-	switch len(parts) {
-	case 1:
-		name = parts[0]
-	case 2:
-		var prefix string
-		prefix, name = parts[0], parts[1]
+	prefix, name, hasPrefix := strings.Cut(value, "/")
+	switch {
+	case !hasPrefix:
+		name = prefix
+	case !strings.Contains(name, "/"):
 		if len(prefix) == 0 {
 			errs = append(errs, "prefix part "+EmptyError())
 		} else if msgs := IsDNS1123Subdomain(prefix); len(msgs) != 0 {
@@ -109,8 +106,7 @@ func IsPrefixedLabelKey(value string) []string {
 		return errs
 	}
 
-	segments := strings.Split(value, "/")
-	if len(segments) != 2 {
+	if strings.Count(value, "/") != 1 {
 		return []string{"must include a prefix (e.g. 'example.com/key')"}
 	}
 	return nil
