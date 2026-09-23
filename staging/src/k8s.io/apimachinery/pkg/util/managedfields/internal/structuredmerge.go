@@ -18,6 +18,7 @@ package internal
 
 import (
 	"fmt"
+	"reflect"
 
 	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
 	"sigs.k8s.io/structured-merge-diff/v7/merge"
@@ -25,8 +26,10 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/ptr"
 )
 
 type structuredMergeManager struct {
@@ -96,6 +99,12 @@ func (f *structuredMergeManager) Update(liveObj, newObj runtime.Object, managed 
 	liveObjVersioned, err := f.toVersioned(liveObj)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to convert live object (%v) to proper version: %v", objectGVKNN(liveObj), err)
+	}
+	// newObj has no managedFields by now, so the comparison would only report
+	// metadata.managedFields as removed. That changes no manager's set unless one
+	// owns that path, so skip converting the live managedFields, which is costly.
+	if !ownsManagedFields(managed.Fields()) {
+		liveObjVersioned = withoutManagedFields(liveObjVersioned)
 	}
 	newObjTyped, err := f.typeConverter.ObjectToTyped(newObjVersioned, typed.AllowDuplicates)
 	if err != nil {
@@ -179,6 +188,50 @@ func (f *structuredMergeManager) Apply(liveObj, patchObj runtime.Object, managed
 		return nil, nil, fmt.Errorf("failed to convert to unversioned (%v): %v", objectGVKNN(patchObj), err)
 	}
 	return newObjUnversioned, managed, nil
+}
+
+var (
+	metadataPathElement      = fieldpath.PathElement{FieldName: ptr.To("metadata")}
+	managedFieldsPathElement = fieldpath.PathElement{FieldName: ptr.To("managedFields")}
+	objectMetaType           = reflect.TypeFor[metav1.ObjectMeta]()
+)
+
+func ownsManagedFields(managers fieldpath.ManagedFields) bool {
+	for _, vs := range managers {
+		metadata, ok := vs.Set().Children.Get(metadataPathElement)
+		if !ok {
+			continue
+		}
+		if metadata.Members.Has(managedFieldsPathElement) {
+			return true
+		}
+		if _, ok := metadata.Children.Get(managedFieldsPathElement); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutManagedFields returns obj with managedFields cleared. obj itself is never
+// modified, since it may be shared, for example with the watch cache. Only a pointer
+// to a struct embedding metav1.ObjectMeta by value is handled, because a shallow
+// copy of anything else could still share the managedFields storage.
+func withoutManagedFields(obj runtime.Object) runtime.Object {
+	v := reflect.ValueOf(obj)
+	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+		return obj
+	}
+	field, ok := v.Elem().Type().FieldByName("ObjectMeta")
+	if !ok || !field.Anonymous || field.Type != objectMetaType || len(field.Index) != 1 {
+		return obj
+	}
+	if v.Elem().Field(field.Index[0]).Addr().Interface().(*metav1.ObjectMeta).ManagedFields == nil {
+		return obj
+	}
+	cp := reflect.New(v.Elem().Type())
+	cp.Elem().Set(v.Elem())
+	cp.Elem().Field(field.Index[0]).Addr().Interface().(*metav1.ObjectMeta).ManagedFields = nil
+	return cp.Interface().(runtime.Object)
 }
 
 func (f *structuredMergeManager) toVersioned(obj runtime.Object) (runtime.Object, error) {
