@@ -53,21 +53,21 @@ func getAvoidTimestampEqualities() conversion.Equalities {
 
 		var eqs = equality.Semantic.Copy()
 		err := eqs.AddFuncs(
-			func(a, b metav1.ManagedFieldsEntry) bool {
+			conversion.EqualityFunc[metav1.ManagedFieldsEntry](func(a, b metav1.ManagedFieldsEntry) bool {
 				// Two objects' managed fields are equivalent if, ignoring timestamp,
 				//	the objects are deeply equal.
 				a.Time = nil
 				b.Time = nil
 				return reflect.DeepEqual(a, b)
-			},
-			func(a, b unstructured.Unstructured) bool {
+			}),
+			conversion.EqualityFunc[unstructured.Unstructured](func(a, b unstructured.Unstructured) bool {
 				// Check if the managed fields are equal by converting to structured types and leveraging the above
 				// function, then, ignoring the managed fields, equality check the rest of the unstructured data.
 				if !avoidTimestampEqualities.DeepEqual(a.GetManagedFields(), b.GetManagedFields()) {
 					return false
 				}
 				return equalIgnoringValueAtPath(a.Object, b.Object, []string{"metadata", "managedFields"})
-			},
+			}),
 		)
 
 		if err != nil {

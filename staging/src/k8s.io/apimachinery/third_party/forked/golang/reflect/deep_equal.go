@@ -61,6 +61,36 @@ func (e Equalities) AddFunc(eqFunc interface{}) error {
 	return nil
 }
 
+// EqualityFunc is an equality function that can be added to Equalities like
+// any other, and is then called without the allocations of reflect.Value.Call.
+type EqualityFunc[T any] func(a, b T) bool
+
+type typedEqualityFunc interface {
+	callEqual(a, b reflect.Value) bool
+}
+
+func (f EqualityFunc[T]) callEqual(a, b reflect.Value) bool {
+	return f(valueOf[T](a), valueOf[T](b))
+}
+
+// valueOf returns v as a T, avoiding the allocation of Interface when v is
+// addressable.
+func valueOf[T any](v reflect.Value) T {
+	if v.CanAddr() {
+		return *v.Addr().Interface().(*T)
+	}
+	// The comma-ok form maps a nil interface value to the zero T.
+	t, _ := v.Interface().(T)
+	return t
+}
+
+func callEqualityFunc(fv, a, b reflect.Value) bool {
+	if f, ok := fv.Interface().(typedEqualityFunc); ok {
+		return f.callEqual(a, b)
+	}
+	return fv.Call([]reflect.Value{a, b})[0].Bool()
+}
+
 var (
 	stringType          = reflect.TypeFor[string]()
 	mapStringStringType = reflect.TypeFor[map[string]string]()
@@ -116,7 +146,7 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 		return false
 	}
 	if fv, ok := e[v1.Type()]; ok {
-		return fv.Call([]reflect.Value{v1, v2})[0].Bool()
+		return callEqualityFunc(fv, v1, v2)
 	}
 
 	hard := func(k reflect.Kind) bool {
@@ -342,7 +372,7 @@ func (e Equalities) deepValueDerive(v1, v2 reflect.Value, visited map[visit]bool
 		return false
 	}
 	if fv, ok := e[v1.Type()]; ok {
-		return fv.Call([]reflect.Value{v1, v2})[0].Bool()
+		return callEqualityFunc(fv, v1, v2)
 	}
 
 	hard := func(k reflect.Kind) bool {

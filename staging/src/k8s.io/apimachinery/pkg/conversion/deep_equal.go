@@ -26,6 +26,9 @@ type Equalities struct {
 	reflect.Equalities
 }
 
+// EqualityFunc is an equality function that Equalities call without reflection.
+type EqualityFunc[T any] = reflect.EqualityFunc[T]
+
 // For convenience, panics on errors
 func EqualitiesOrDie(funcs ...interface{}) Equalities {
 	e := Equalities{reflect.Equalities{}}

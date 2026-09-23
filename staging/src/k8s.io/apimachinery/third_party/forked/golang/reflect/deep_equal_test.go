@@ -254,3 +254,55 @@ func TestMapsOfStructs(t *testing.T) {
 		}
 	}
 }
+
+type sel interface{ Key() string }
+
+type keySel string
+
+func (k keySel) Key() string { return string(k) }
+
+func TestEqualityFuncMatchesPlainFunc(t *testing.T) {
+	type num struct{ V, Scale int }
+	type holder struct {
+		N   num
+		NP  *num
+		NS  []num
+		NM  map[string]num
+		Sel sel
+	}
+	sameValue := func(a, b num) bool { return a.V*b.Scale == b.V*a.Scale || a.Scale == 0 && b.Scale == 0 }
+	sameSel := func(a, b sel) bool { return (a == nil) == (b == nil) }
+	plain := EqualitiesOrDie(sameValue, sameSel)
+	typed := EqualitiesOrDie(EqualityFunc[num](sameValue), EqualityFunc[sel](sameSel))
+
+	values := []holder{
+		{},
+		{N: num{1, 1}, NP: &num{2, 1}, NS: []num{{3, 1}}, NM: map[string]num{"a": {4, 1}}},
+		{N: num{2, 2}, NP: &num{4, 2}, NS: []num{{6, 2}}, NM: map[string]num{"a": {8, 2}}},
+		{N: num{1, 2}, NP: &num{2, 1}, NS: []num{{3, 1}}, NM: map[string]num{"a": {4, 1}}},
+		{NM: map[string]num{"a": {4, 1}}, Sel: keySel("k")},
+		{NM: map[string]num{"a": {5, 1}}},
+	}
+	for i, a := range values {
+		for j, b := range values {
+			for _, args := range [][2]interface{}{{a, b}, {&a, &b}, {a.N, b.N}, {a.NM, b.NM}, {a.Sel, b.Sel}} {
+				want := plain.DeepEqual(args[0], args[1])
+				if got := typed.DeepEqual(args[0], args[1]); got != want {
+					t.Errorf("%d, %d: DeepEqual(%T) = %v, want %v", i, j, args[0], got, want)
+				}
+				if args[0] == nil || args[1] == nil {
+					continue // DeepDerivative does not take nil interfaces
+				}
+				want = plain.DeepDerivative(args[0], args[1])
+				if got := typed.DeepDerivative(args[0], args[1]); got != want {
+					t.Errorf("%d, %d: DeepDerivative(%T) = %v, want %v", i, j, args[0], got, want)
+				}
+			}
+		}
+	}
+
+	a, b := &holder{N: num{1, 1}}, &holder{N: num{2, 2}}
+	if allocs := testing.AllocsPerRun(10, func() { typed.DeepEqual(a, b) }); allocs != 0 {
+		t.Errorf("DeepEqual with an EqualityFunc allocated %v times, want 0", allocs)
+	}
+}
