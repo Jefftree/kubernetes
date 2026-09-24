@@ -17,7 +17,10 @@ limitations under the License.
 package sharding
 
 import (
+	"errors"
 	"fmt"
+	"math/big"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -57,37 +60,74 @@ func (s *everythingSelector) String() string                         { return ""
 func (s *everythingSelector) Requirements() []ShardRangeRequirement  { return nil }
 func (s *everythingSelector) DeepCopySelector() Selector             { return &everythingSelector{} }
 
+// parsedRequirement is a ShardRangeRequirement with its bounds resolved to
+// integers, so that matching an object is a pair of integer comparisons
+// rather than hex string formatting and comparison.
+type parsedRequirement struct {
+	req        ShardRangeRequirement
+	start      uint64
+	end        uint64
+	startIsMax bool
+	endIsMax   bool
+}
+
 // shardSelector implements Selector with one or more shard range requirements.
 type shardSelector struct {
-	requirements []ShardRangeRequirement
+	requirements []parsedRequirement
+	// key is shared by every requirement, so Matches resolves the object
+	// field and hashes it once.
+	key string
+	// err records a malformed selector. NewSelector has no error return and
+	// callers can build requirements without going through Parse, so the
+	// problem is reported from Matches.
+	err error
 }
 
 func (s *shardSelector) Matches(obj runtime.Object) (bool, error) {
+	if s.err != nil {
+		return false, s.err
+	}
 	if len(s.requirements) == 0 {
 		return true, nil
 	}
-	// All requirements must share the same key so we resolve the field value
-	// and compute the hash once. The parser enforces this, but we verify here
-	// to guard against selectors constructed through other means.
-	key := s.requirements[0].Key
-	for _, req := range s.requirements[1:] {
-		if req.Key != key {
-			return false, fmt.Errorf("inconsistent shard keys: %q vs %q", key, req.Key)
-		}
-	}
 
-	value, err := ResolveFieldValue(obj, key)
+	value, err := ResolveFieldValue(obj, s.key)
 	if err != nil {
 		return false, err
 	}
-	hash := "0x" + HashField(value)
+	hash := HashFieldValue(value)
 
-	for _, req := range s.requirements {
-		if !HexLess(hash, req.Start) && HexLess(hash, req.End) {
+	for i := range s.requirements {
+		r := &s.requirements[i]
+		// A range starting at 2^64 is empty: no hash can reach it.
+		if r.startIsMax || hash < r.start {
+			continue
+		}
+		if r.endIsMax || hash < r.end {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// parseBound converts a 0x-prefixed hex bound to an integer. The second
+// result reports a bound that sits above the entire hash space and therefore
+// has no uint64 value. 2^64 is the canonical such bound and the only one the
+// wire parser accepts, but NewSelector is public and any over-long hex was
+// treated the same way by the string comparison this replaces.
+func parseBound(bound string) (uint64, bool, error) {
+	digits, ok := strings.CutPrefix(bound, "0x")
+	if !ok {
+		return 0, false, fmt.Errorf("shard range bound %q must be 0x-prefixed", bound)
+	}
+	value, err := strconv.ParseUint(digits, 16, 64)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, true, nil
+		}
+		return 0, false, fmt.Errorf("shard range bound %q is not a valid hex value", bound)
+	}
+	return value, false, nil
 }
 
 // HexLess compares two 0x-prefixed lowercase hex strings numerically.
@@ -106,7 +146,8 @@ func (s *shardSelector) Empty() bool {
 
 func (s *shardSelector) String() string {
 	parts := make([]string, 0, len(s.requirements))
-	for _, req := range s.requirements {
+	for i := range s.requirements {
+		req := s.requirements[i].req
 		parts = append(parts, fmt.Sprintf("shardRange(%s, '%s', '%s')", req.Key, req.Start, req.End))
 	}
 	return strings.Join(parts, " || ")
@@ -114,24 +155,69 @@ func (s *shardSelector) String() string {
 
 func (s *shardSelector) Requirements() []ShardRangeRequirement {
 	result := make([]ShardRangeRequirement, len(s.requirements))
-	copy(result, s.requirements)
+	for i := range s.requirements {
+		result[i] = s.requirements[i].req
+	}
 	return result
 }
 
 func (s *shardSelector) DeepCopySelector() Selector {
-	reqs := make([]ShardRangeRequirement, len(s.requirements))
+	reqs := make([]parsedRequirement, len(s.requirements))
 	copy(reqs, s.requirements)
-	return &shardSelector{requirements: reqs}
+	return &shardSelector{requirements: reqs, key: s.key, err: s.err}
 }
 
 // NewSelector creates a Selector from the given requirements.
-// All requirements must use the same Key; this is validated at match time.
+// All requirements must use the same Key, and their bounds must be
+// 0x-prefixed hex; violations are reported from Matches.
 // If no requirements are provided, returns Everything().
 func NewSelector(reqs ...ShardRangeRequirement) Selector {
 	if len(reqs) == 0 {
 		return Everything()
 	}
-	return &shardSelector{
-		requirements: reqs,
+	s := &shardSelector{
+		requirements: make([]parsedRequirement, 0, len(reqs)),
+		key:          reqs[0].Key,
 	}
+	for _, req := range reqs {
+		parsed := parsedRequirement{req: req}
+		if req.Key != s.key && s.err == nil {
+			s.err = fmt.Errorf("inconsistent shard keys: %q vs %q", s.key, req.Key)
+		}
+		start, startIsMax, err := parseBound(req.Start)
+		if err != nil && s.err == nil {
+			s.err = err
+		}
+		end, endIsMax, err := parseBound(req.End)
+		if err != nil && s.err == nil {
+			s.err = err
+		}
+		parsed.start, parsed.startIsMax = start, startIsMax
+		parsed.end, parsed.endIsMax = end, endIsMax
+		// Kept even when malformed so String() and Requirements() can still
+		// round-trip what the client asked for.
+		s.requirements = append(s.requirements, parsed)
+	}
+	return s
+}
+
+// NewShardRangeSelector returns a Selector for shardIndex in [0, totalShards)
+// evenly partitioning the 64-bit FNV-1a hash space [0x0000000000000000, 0x10000000000000000).
+func NewShardRangeSelector(key string, shardIndex, totalShards int) (Selector, error) {
+	if key == "" || totalShards <= 0 || shardIndex < 0 || shardIndex >= totalShards {
+		return nil, fmt.Errorf("invalid shard range parameters: key=%q shardIndex=%d totalShards=%d", key, shardIndex, totalShards)
+	}
+	maxHash := new(big.Int).Lsh(big.NewInt(1), 64)
+	total := big.NewInt(int64(totalShards))
+	start := new(big.Int).Div(new(big.Int).Mul(big.NewInt(int64(shardIndex)), maxHash), total)
+	endHex := "0x10000000000000000"
+	if shardIndex < totalShards-1 {
+		end := new(big.Int).Div(new(big.Int).Mul(big.NewInt(int64(shardIndex+1)), maxHash), total)
+		endHex = fmt.Sprintf("0x%016x", end.Uint64())
+	}
+	return NewSelector(ShardRangeRequirement{
+		Key:   key,
+		Start: fmt.Sprintf("0x%016x", start.Uint64()),
+		End:   endHex,
+	}), nil
 }

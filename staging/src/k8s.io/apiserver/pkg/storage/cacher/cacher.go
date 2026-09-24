@@ -832,14 +832,11 @@ func (c *Cacher) GetList(ctx context.Context, key string, opts storage.ListOptio
 				hasMoreListItems = true
 				break
 			}
-			shardMatch := true
-			if utilfeature.DefaultFeatureGate.Enabled(features.ShardedListAndWatch) {
-				shardMatch, err = opts.Predicate.MatchesSharding(elem.Object)
-				if err != nil {
-					return fmt.Errorf("shard matching failed: %w", err)
-				}
+			matched, err := opts.Predicate.MatchesWithPrecomputedAttrs(elem.Object, elem.Labels, elem.Fields)
+			if err != nil {
+				return fmt.Errorf("predicate matching failed: %w", err)
 			}
-			if shardMatch && opts.Predicate.MatchesObjectAttributes(elem.Labels, elem.Fields) {
+			if matched {
 				selectedObjects = append(selectedObjects, elem.Object)
 				lastSelectedObjectKey = elem.Key
 			}
@@ -1256,18 +1253,18 @@ func filterWithAttrsAndPrefixFunction(prefix string, p storage.SelectionPredicat
 		if !key.HasPathPrefix(objKey, prefix) {
 			return false
 		}
-		if isSharded {
-			matches, err := p.MatchesSharding(obj)
-			if err != nil {
-				utilruntime.HandleError(fmt.Errorf("shard matching failed for %v: %w", groupResource, err))
-				return false
-			}
-			if !matches {
-				metrics.RecordWatchFilteredEvent(groupResource)
-				return false
-			}
+		matches, err := p.MatchesWithPrecomputedAttrs(obj, label, field)
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("predicate matching failed for %v: %w", groupResource, err))
+			return false
 		}
-		return p.MatchesObjectAttributes(label, field)
+		if !matches {
+			if isSharded && p.MatchesObjectAttributes(label, field) {
+				metrics.RecordWatchFilteredEvent(groupResource)
+			}
+			return false
+		}
+		return true
 	}
 	return filterFunc
 }

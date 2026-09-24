@@ -21,6 +21,22 @@ import (
 	"hash/fnv"
 )
 
+const (
+	// FNV-1a 64-bit parameters, from hash/fnv.
+	fnvOffset64 = 14695981039346656037
+	fnvPrime64  = 1099511628211
+)
+
+// HashFieldValue computes the FNV-1a 64-bit hash of value without allocating.
+func HashFieldValue(value string) uint64 {
+	h := uint64(fnvOffset64)
+	for i := 0; i < len(value); i++ {
+		h ^= uint64(value[i])
+		h *= fnvPrime64
+	}
+	return h
+}
+
 // HashField computes a hash of value and returns it
 // as a 16-character lowercase hex string (no "0x" prefix).
 func HashField(value string) string {

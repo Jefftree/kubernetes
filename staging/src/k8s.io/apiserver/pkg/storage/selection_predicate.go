@@ -91,9 +91,18 @@ type SelectionPredicate struct {
 }
 
 // Matches returns true if the given object's labels and fields (as
-// returned by s.GetAttrs) match s.Label and s.Field. An error is
-// returned if s.GetAttrs fails.
+// returned by s.GetAttrs) match s.Label and s.Field, and the object matches
+// s.ShardSelector when sharding is enabled. An error is returned if
+// s.GetAttrs or shard matching fails.
 func (s *SelectionPredicate) Matches(obj runtime.Object) (bool, error) {
+	return s.MatchesWithPrecomputedAttrs(obj, nil, nil)
+}
+
+// MatchesWithPrecomputedAttrs evaluates the full SelectionPredicate (sharding,
+// label, and field selectors) using precomputed label and field sets when
+// available, falling back to s.GetAttrs(obj) only if both sets are nil and
+// label/field filtering is non-empty.
+func (s *SelectionPredicate) MatchesWithPrecomputedAttrs(obj runtime.Object, l labels.Set, f fields.Set) (bool, error) {
 	if utilfeature.DefaultFeatureGate.Enabled(features.ShardedListAndWatch) {
 		if matched, err := s.MatchesSharding(obj); err != nil || !matched {
 			return matched, err
@@ -102,15 +111,14 @@ func (s *SelectionPredicate) Matches(obj runtime.Object) (bool, error) {
 	if s.labelFieldEmpty() {
 		return true, nil
 	}
-	labels, fields, err := s.GetAttrs(obj)
-	if err != nil {
-		return false, err
+	if l == nil && f == nil && s.GetAttrs != nil {
+		var err error
+		l, f, err = s.GetAttrs(obj)
+		if err != nil {
+			return false, err
+		}
 	}
-	matched := s.Label.Matches(labels)
-	if matched && s.Field != nil {
-		matched = matched && s.Field.Matches(fields)
-	}
-	return matched, nil
+	return s.MatchesObjectAttributes(l, f), nil
 }
 
 // MatchesObjectAttributes returns true if the given labels and fields
