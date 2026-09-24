@@ -74,6 +74,31 @@ const (
 	LexicalKeyOrder
 )
 
+// MapZipVisitor is a closure-free visitor for MapZipVisitorUsing.
+type MapZipVisitor interface {
+	VisitMapEntry(key string, lhs, rhs Value) bool
+}
+
+type mapZipVisitorOptional interface {
+	ZipVisitorUsing(a Allocator, other Map, order MapTraverseOrder, v MapZipVisitor) bool
+}
+
+// MapZipVisitorUsing iterates over the entries of two maps together using a MapZipVisitor without allocating a closure.
+func MapZipVisitorUsing(a Allocator, lhs, rhs Map, order MapTraverseOrder, v MapZipVisitor) bool {
+	if lhs != nil {
+		if zv, ok := lhs.(mapZipVisitorOptional); ok {
+			return zv.ZipVisitorUsing(a, rhs, order, v)
+		}
+		return lhs.ZipUsing(a, rhs, order, v.VisitMapEntry)
+	}
+	if rhs != nil {
+		return rhs.ZipUsing(a, lhs, order, func(key string, rhsVal, lhsVal Value) bool {
+			return v.VisitMapEntry(key, lhsVal, rhsVal)
+		})
+	}
+	return true
+}
+
 // MapZip iterates over the entries of two maps together. If both maps contain a value for a given key, fn is called
 // with the values from both maps, otherwise it is called with the value of the map that contains the key and nil
 // for the other map. Returning false in the closure prematurely stops the iteration.

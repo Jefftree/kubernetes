@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	grpccodes "google.golang.org/grpc/codes"
@@ -295,6 +296,24 @@ func checkName(obj runtime.Object, name, namespace string, namer ScopeNamer) err
 // sharing the same UID but different fields. Nor do we know what might break.
 // In the future we may just dedup/reject owner references with the same UID.
 func dedupOwnerReferences(refs []metav1.OwnerReference) ([]metav1.OwnerReference, []string) {
+	if len(refs) <= 1 {
+		return refs, nil
+	}
+	if len(refs) <= 8 {
+		hasDupUID := false
+	outer:
+		for i := range refs {
+			for j := i + 1; j < len(refs); j++ {
+				if refs[i].UID == refs[j].UID {
+					hasDupUID = true
+					break outer
+				}
+			}
+		}
+		if !hasDupUID {
+			return refs, nil
+		}
+	}
 	var result []metav1.OwnerReference
 	var duplicates []string
 	seen := make(map[types.UID]struct{})
@@ -369,14 +388,44 @@ func summarizeData(data []byte, maxLength int) string {
 	}
 }
 
+var limitedReaderPool = sync.Pool{
+	New: func() any {
+		return &io.LimitedReader{}
+	},
+}
+
 func limitedReadBody(req *http.Request, limit int64) ([]byte, error) {
 	defer req.Body.Close()
 	if limit <= 0 {
 		return io.ReadAll(req.Body)
 	}
-	lr := &io.LimitedReader{
-		R: req.Body,
-		N: limit + 1,
+	lr := limitedReaderPool.Get().(*io.LimitedReader)
+	lr.R = req.Body
+	lr.N = limit + 1
+	defer func() {
+		lr.R = nil
+		limitedReaderPool.Put(lr)
+	}()
+	if cl := req.ContentLength; cl >= 0 && cl <= limit && cl < 64*1024 {
+		buf := make([]byte, 0, int(cl)+1)
+		for {
+			if len(buf) == cap(buf) {
+				d := append(buf[:cap(buf)], 0)
+				buf = d[:len(buf)]
+			}
+			n, err := lr.Read(buf[len(buf):cap(buf)])
+			buf = buf[:len(buf)+n]
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				return nil, err
+			}
+		}
+		if lr.N <= 0 {
+			return nil, errors.NewRequestEntityTooLargeError(fmt.Sprintf("limit is %d", limit))
+		}
+		return buf, nil
 	}
 	data, err := io.ReadAll(lr)
 	if err != nil {

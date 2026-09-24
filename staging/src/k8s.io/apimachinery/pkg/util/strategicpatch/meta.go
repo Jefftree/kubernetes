@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/util/mergepatch"
 	forkedjson "k8s.io/apimachinery/third_party/forked/golang/json"
@@ -75,20 +76,56 @@ func NewPatchMetaFromStruct(dataStruct interface{}) (PatchMetaFromStruct, error)
 
 var _ LookupPatchMeta = PatchMetaFromStruct{}
 
+type patchMetaCacheKey struct {
+	t       reflect.Type
+	key     string
+	isSlice bool
+}
+
+type patchMetaCacheVal struct {
+	schema    LookupPatchMeta
+	patchMeta PatchMeta
+}
+
+var (
+	patchMetaLookupMu    sync.RWMutex
+	patchMetaLookupCache = make(map[patchMetaCacheKey]patchMetaCacheVal, 64)
+)
+
 func (s PatchMetaFromStruct) LookupPatchMetadataForStruct(key string) (LookupPatchMeta, PatchMeta, error) {
+	ck := patchMetaCacheKey{t: s.T, key: key, isSlice: false}
+	patchMetaLookupMu.RLock()
+	res, ok := patchMetaLookupCache[ck]
+	patchMetaLookupMu.RUnlock()
+	if ok {
+		return res.schema, res.patchMeta, nil
+	}
 	fieldType, fieldPatchStrategies, fieldPatchMergeKey, err := forkedjson.LookupPatchMetadataForStruct(s.T, key)
 	if err != nil {
 		return nil, PatchMeta{}, err
 	}
 
-	return PatchMetaFromStruct{T: fieldType},
-		PatchMeta{
+	res = patchMetaCacheVal{
+		schema: PatchMetaFromStruct{T: fieldType},
+		patchMeta: PatchMeta{
 			patchStrategies: fieldPatchStrategies,
 			patchMergeKey:   fieldPatchMergeKey,
-		}, nil
+		},
+	}
+	patchMetaLookupMu.Lock()
+	patchMetaLookupCache[ck] = res
+	patchMetaLookupMu.Unlock()
+	return res.schema, res.patchMeta, nil
 }
 
 func (s PatchMetaFromStruct) LookupPatchMetadataForSlice(key string) (LookupPatchMeta, PatchMeta, error) {
+	ck := patchMetaCacheKey{t: s.T, key: key, isSlice: true}
+	patchMetaLookupMu.RLock()
+	res, ok := patchMetaLookupCache[ck]
+	patchMetaLookupMu.RUnlock()
+	if ok {
+		return res.schema, res.patchMeta, nil
+	}
 	subschema, patchMeta, err := s.LookupPatchMetadataForStruct(key)
 	if err != nil {
 		return nil, PatchMeta{}, err
@@ -120,7 +157,14 @@ func (s PatchMetaFromStruct) LookupPatchMetadataForSlice(key string) (LookupPatc
 		return nil, PatchMeta{}, fmt.Errorf("expected slice or array type, but got: %s", s.T.Kind().String())
 	}
 
-	return PatchMetaFromStruct{T: elemType}, patchMeta, nil
+	res = patchMetaCacheVal{
+		schema:    PatchMetaFromStruct{T: elemType},
+		patchMeta: patchMeta,
+	}
+	patchMetaLookupMu.Lock()
+	patchMetaLookupCache[ck] = res
+	patchMetaLookupMu.Unlock()
+	return res.schema, res.patchMeta, nil
 }
 
 func (s PatchMetaFromStruct) Name() string {

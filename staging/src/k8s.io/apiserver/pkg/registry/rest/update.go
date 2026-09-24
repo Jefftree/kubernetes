@@ -284,9 +284,12 @@ func (i *wrappedUpdatedObjectInfo) UpdatedObject(ctx context.Context, oldObj run
 
 // AdmissionToValidateObjectUpdateFunc converts validating admission to a rest validate object update func
 func AdmissionToValidateObjectUpdateFunc(admit admission.Interface, staticAttributes admission.Attributes, o admission.ObjectInterfaces) ValidateObjectUpdateFunc {
+	if !admission.HasValidationHandler(admit, staticAttributes.GetOperation()) {
+		return ValidateAllObjectUpdateFunc
+	}
 	validatingAdmission, ok := admit.(admission.ValidationInterface)
 	if !ok {
-		return func(ctx context.Context, obj, old runtime.Object) error { return nil }
+		return ValidateAllObjectUpdateFunc
 	}
 	return func(ctx context.Context, obj, old runtime.Object) error {
 		finalAttributes := admission.NewAttributesRecord(

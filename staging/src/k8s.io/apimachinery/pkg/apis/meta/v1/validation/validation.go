@@ -173,19 +173,26 @@ func ValidateDeleteOptions(options *metav1.DeleteOptions) field.ErrorList {
 	return allErrs
 }
 
+var (
+	fieldPathFieldManager    = field.NewPath("fieldManager")
+	fieldPathDryRun          = field.NewPath("dryRun")
+	fieldPathFieldValidation = field.NewPath("fieldValidation")
+	fieldPathForce           = field.NewPath("force")
+)
+
 func ValidateCreateOptions(options *metav1.CreateOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
-	allErrs = append(allErrs, ValidateFieldManager(options.FieldManager, field.NewPath("fieldManager"))...)
-	allErrs = append(allErrs, ValidateDryRun(field.NewPath("dryRun"), options.DryRun)...)
-	allErrs = append(allErrs, ValidateFieldValidation(field.NewPath("fieldValidation"), options.FieldValidation)...)
+	allErrs = append(allErrs, ValidateFieldManager(options.FieldManager, fieldPathFieldManager)...)
+	allErrs = append(allErrs, ValidateDryRun(fieldPathDryRun, options.DryRun)...)
+	allErrs = append(allErrs, ValidateFieldValidation(fieldPathFieldValidation, options.FieldValidation)...)
 	return allErrs
 }
 
 func ValidateUpdateOptions(options *metav1.UpdateOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
-	allErrs = append(allErrs, ValidateFieldManager(options.FieldManager, field.NewPath("fieldManager"))...)
-	allErrs = append(allErrs, ValidateDryRun(field.NewPath("dryRun"), options.DryRun)...)
-	allErrs = append(allErrs, ValidateFieldValidation(field.NewPath("fieldValidation"), options.FieldValidation)...)
+	allErrs = append(allErrs, ValidateFieldManager(options.FieldManager, fieldPathFieldManager)...)
+	allErrs = append(allErrs, ValidateDryRun(fieldPathDryRun, options.DryRun)...)
+	allErrs = append(allErrs, ValidateFieldValidation(fieldPathFieldValidation, options.FieldValidation)...)
 	return allErrs
 }
 
@@ -195,24 +202,39 @@ func ValidatePatchOptions(options *metav1.PatchOptions, patchType types.PatchTyp
 	case types.ApplyYAMLPatchType, types.ApplyCBORPatchType:
 		if options.FieldManager == "" {
 			// This field is defaulted to "kubectl" by kubectl, but HAS TO be explicitly set by controllers.
-			allErrs = append(allErrs, field.Required(field.NewPath("fieldManager"), "is required for apply patch"))
+			allErrs = append(allErrs, field.Required(fieldPathFieldManager, "is required for apply patch"))
 		}
 	default:
 		if options.Force != nil {
-			allErrs = append(allErrs, field.Forbidden(field.NewPath("force"), "may not be specified for non-apply patch"))
+			allErrs = append(allErrs, field.Forbidden(fieldPathForce, "may not be specified for non-apply patch"))
 		}
 	}
-	allErrs = append(allErrs, ValidateFieldManager(options.FieldManager, field.NewPath("fieldManager"))...)
-	allErrs = append(allErrs, ValidateDryRun(field.NewPath("dryRun"), options.DryRun)...)
-	allErrs = append(allErrs, ValidateFieldValidation(field.NewPath("fieldValidation"), options.FieldValidation)...)
+	allErrs = append(allErrs, ValidateFieldManager(options.FieldManager, fieldPathFieldManager)...)
+	allErrs = append(allErrs, ValidateDryRun(fieldPathDryRun, options.DryRun)...)
+	allErrs = append(allErrs, ValidateFieldValidation(fieldPathFieldValidation, options.FieldValidation)...)
 	return allErrs
 }
 
 var FieldManagerMaxLength = 128
 
+func isValidFieldManagerString(fieldManager string) bool {
+	if len(fieldManager) > FieldManagerMaxLength {
+		return false
+	}
+	for _, r := range fieldManager {
+		if !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
+}
+
 // ValidateFieldManager valides that the fieldManager is the proper length and
 // only has printable characters.
 func ValidateFieldManager(fieldManager string, fldPath *field.Path) field.ErrorList {
+	if isValidFieldManagerString(fieldManager) {
+		return nil
+	}
 	allErrs := field.ErrorList{}
 	// the field can not be set as a `*string`, so a empty string ("") is
 	// considered as not set and is defaulted by the rest of the process
@@ -234,6 +256,9 @@ var allowedDryRunValues = sets.NewString(metav1.DryRunAll)
 
 // ValidateDryRun validates that a dryRun query param only contains allowed values.
 func ValidateDryRun(fldPath *field.Path, dryRun []string) field.ErrorList {
+	if len(dryRun) == 0 {
+		return nil
+	}
 	allErrs := field.ErrorList{}
 	if !allowedDryRunValues.HasAll(dryRun...) {
 		allErrs = append(allErrs, field.NotSupported(fldPath, dryRun, allowedDryRunValues.List()))
@@ -245,6 +270,10 @@ var allowedFieldValidationValues = sets.NewString("", metav1.FieldValidationIgno
 
 // ValidateFieldValidation validates that a fieldValidation query param only contains allowed values.
 func ValidateFieldValidation(fldPath *field.Path, fieldValidation string) field.ErrorList {
+	switch fieldValidation {
+	case "", metav1.FieldValidationIgnore, metav1.FieldValidationWarn, metav1.FieldValidationStrict:
+		return nil
+	}
 	allErrs := field.ErrorList{}
 	if !allowedFieldValidationValues.Has(fieldValidation) {
 		allErrs = append(allErrs, field.NotSupported(fldPath, fieldValidation, allowedFieldValidationValues.List()))
@@ -278,37 +307,44 @@ const (
 
 // ValidateManagedFields validates a list of managed fields.
 func ValidateManagedFields(fieldsList []metav1.ManagedFieldsEntry, fldPath *field.Path, opts ...ManagedFieldsValidationOption) field.ErrorList {
-	coveredByDeclarative := false
-	for _, opt := range opts {
-		if opt == CoveredByDeclarative {
-			coveredByDeclarative = true
-		}
-	}
 	var allErrs field.ErrorList
-	for i, fields := range fieldsList {
-		fldPath := fldPath.Index(i)
+	for i := range fieldsList {
+		fields := &fieldsList[i]
+		if (fields.Operation == metav1.ManagedFieldsOperationApply || fields.Operation == metav1.ManagedFieldsOperationUpdate) &&
+			(len(fields.FieldsType) == 0 || fields.FieldsType == "FieldsV1") &&
+			len(fields.Subresource) <= MaxSubresourceNameLength &&
+			isValidFieldManagerString(fields.Manager) {
+			continue
+		}
+		coveredByDeclarative := false
+		for _, opt := range opts {
+			if opt == CoveredByDeclarative {
+				coveredByDeclarative = true
+			}
+		}
+		idxPath := fldPath.Index(i)
 		switch fields.Operation {
 		case "":
-			err := field.Required(fldPath.Child("operation"), "must not be empty")
+			err := field.Required(idxPath.Child("operation"), "must not be empty")
 			if coveredByDeclarative {
 				err = err.MarkCoveredByDeclarative()
 			}
 			allErrs = append(allErrs, err)
 		case metav1.ManagedFieldsOperationApply, metav1.ManagedFieldsOperationUpdate:
 		default:
-			err := field.NotSupported(fldPath.Child("operation"), fields.Operation, []metav1.ManagedFieldsOperationType{metav1.ManagedFieldsOperationApply, metav1.ManagedFieldsOperationUpdate})
+			err := field.NotSupported(idxPath.Child("operation"), fields.Operation, []metav1.ManagedFieldsOperationType{metav1.ManagedFieldsOperationApply, metav1.ManagedFieldsOperationUpdate})
 			if coveredByDeclarative {
 				err = err.MarkCoveredByDeclarative()
 			}
 			allErrs = append(allErrs, err)
 		}
 		if len(fields.FieldsType) > 0 && fields.FieldsType != "FieldsV1" {
-			allErrs = append(allErrs, field.Invalid(fldPath.Child("fieldsType"), fields.FieldsType, "must be `FieldsV1`"))
+			allErrs = append(allErrs, field.Invalid(idxPath.Child("fieldsType"), fields.FieldsType, "must be `FieldsV1`"))
 		}
-		allErrs = append(allErrs, ValidateFieldManager(fields.Manager, fldPath.Child("manager"))...)
+		allErrs = append(allErrs, ValidateFieldManager(fields.Manager, idxPath.Child("manager"))...)
 
 		if len(fields.Subresource) > MaxSubresourceNameLength {
-			allErrs = append(allErrs, field.TooLong(fldPath.Child("subresource"), "" /*unused*/, MaxSubresourceNameLength))
+			allErrs = append(allErrs, field.TooLong(idxPath.Child("subresource"), "" /*unused*/, MaxSubresourceNameLength))
 		}
 	}
 	return allErrs

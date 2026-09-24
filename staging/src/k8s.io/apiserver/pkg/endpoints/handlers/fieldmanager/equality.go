@@ -109,6 +109,26 @@ func equalIgnoringValueAtPath(a, b any, path []string) bool {
 	return true
 }
 
+func managedFieldsEqualModuloTime(a, b []metav1.ManagedFieldsEntry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		ea, eb := &a[i], &b[i]
+		if ea.Manager != eb.Manager || ea.Operation != eb.Operation || ea.APIVersion != eb.APIVersion ||
+			ea.FieldsType != eb.FieldsType || ea.Subresource != eb.Subresource {
+			return false
+		}
+		if (ea.FieldsV1 == nil) != (eb.FieldsV1 == nil) {
+			return false
+		}
+		if ea.FieldsV1 != nil && string(ea.FieldsV1.Raw) != string(eb.FieldsV1.Raw) {
+			return false
+		}
+	}
+	return true
+}
+
 // IgnoreManagedFieldsTimestampsTransformer reverts timestamp updates
 // if the non-managed parts of the object are equivalent
 func IgnoreManagedFieldsTimestampsTransformer(
@@ -121,58 +141,25 @@ func IgnoreManagedFieldsTimestampsTransformer(
 		return newObj, nil
 	}
 
-	outcome := "unequal_objects_fast"
 	start := time.Now()
-	err = nil
-	res = nil
 
-	defer func() {
-		if err != nil {
-			outcome = "error"
-		}
-
-		metrics.RecordTimestampComparisonLatency(outcome, time.Since(start))
-	}()
-
-	// If managedFields modulo timestamps are unchanged
-	//		and
-	//	rest of object is unchanged
-	//		then
-	//	revert any changes to timestamps in managed fields
-	//		(to prevent spurious ResourceVersion bump)
-	//
-	// Procecure:
-	// Do a quicker check to see if just managed fields modulo timestamps are
-	//	unchanged. If so, then do the full, slower check.
-	//
-	// In most cases which actually update the object, the managed fields modulo
-	//	timestamp check will fail, and we will be able to return early.
-	//
-	// In other cases, the managed fields may be exactly the same,
-	// 	except for timestamp, but the objects are the different. This is the
-	//	slow path which checks the full object.
 	oldAccessor, err := meta.Accessor(oldObj)
 	if err != nil {
+		metrics.RecordTimestampComparisonLatency("error", time.Since(start))
 		return nil, fmt.Errorf("failed to acquire accessor for oldObj: %v", err)
 	}
 
 	accessor, err := meta.Accessor(newObj)
 	if err != nil {
+		metrics.RecordTimestampComparisonLatency("error", time.Since(start))
 		return nil, fmt.Errorf("failed to acquire accessor for newObj: %v", err)
 	}
 
 	oldManagedFields := oldAccessor.GetManagedFields()
 	newManagedFields := accessor.GetManagedFields()
 
-	if len(oldManagedFields) != len(newManagedFields) {
-		// Return early if any managed fields entry was added/removed.
-		// We want to retain user expectation that even if they write to a field
-		// whose value did not change, they will still result as the field
-		// manager at the end.
-		return newObj, nil
-	} else if len(newManagedFields) == 0 {
-		// This transformation only makes sense when managedFields are
-		// non-empty
+	if len(oldManagedFields) != len(newManagedFields) || len(newManagedFields) == 0 {
+		metrics.RecordTimestampComparisonLatency("unequal_objects_fast", time.Since(start))
 		return newObj, nil
 	}
 
@@ -188,6 +175,12 @@ func IgnoreManagedFieldsTimestampsTransformer(
 	}
 
 	if allTimesUnchanged {
+		metrics.RecordTimestampComparisonLatency("unequal_objects_fast", time.Since(start))
+		return newObj, nil
+	}
+
+	if !managedFieldsEqualModuloTime(oldManagedFields, newManagedFields) {
+		metrics.RecordTimestampComparisonLatency("unequal_objects_fast", time.Since(start))
 		return newObj, nil
 	}
 
@@ -195,13 +188,6 @@ func IgnoreManagedFieldsTimestampsTransformer(
 	if _, ok := newObj.(*unstructured.Unstructured); ok {
 		// Use strict equality with unstructured
 		eqFn = equalities.DeepEqualWithNilDifferentFromEmpty
-	}
-
-	// This condition ensures the managed fields are always compared first. If
-	//	this check fails, the if statement will short circuit. If the check
-	// 	succeeds the slow path is taken which compares entire objects.
-	if !eqFn(oldManagedFields, newManagedFields) {
-		return newObj, nil
 	}
 
 	if eqFn(newObj, oldObj) {
@@ -217,10 +203,10 @@ func IgnoreManagedFieldsTimestampsTransformer(
 		}
 
 		accessor.SetManagedFields(newManagedFields)
-		outcome = "equal_objects"
+		metrics.RecordTimestampComparisonLatency("equal_objects", time.Since(start))
 		return newObj, nil
 	}
 
-	outcome = "unequal_objects_slow"
+	metrics.RecordTimestampComparisonLatency("unequal_objects_slow", time.Since(start))
 	return newObj, nil
 }

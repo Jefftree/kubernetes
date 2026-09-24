@@ -68,3 +68,46 @@ func (admissionHandler chainAdmissionHandler) Handles(operation Operation) bool 
 	}
 	return false
 }
+
+// HasMutationHandler returns true if the admission Interface contains at least one
+// MutationInterface that handles the given operation.
+func HasMutationHandler(i Interface, operation Operation) bool {
+	if i == nil || !i.Handles(operation) {
+		return false
+	}
+	if chain, ok := i.(chainAdmissionHandler); ok {
+		for _, handler := range chain {
+			if HasMutationHandler(handler, operation) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapper, ok := i.(interface{ Unwrap() Interface }); ok {
+		return HasMutationHandler(wrapper.Unwrap(), operation)
+	}
+	_, ok := i.(MutationInterface)
+	return ok
+}
+
+// HasValidationHandler returns true if the admission Interface contains at least one
+// ValidationInterface that handles the given operation.
+func HasValidationHandler(i Interface, operation Operation) bool {
+	if i == nil || !i.Handles(operation) {
+		return false
+	}
+	if chain, ok := i.(chainAdmissionHandler); ok {
+		for _, handler := range chain {
+			if HasValidationHandler(handler, operation) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapper, ok := i.(interface{ Unwrap() Interface }); ok {
+		return HasValidationHandler(wrapper.Unwrap(), operation)
+	}
+	_, ok := i.(ValidationInterface)
+	return ok
+}
+

@@ -179,6 +179,37 @@ func (r structReflect) ZipUsing(a Allocator, other Map, order MapTraverseOrder, 
 	return defaultMapZip(a, &r, other, order, fn)
 }
 
+func (r structReflect) ZipVisitorUsing(a Allocator, other Map, order MapTraverseOrder, v MapZipVisitor) bool {
+	if otherStruct, ok := other.(*structReflect); ok && r.Value.Type() == otherStruct.Value.Type() {
+		lhsvr, rhsvr := a.allocValueReflect(), a.allocValueReflect()
+		defer a.Free(lhsvr)
+		defer a.Free(rhsvr)
+		lhsVal := r.Value
+		rhsVal := otherStruct.Value
+		for _, fieldCacheEntry := range TypeReflectEntryOf(lhsVal.Type()).OrderedFields() {
+			lhsFieldVal := fieldCacheEntry.GetFrom(lhsVal)
+			rhsFieldVal := fieldCacheEntry.GetFrom(rhsVal)
+			lhsOmit := fieldCacheEntry.CanOmit(lhsFieldVal)
+			rhsOmit := fieldCacheEntry.CanOmit(rhsFieldVal)
+			if lhsOmit && rhsOmit {
+				continue
+			}
+			var lv, rv Value
+			if !lhsOmit {
+				lv = lhsvr.mustReuse(lhsFieldVal, fieldCacheEntry.TypeEntry, nil, nil)
+			}
+			if !rhsOmit {
+				rv = rhsvr.mustReuse(rhsFieldVal, fieldCacheEntry.TypeEntry, nil, nil)
+			}
+			if !v.VisitMapEntry(fieldCacheEntry.JsonName, lv, rv) {
+				return false
+			}
+		}
+		return true
+	}
+	return defaultMapZip(a, &r, other, order, v.VisitMapEntry)
+}
+
 // structZip provides an optimized zip for structReflect types. The zip is always lexical key ordered since there is
 // no additional cost to ordering the zip for structured types.
 func (r structReflect) structZip(other *structReflect, lhsvr, rhsvr *valueReflect, fn func(key string, lhs, rhs Value) bool) bool {

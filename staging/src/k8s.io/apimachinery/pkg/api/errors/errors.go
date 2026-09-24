@@ -789,6 +789,9 @@ func IsStoreReadError(err error) bool {
 // request delay without retry.
 // It supports wrapped errors and returns false when the error is nil.
 func SuggestsClientDelay(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
 	t, ok := err.(APIStatus)
 	if (ok || errors.As(err, &t)) && t.Status().Details != nil {
 		switch t.Status().Reason {
@@ -808,6 +811,9 @@ func SuggestsClientDelay(err error) (int, bool) {
 // It supports wrapped errors and returns StatusReasonUnknown when
 // the error is nil or doesn't have a status.
 func ReasonForError(err error) metav1.StatusReason {
+	if err == nil {
+		return metav1.StatusReasonUnknown
+	}
 	if status, ok := err.(APIStatus); ok || errors.As(err, &status) {
 		return status.Status().Reason
 	}
@@ -815,6 +821,9 @@ func ReasonForError(err error) metav1.StatusReason {
 }
 
 func reasonAndCodeForError(err error) (metav1.StatusReason, int32) {
+	if err == nil {
+		return metav1.StatusReasonUnknown, 0
+	}
 	if status, ok := err.(APIStatus); ok || errors.As(err, &status) {
 		return status.Status().Reason, status.Status().Code
 	}

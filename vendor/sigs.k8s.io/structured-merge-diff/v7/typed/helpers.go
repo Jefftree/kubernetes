@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
 	"sigs.k8s.io/structured-merge-diff/v7/schema"
@@ -197,6 +198,14 @@ func getAssociativeKeyDefault(s *schema.Schema, list *schema.List, fieldName str
 	return field.Default, nil
 }
 
+type assocKeyPECacheEntry struct {
+	fieldName string
+	val       string
+	pe        fieldpath.PathElement
+}
+
+var assocKeyPECache [512]atomic.Pointer[assocKeyPECacheEntry]
+
 func keyedAssociativeListItemToPathElement(a value.Allocator, s *schema.Schema, list *schema.List, child value.Value) (fieldpath.PathElement, error) {
 	pe := fieldpath.PathElement{}
 	if child.IsNull() {
@@ -206,9 +215,36 @@ func keyedAssociativeListItemToPathElement(a value.Allocator, s *schema.Schema, 
 	if !child.IsMap() {
 		return pe, errors.New("associative list with keys may not have non-map elements")
 	}
-	keyMap := value.FieldList{}
 	m := child.AsMapUsing(a)
 	defer a.Free(m)
+	if len(list.Keys) == 1 {
+		fieldName := list.Keys[0]
+		if val, ok := m.GetUsing(a, fieldName); ok {
+			if val.IsString() {
+				strVal := val.AsString()
+				a.Free(val)
+				var h uint32 = 2166136261
+				for i := 0; i < len(fieldName); i++ {
+					h ^= uint32(fieldName[i])
+					h *= 16777619
+				}
+				for i := 0; i < len(strVal); i++ {
+					h ^= uint32(strVal[i])
+					h *= 16777619
+				}
+				slot := &assocKeyPECache[h&511]
+				if e := slot.Load(); e != nil && e.fieldName == fieldName && e.val == strVal {
+					return e.pe, nil
+				}
+				fl := value.FieldList{{Name: fieldName, Value: value.NewValueInterface(strVal)}}
+				pe.Key = &fl
+				slot.Store(&assocKeyPECacheEntry{fieldName: fieldName, val: strVal, pe: pe})
+				return pe, nil
+			}
+			a.Free(val)
+		}
+	}
+	keyMap := make(value.FieldList, 0, len(list.Keys))
 	for _, fieldName := range list.Keys {
 		if val, ok := m.Get(fieldName); ok {
 			keyMap = append(keyMap, value.Field{Name: fieldName, Value: val})

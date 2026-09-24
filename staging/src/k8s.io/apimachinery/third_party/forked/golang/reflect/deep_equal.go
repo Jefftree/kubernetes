@@ -7,10 +7,16 @@
 package reflect
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
+	"time"
+	"unsafe"
 )
+
+var reflectTimeType = reflect.TypeOf(time.Time{})
 
 // Equalities is a map from type to a function comparing two values of
 // that type.
@@ -97,6 +103,12 @@ func makeUsefulPanic(v reflect.Value) {
 	}
 }
 
+var visitMapPool = sync.Pool{
+	New: func() any {
+		return make(map[visit]bool)
+	},
+}
+
 // Tests for deep equality using reflected types. The map argument tracks
 // comparisons that have already been seen, which allows short circuiting on
 // recursive types.
@@ -111,6 +123,24 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 		return false
 	}
 	if fv, ok := e[v1.Type()]; ok {
+		if v1.IsZero() && v2.IsZero() {
+			return true
+		}
+		if v1.CanAddr() && v2.CanAddr() {
+			if v1.UnsafeAddr() == v2.UnsafeAddr() {
+				return true
+			}
+			p1 := v1.Addr().UnsafePointer()
+			p2 := v2.Addr().UnsafePointer()
+			if size := v1.Type().Size(); size > 0 {
+				if bytes.Equal(unsafe.Slice((*byte)(p1), size), unsafe.Slice((*byte)(p2), size)) {
+					return true
+				}
+			}
+			if t := v1.Type(); t.Kind() == reflect.Struct && t.NumField() == 1 && t.Field(0).Type == reflectTimeType {
+				return (*(*time.Time)(p1)).UTC() == (*(*time.Time)(p2)).UTC()
+			}
+		}
 		return fv.Call([]reflect.Value{v1, v2})[0].Bool()
 	}
 
@@ -200,6 +230,9 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 		}
 		return e.deepValueEqual(v1.Elem(), v2.Elem(), visited, equateNilAndEmpty, depth+1)
 	case reflect.Pointer:
+		if v1.Pointer() == v2.Pointer() {
+			return true
+		}
 		return e.deepValueEqual(v1.Elem(), v2.Elem(), visited, equateNilAndEmpty, depth+1)
 	case reflect.Struct:
 		for i, n := 0, v1.NumField(); i < n; i++ {
@@ -239,6 +272,21 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 		if v1.Pointer() == v2.Pointer() {
 			return true
 		}
+		if v1.CanInterface() && v2.CanInterface() {
+			if m1, ok := v1.Interface().(map[string]string); ok {
+				if _, hasKeyEq := e[v1.Type().Key()]; !hasKeyEq {
+					if _, hasElemEq := e[v1.Type().Elem()]; !hasElemEq {
+						m2 := v2.Interface().(map[string]string)
+						for k, val1 := range m1 {
+							if val2, ok := m2[k]; !ok || val1 != val2 {
+								return false
+							}
+						}
+						return true
+					}
+				}
+			}
+		}
 		for _, k := range v1.MapKeys() {
 			if !e.deepValueEqual(v1.MapIndex(k), v2.MapIndex(k), visited, equateNilAndEmpty, depth+1) {
 				return false
@@ -251,6 +299,31 @@ func (e Equalities) deepValueEqual(v1, v2 reflect.Value, visited map[visit]bool,
 		}
 		// Can't do better than this:
 		return false
+	case reflect.String:
+		if !v1.CanInterface() || !v2.CanInterface() {
+			panic(unexportedTypePanic{})
+		}
+		return v1.String() == v2.String()
+	case reflect.Bool:
+		if !v1.CanInterface() || !v2.CanInterface() {
+			panic(unexportedTypePanic{})
+		}
+		return v1.Bool() == v2.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if !v1.CanInterface() || !v2.CanInterface() {
+			panic(unexportedTypePanic{})
+		}
+		return v1.Int() == v2.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		if !v1.CanInterface() || !v2.CanInterface() {
+			panic(unexportedTypePanic{})
+		}
+		return v1.Uint() == v2.Uint()
+	case reflect.Float32, reflect.Float64:
+		if !v1.CanInterface() || !v2.CanInterface() {
+			panic(unexportedTypePanic{})
+		}
+		return v1.Float() == v2.Float()
 	default:
 		// Normal equality suffices
 		if !v1.CanInterface() || !v2.CanInterface() {
@@ -273,6 +346,20 @@ func (e Equalities) DeepEqual(a1, a2 interface{}) bool {
 	return e.deepEqual(a1, a2, true)
 }
 
+func (e Equalities) DeepEqualValue(v1, v2 reflect.Value) bool {
+	if !v1.IsValid() || !v2.IsValid() {
+		return v1.IsValid() == v2.IsValid()
+	}
+	if v1.Type() != v2.Type() {
+		return false
+	}
+	visited := visitMapPool.Get().(map[visit]bool)
+	res := e.deepValueEqual(v1, v2, visited, true, 0)
+	clear(visited)
+	visitMapPool.Put(visited)
+	return res
+}
+
 func (e Equalities) DeepEqualWithNilDifferentFromEmpty(a1, a2 interface{}) bool {
 	return e.deepEqual(a1, a2, false)
 }
@@ -286,7 +373,11 @@ func (e Equalities) deepEqual(a1, a2 interface{}, equateNilAndEmpty bool) bool {
 	if v1.Type() != v2.Type() {
 		return false
 	}
-	return e.deepValueEqual(v1, v2, make(map[visit]bool), equateNilAndEmpty, 0)
+	visited := visitMapPool.Get().(map[visit]bool)
+	res := e.deepValueEqual(v1, v2, visited, equateNilAndEmpty, 0)
+	clear(visited)
+	visitMapPool.Put(visited)
+	return res
 }
 
 func (e Equalities) deepValueDerive(v1, v2 reflect.Value, visited map[visit]bool, depth int) bool {

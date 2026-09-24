@@ -264,6 +264,25 @@ func preserveOldObservedGeneration(newPod, oldPod *api.Pod) {
 		newPod.Status.ObservedGeneration = oldPod.Status.ObservedGeneration
 	}
 
+	if len(oldPod.Status.Conditions) <= 64 {
+		var used uint64
+		for i := range newPod.Status.Conditions {
+			t := newPod.Status.Conditions[i].Type
+			var oldGeneration int64
+			for j := range oldPod.Status.Conditions {
+				if used&(1<<uint(j)) == 0 && oldPod.Status.Conditions[j].Type == t {
+					used |= 1 << uint(j)
+					oldGeneration = oldPod.Status.Conditions[j].ObservedGeneration
+					break
+				}
+			}
+			if newPod.Status.Conditions[i].ObservedGeneration == 0 {
+				newPod.Status.Conditions[i].ObservedGeneration = oldGeneration
+			}
+		}
+		return
+	}
+
 	// Remember observedGeneration values from old status conditions.
 	// This is a list per type because validation permits multiple conditions with the same type.
 	oldConditionGenerations := map[api.PodConditionType][]int64{}
@@ -294,16 +313,31 @@ func (podStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Ob
 	return corevalidation.ValidatePodStatusUpdate(obj.(*api.Pod), old.(*api.Pod), opts)
 }
 
+var (
+	statusPodIPsPath   = field.NewPath("status", "podIPs")
+	statusPodIPs0Path  = statusPodIPsPath.Index(0).Child("ip")
+	statusHostIPsPath  = field.NewPath("status", "hostIPs")
+	statusHostIPs0Path = statusHostIPsPath.Index(0).Child("ip")
+)
+
 // WarningsOnUpdate returns warnings for the given update.
 func (podStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
 	pod := obj.(*api.Pod)
 	var warnings []string
 
 	for i, podIP := range pod.Status.PodIPs {
-		warnings = append(warnings, utilvalidation.GetWarningsForIP(field.NewPath("status", "podIPs").Index(i).Child("ip"), podIP.IP)...)
+		fldPath := statusPodIPs0Path
+		if i != 0 {
+			fldPath = statusPodIPsPath.Index(i).Child("ip")
+		}
+		warnings = append(warnings, utilvalidation.GetWarningsForIP(fldPath, podIP.IP)...)
 	}
 	for i, hostIP := range pod.Status.HostIPs {
-		warnings = append(warnings, utilvalidation.GetWarningsForIP(field.NewPath("status", "hostIPs").Index(i).Child("ip"), hostIP.IP)...)
+		fldPath := statusHostIPs0Path
+		if i != 0 {
+			fldPath = statusHostIPsPath.Index(i).Child("ip")
+		}
+		warnings = append(warnings, utilvalidation.GetWarningsForIP(fldPath, hostIP.IP)...)
 	}
 
 	return warnings

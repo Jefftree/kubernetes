@@ -241,13 +241,16 @@ func (s *store) Get(ctx context.Context, key string, opts storage.GetOptions, ou
 	if err != nil {
 		return err
 	}
-	ctx, span := tracing.Start(ctx, "Get etcd3",
-		attribute.String("audit-id", audit.GetAuditIDTruncated(ctx)),
-		attribute.String("key", key),
-		attribute.String("group", s.groupResource.Group),
-		attribute.String("resource", s.groupResource.Resource),
-	)
-	defer span.End(500 * time.Millisecond)
+	var span *tracing.Span
+	if tracing.IsEnabled(ctx) {
+		ctx, span = tracing.Start(ctx, "Get etcd3",
+			attribute.String("audit-id", audit.GetAuditIDTruncated(ctx)),
+			attribute.String("key", key),
+			attribute.String("group", s.groupResource.Group),
+			attribute.String("resource", s.groupResource.Resource),
+		)
+		defer span.End(500 * time.Millisecond)
+	}
 	startTime := time.Now()
 	getResp, err := s.client.Kubernetes.Get(ctx, preparedKey, kubernetes.GetOptions{})
 	s.metricsTracker.Get.Record(err, startTime)
@@ -284,20 +287,68 @@ func (s *store) Get(ctx context.Context, key string, opts storage.GetOptions, ou
 	return nil
 }
 
+type versionedCodec interface {
+	EncodeReturningVersioned(obj runtime.Object) ([]byte, runtime.Object, error)
+	DecodeVersionedInto(versionedObj runtime.Object, into runtime.Object) error
+}
+
+func (s *store) canUseVersionedDecode() bool {
+	switch d := s.decoder.(type) {
+	case *defaultDecoder:
+		return d.codec == s.codec && d.versioner == s.versioner
+	case *corruptObjErrorInterpretingDecoder:
+		if dd, ok := d.Decoder.(*defaultDecoder); ok {
+			return dd.codec == s.codec && dd.versioner == s.versioner
+		}
+	}
+	return false
+}
+
+func (s *store) encodeForStorage(obj runtime.Object) ([]byte, runtime.Object, error) {
+	if vc, ok := s.codec.(versionedCodec); ok && s.canUseVersionedDecode() {
+		return vc.EncodeReturningVersioned(obj)
+	}
+	data, err := runtime.Encode(s.codec, obj)
+	return data, nil, err
+}
+
+func (s *store) decodeFromStorageOrVersioned(data []byte, versionedObj runtime.Object, out runtime.Object, rev int64) error {
+	if versionedObj != nil {
+		if _, err := conversion.EnforcePtr(out); err != nil {
+			return fmt.Errorf("unable to convert output object to pointer: %v", err)
+		}
+		vc := s.codec.(versionedCodec)
+		if err := vc.DecodeVersionedInto(versionedObj, out); err != nil {
+			if _, isCorrupt := s.decoder.(*corruptObjErrorInterpretingDecoder); isCorrupt {
+				return &corruptObjectError{err: err, errType: undecodable, revision: rev}
+			}
+			return err
+		}
+		if err := s.versioner.UpdateObject(out, uint64(rev)); err != nil {
+			klog.Errorf("failed to update object version: %v", err)
+		}
+		return nil
+	}
+	return s.decoder.Decode(data, out, rev)
+}
+
 // Create implements storage.Interface.Create.
 func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
 	preparedKey, err := s.prepareKey(key, false)
 	if err != nil {
 		return err
 	}
-	ctx, span := tracing.Start(ctx, "Create etcd3",
-		attribute.String("audit-id", audit.GetAuditIDTruncated(ctx)),
-		attribute.String("key", key),
-		attribute.String("type", getTypeName(obj)),
-		attribute.String("group", s.groupResource.Group),
-		attribute.String("resource", s.groupResource.Resource),
-	)
-	defer span.End(500 * time.Millisecond)
+	var span *tracing.Span
+	if tracing.IsEnabled(ctx) {
+		ctx, span = tracing.Start(ctx, "Create etcd3",
+			attribute.String("audit-id", audit.GetAuditIDTruncated(ctx)),
+			attribute.String("key", key),
+			attribute.String("type", getTypeName(obj)),
+			attribute.String("group", s.groupResource.Group),
+			attribute.String("resource", s.groupResource.Resource),
+		)
+		defer span.End(500 * time.Millisecond)
+	}
 	if version, err := s.versioner.ObjectResourceVersion(obj); err == nil && version != 0 {
 		return storage.ErrResourceVersionSetOnCreate
 	}
@@ -305,7 +356,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 		return fmt.Errorf("PrepareObjectForStorage failed: %v", err)
 	}
 	span.AddEvent("About to Encode")
-	data, err := runtime.Encode(s.codec, obj)
+	data, versionedObj, err := s.encodeForStorage(obj)
 	if err != nil {
 		span.AddEvent("Encode failed", attribute.Int("len", len(data)), attribute.String("err", err.Error()))
 		return err
@@ -341,7 +392,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 	}
 
 	if out != nil {
-		err = s.decoder.Decode(data, out, txnResp.Revision)
+		err = s.decodeFromStorageOrVersioned(data, versionedObj, out, txnResp.Revision)
 		if err != nil {
 			span.AddEvent("Decode failed", attribute.Int("len", len(data)), attribute.String("err", err.Error()))
 			recordDecodeError(s.groupResource, preparedKey)
@@ -481,13 +532,16 @@ func (s *store) GuaranteedUpdate(
 	if err != nil {
 		return err
 	}
-	ctx, span := tracing.Start(ctx, "GuaranteedUpdate etcd3",
-		attribute.String("audit-id", audit.GetAuditIDTruncated(ctx)),
-		attribute.String("key", key),
-		attribute.String("type", getTypeName(destination)),
-		attribute.String("group", s.groupResource.Group),
-		attribute.String("resource", s.groupResource.Resource))
-	defer span.End(500 * time.Millisecond)
+	var span *tracing.Span
+	if tracing.IsEnabled(ctx) {
+		ctx, span = tracing.Start(ctx, "GuaranteedUpdate etcd3",
+			attribute.String("audit-id", audit.GetAuditIDTruncated(ctx)),
+			attribute.String("key", key),
+			attribute.String("type", getTypeName(destination)),
+			attribute.String("group", s.groupResource.Group),
+			attribute.String("resource", s.groupResource.Resource))
+		defer span.End(500 * time.Millisecond)
+	}
 
 	v, err := conversion.EnforcePtr(destination)
 	if err != nil {
@@ -557,7 +611,7 @@ func (s *store) GuaranteedUpdate(
 		}
 
 		span.AddEvent("About to Encode")
-		data, err := runtime.Encode(s.codec, ret)
+		data, versionedObj, err := s.encodeForStorage(ret)
 		if err != nil {
 			span.AddEvent("Encode failed", attribute.Int("len", len(data)), attribute.String("err", err.Error()))
 			return err
@@ -580,7 +634,7 @@ func (s *store) GuaranteedUpdate(
 			}
 			// recheck that the data from etcd is not stale before short-circuiting a write
 			if !origState.stale {
-				err = s.decoder.Decode(origState.data, destination, origState.rev)
+				err = s.decodeFromStorageOrVersioned(origState.data, versionedObj, destination, origState.rev)
 				if err != nil {
 					recordDecodeError(s.groupResource, preparedKey)
 					return err
@@ -629,7 +683,7 @@ func (s *store) GuaranteedUpdate(
 			continue
 		}
 
-		err = s.decoder.Decode(data, destination, txnResp.Revision)
+		err = s.decodeFromStorageOrVersioned(data, versionedObj, destination, txnResp.Revision)
 		if err != nil {
 			span.AddEvent("Decode failed", attribute.Int("len", len(data)), attribute.String("err", err.Error()))
 			recordDecodeError(s.groupResource, preparedKey)

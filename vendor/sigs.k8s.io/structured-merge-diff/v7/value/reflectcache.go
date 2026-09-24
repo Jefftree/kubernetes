@@ -222,6 +222,12 @@ func (e TypeReflectCacheEntry) ToUnstructured(sv reflect.Value) (interface{}, er
 	}
 	// Check if the object has a custom string converter and use it if available, since it is much more efficient
 	// than round tripping through json.
+	if e.ptrIsUnstructuredConverter && sv.CanAddr() {
+		return sv.Addr().Interface().(UnstructuredConverter).ToUnstructured(), nil
+	}
+	if e.isUnstructuredConverter {
+		return sv.Interface().(UnstructuredConverter).ToUnstructured(), nil
+	}
 	if converter, ok := e.getUnstructuredConverter(sv); ok {
 		return converter.ToUnstructuredWithError()
 	}

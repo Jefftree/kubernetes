@@ -368,14 +368,20 @@ func (w *mergingWalker) doList(t *schema.List) (errs ValidationErrors) {
 
 func (w *mergingWalker) visitMapItem(t *schema.Map, out map[string]interface{}, key string, lhs, rhs value.Value) (errs ValidationErrors) {
 	fieldType := t.ElementType
-	if sf, ok := t.FindField(key); ok {
+	var pe fieldpath.PathElement
+	if sf := t.FindFieldPtr(key); sf != nil {
 		fieldType = sf.Type
+		pe.FieldName = &sf.Name
+	} else {
+		pe.FieldName = internStringPtr(key)
 	}
-	pe := fieldpath.PathElement{FieldName: &key}
 	w2 := w.prepareDescent(pe, fieldType)
 	w2.lhs = lhs
 	w2.rhs = rhs
-	errs = append(errs, w2.merge(pe.String)...)
+	subErrs := w2.merge(nil)
+	if len(subErrs) > 0 {
+		errs = append(errs, subErrs.WithPrefix(pe.String())...)
+	}
 	if w2.out != nil {
 		out[key] = *w2.out
 	}

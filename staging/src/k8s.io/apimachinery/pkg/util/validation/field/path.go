@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"fmt"
 	"strconv"
+	"sync"
+	"unsafe"
 )
 
 type pathOptions struct {
@@ -52,11 +54,65 @@ type Path struct {
 	parent *Path  // nil if this is the root element
 }
 
+type pathChildEntry struct {
+	parent *Path
+	name   string
+	child  *Path
+}
+
+type pathChildShard struct {
+	mu      sync.Mutex
+	entries [16]pathChildEntry
+	next    uint32
+}
+
+var pathChildShards [128]pathChildShard
+
+func childSingle(parent *Path, name string) *Path {
+	if len(name) <= 64 {
+		h := uint64(uintptr(unsafe.Pointer(parent))) * 0x9e3779b97f4a7c15
+		for i := 0; i < len(name); i++ {
+			h = (h ^ uint64(name[i])) * 1099511628211
+		}
+		shard := &pathChildShards[(h^(h>>16))&127]
+		shard.mu.Lock()
+		for i := range shard.entries {
+			e := &shard.entries[i]
+			if e.child != nil && e.parent == parent && e.name == name {
+				res := e.child
+				shard.mu.Unlock()
+				return res
+			}
+		}
+		res := &Path{name: name, parent: parent}
+		idx := shard.next & 15
+		shard.entries[idx] = pathChildEntry{parent: parent, name: name, child: res}
+		shard.next++
+		shard.mu.Unlock()
+		return res
+	}
+	return &Path{name: name, parent: parent}
+}
+
+type pathIndexEntry struct {
+	parent *Path
+	index  int
+	child  *Path
+}
+
+type pathIndexShard struct {
+	mu      sync.Mutex
+	entries [8]pathIndexEntry
+	next    uint32
+}
+
+var pathIndexShards [64]pathIndexShard
+
 // NewPath creates a root Path object.
 func NewPath(name string, moreNames ...string) *Path {
-	r := &Path{name: name, parent: nil}
+	r := childSingle(nil, name)
 	for _, anotherName := range moreNames {
-		r = &Path{name: anotherName, parent: r}
+		r = childSingle(r, anotherName)
 	}
 	return r
 }
@@ -71,14 +127,35 @@ func (p *Path) Root() *Path {
 
 // Child creates a new Path that is a child of the method receiver.
 func (p *Path) Child(name string, moreNames ...string) *Path {
-	r := NewPath(name, moreNames...)
-	r.Root().parent = p
+	r := childSingle(p, name)
+	for _, anotherName := range moreNames {
+		r = childSingle(r, anotherName)
+	}
 	return r
 }
 
 // Index indicates that the previous Path is to be subscripted by an int.
 // This sets the same underlying value as Key.
 func (p *Path) Index(index int) *Path {
+	if index >= 0 && index < 64 {
+		h := (uint64(uintptr(unsafe.Pointer(p))) * 0x9e3779b97f4a7c15) ^ uint64(index)*0x517cc1b727220a95
+		shard := &pathIndexShards[(h^(h>>16))&63]
+		shard.mu.Lock()
+		for i := range shard.entries {
+			e := &shard.entries[i]
+			if e.child != nil && e.parent == p && e.index == index {
+				res := e.child
+				shard.mu.Unlock()
+				return res
+			}
+		}
+		res := &Path{index: strconv.Itoa(index), parent: p}
+		idx := shard.next & 7
+		shard.entries[idx] = pathIndexEntry{parent: p, index: index, child: res}
+		shard.next++
+		shard.mu.Unlock()
+		return res
+	}
 	return &Path{index: strconv.Itoa(index), parent: p}
 }
 

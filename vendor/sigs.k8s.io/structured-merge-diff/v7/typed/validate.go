@@ -127,7 +127,6 @@ func (v *validatingObjectWalker) visitListItems(t *schema.List, list value.List)
 	observedKeys := fieldpath.MakePathElementSet(list.Length())
 	for i := 0; i < list.Length(); i++ {
 		child := list.AtUsing(v.allocator, i)
-		defer v.allocator.Free(child)
 		var pe fieldpath.PathElement
 		if t.ElementRelationship != schema.Associative {
 			pe.Index = &i
@@ -135,6 +134,7 @@ func (v *validatingObjectWalker) visitListItems(t *schema.List, list value.List)
 			var err error
 			pe, err = listItemToPathElement(v.allocator, v.schema, t, child)
 			if err != nil {
+				v.allocator.Free(child)
 				errs = append(errs, errorf("element %v: %v", i, err.Error())...)
 				// If we can't construct the path element, we can't
 				// even report errors deeper in the schema, so bail on
@@ -148,8 +148,12 @@ func (v *validatingObjectWalker) visitListItems(t *schema.List, list value.List)
 		}
 		v2 := v.prepareDescent(t.ElementType)
 		v2.value = child
-		errs = append(errs, v2.validate(pe.String)...)
+		subErrs := v2.validate(nil)
+		if len(subErrs) > 0 {
+			errs = append(errs, subErrs.WithPrefix(pe.String())...)
+		}
 		v.finishDescent(v2)
+		v.allocator.Free(child)
 	}
 	return errs
 }
@@ -172,18 +176,21 @@ func (v *validatingObjectWalker) doList(t *schema.List) (errs ValidationErrors) 
 
 func (v *validatingObjectWalker) visitMapItems(t *schema.Map, m value.Map) (errs ValidationErrors) {
 	m.IterateUsing(v.allocator, func(key string, val value.Value) bool {
-		pe := fieldpath.PathElement{FieldName: &key}
 		tr := t.ElementType
-		if sf, ok := t.FindField(key); ok {
+		if sf := t.FindFieldPtr(key); sf != nil {
 			tr = sf.Type
 		} else if (t.ElementType == schema.TypeRef{}) {
+			pe := fieldpath.PathElement{FieldName: &key}
 			errs = append(errs, errorf("field not declared in schema").WithPrefix(pe.String())...)
 			return false
 		}
 		v2 := v.prepareDescent(tr)
 		v2.value = val
-		// Giving pe.String as a parameter actually increases the allocations.
-		errs = append(errs, v2.validate(func() string { return pe.String() })...)
+		subErrs := v2.validate(nil)
+		if len(subErrs) > 0 {
+			pe := fieldpath.PathElement{FieldName: &key}
+			errs = append(errs, subErrs.WithPrefix(pe.String())...)
+		}
 		v.finishDescent(v2)
 		return true
 	})

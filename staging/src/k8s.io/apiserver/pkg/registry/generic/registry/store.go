@@ -19,6 +19,7 @@ package registry
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -571,7 +572,7 @@ func (e *Store) create(ctx context.Context, obj runtime.Object, createValidation
 	}
 	// at this point we have a fully formed object.  It is time to call the validators that the apiserver
 	// handling chain wants to enforce.
-	if createValidation != nil {
+	if createValidation != nil && reflect.ValueOf(createValidation).Pointer() != reflect.ValueOf(rest.ValidateAllObjectFunc).Pointer() {
 		if err := createValidation(ctx, obj.DeepCopyObject()); err != nil {
 			return nil, err
 		}
@@ -791,7 +792,7 @@ func (e *Store) Update(ctx context.Context, name string, objInfo rest.UpdatedObj
 			}
 			// at this point we have a fully formed object.  It is time to call the validators that the apiserver
 			// handling chain wants to enforce.
-			if createValidation != nil {
+			if createValidation != nil && reflect.ValueOf(createValidation).Pointer() != reflect.ValueOf(rest.ValidateAllObjectFunc).Pointer() {
 				if err := createValidation(ctx, obj.DeepCopyObject()); err != nil {
 					return nil, nil, err
 				}
@@ -862,7 +863,7 @@ func (e *Store) Update(ctx context.Context, name string, objInfo rest.UpdatedObj
 
 		// at this point we have a fully formed object.  It is time to call the validators that the apiserver
 		// handling chain wants to enforce.
-		if updateValidation != nil {
+		if updateValidation != nil && reflect.ValueOf(updateValidation).Pointer() != reflect.ValueOf(rest.ValidateAllObjectUpdateFunc).Pointer() {
 			if err := updateValidation(ctx, obj.DeepCopyObject(), existing.DeepCopyObject()); err != nil {
 				return nil, nil, err
 			}

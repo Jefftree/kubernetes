@@ -216,9 +216,12 @@ type NamespaceScopedStrategy interface {
 
 // AdmissionToValidateObjectFunc converts validating admission to a rest validate object func
 func AdmissionToValidateObjectFunc(admit admission.Interface, staticAttributes admission.Attributes, o admission.ObjectInterfaces) ValidateObjectFunc {
+	if !admission.HasValidationHandler(admit, staticAttributes.GetOperation()) {
+		return ValidateAllObjectFunc
+	}
 	validatingAdmission, ok := admit.(admission.ValidationInterface)
 	if !ok {
-		return func(ctx context.Context, obj runtime.Object) error { return nil }
+		return ValidateAllObjectFunc
 	}
 	return func(ctx context.Context, obj runtime.Object) error {
 		name := staticAttributes.GetName()

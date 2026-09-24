@@ -97,16 +97,17 @@ func validateOwnerReference(ownerReference metav1.OwnerReference, fldPath *field
 // ValidateOwnerReferences validates that a set of owner references are correctly defined.
 func ValidateOwnerReferences(ownerReferences []metav1.OwnerReference, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
-	firstControllerName := ""
-	for idx, ref := range ownerReferences {
-		allErrs = append(allErrs, validateOwnerReference(ref, fldPath.Index(idx))...)
+	var firstController *metav1.OwnerReference
+	for idx := range ownerReferences {
+		ref := &ownerReferences[idx]
+		allErrs = append(allErrs, validateOwnerReference(*ref, fldPath.Index(idx))...)
 		if ref.Controller != nil && *ref.Controller {
-			curControllerName := ref.Kind + "/" + ref.Name
-			if firstControllerName != "" {
+			if firstController != nil {
 				allErrs = append(allErrs, field.Invalid(fldPath, ownerReferences,
-					fmt.Sprintf("Only one reference can have Controller set to true. Found \"true\" in references for %v and %v", firstControllerName, curControllerName)))
+					fmt.Sprintf("Only one reference can have Controller set to true. Found \"true\" in references for %v and %v",
+						firstController.Kind+"/"+firstController.Name, ref.Kind+"/"+ref.Name)))
 			} else {
-				firstControllerName = curControllerName
+				firstController = ref
 			}
 		}
 	}
@@ -348,22 +349,45 @@ func ValidateObjectMetaAccessorUpdate(newMeta, oldMeta metav1.Object, fldPath *f
 	}
 
 	// Generation shouldn't be decremented
-	allErrs = append(allErrs, ValidateNonnegativeField(newMeta.GetGeneration(), fldPath.Child("generation")).MarkCoveredByDeclarative()...)
-	if newMeta.GetGeneration() < oldMeta.GetGeneration() {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("generation"), newMeta.GetGeneration(), "must not be decremented"))
+	newGen := newMeta.GetGeneration()
+	if newGen < 0 {
+		allErrs = append(allErrs, ValidateNonnegativeField(newGen, fldPath.Child("generation")).MarkCoveredByDeclarative()...)
+	}
+	if newGen < oldMeta.GetGeneration() {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("generation"), newGen, "must not be decremented"))
 	}
 
-	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetName(), oldMeta.GetName(), fldPath.Child("name"))...)
-	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetNamespace(), oldMeta.GetNamespace(), fldPath.Child("namespace"))...)
-	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetUID(), oldMeta.GetUID(), fldPath.Child("uid")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
-	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetCreationTimestamp(), oldMeta.GetCreationTimestamp(), fldPath.Child("creationTimestamp")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
-	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetDeletionTimestamp(), oldMeta.GetDeletionTimestamp(), fldPath.Child("deletionTimestamp")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
-	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetDeletionGracePeriodSeconds(), oldMeta.GetDeletionGracePeriodSeconds(), fldPath.Child("deletionGracePeriodSeconds")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	if newMeta.GetName() != oldMeta.GetName() {
+		allErrs = append(allErrs, ValidateImmutableField(newMeta.GetName(), oldMeta.GetName(), fldPath.Child("name"))...)
+	}
+	if newMeta.GetNamespace() != oldMeta.GetNamespace() {
+		allErrs = append(allErrs, ValidateImmutableField(newMeta.GetNamespace(), oldMeta.GetNamespace(), fldPath.Child("namespace"))...)
+	}
+	if newMeta.GetUID() != oldMeta.GetUID() {
+		allErrs = append(allErrs, ValidateImmutableField(newMeta.GetUID(), oldMeta.GetUID(), fldPath.Child("uid")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	}
+	if newCT, oldCT := newMeta.GetCreationTimestamp(), oldMeta.GetCreationTimestamp(); !newCT.Equal(&oldCT) {
+		allErrs = append(allErrs, ValidateImmutableField(newCT, oldCT, fldPath.Child("creationTimestamp")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	}
+	if newDT, oldDT := newMeta.GetDeletionTimestamp(), oldMeta.GetDeletionTimestamp(); ! newDT.Equal(oldDT) {
+		allErrs = append(allErrs, ValidateImmutableField(newDT, oldDT, fldPath.Child("deletionTimestamp")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	}
+	if newDGP, oldDGP := newMeta.GetDeletionGracePeriodSeconds(), oldMeta.GetDeletionGracePeriodSeconds(); (newDGP == nil) != (oldDGP == nil) || (newDGP != nil && *newDGP != *oldDGP) {
+		allErrs = append(allErrs, ValidateImmutableField(newDGP, oldDGP, fldPath.Child("deletionGracePeriodSeconds")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	}
 
-	allErrs = append(allErrs, v1validation.ValidateLabels(newMeta.GetLabels(), fldPath.Child("labels"))...)
-	allErrs = append(allErrs, ValidateAnnotations(newMeta.GetAnnotations(), fldPath.Child("annotations"))...)
-	allErrs = append(allErrs, ValidateOwnerReferences(newMeta.GetOwnerReferences(), fldPath.Child("ownerReferences"))...)
-	allErrs = append(allErrs, v1validation.ValidateManagedFields(newMeta.GetManagedFields(), fldPath.Child("managedFields"), v1validation.CoveredByDeclarative)...)
+	if len(newMeta.GetLabels()) > 0 {
+		allErrs = append(allErrs, v1validation.ValidateLabels(newMeta.GetLabels(), fldPath.Child("labels"))...)
+	}
+	if len(newMeta.GetAnnotations()) > 0 {
+		allErrs = append(allErrs, ValidateAnnotations(newMeta.GetAnnotations(), fldPath.Child("annotations"))...)
+	}
+	if len(newMeta.GetOwnerReferences()) > 0 {
+		allErrs = append(allErrs, ValidateOwnerReferences(newMeta.GetOwnerReferences(), fldPath.Child("ownerReferences"))...)
+	}
+	if len(newMeta.GetManagedFields()) > 0 {
+		allErrs = append(allErrs, v1validation.ValidateManagedFields(newMeta.GetManagedFields(), fldPath.Child("managedFields"), v1validation.CoveredByDeclarative)...)
+	}
 
 	return allErrs
 }

@@ -60,5 +60,8 @@ func Register() {
 }
 
 func RecordRequestBodySize(ctx context.Context, groupResource schema.GroupResource, verb RequestBodyVerb, size int) {
+	if !RequestBodySizes.IsCreated() {
+		return
+	}
 	RequestBodySizes.WithContext(ctx).WithLabelValues(groupResource.Group, groupResource.Resource, string(verb)).Observe(float64(size))
 }

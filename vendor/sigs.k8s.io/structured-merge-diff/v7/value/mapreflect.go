@@ -70,10 +70,16 @@ func (r mapReflect) Delete(key string) {
 	val.SetMapIndex(r.toMapKey(key), reflect.Value{})
 }
 
+var stringKeyType = reflect.TypeFor[string]()
+
 // TODO: Do we need to support types that implement json.Marshaler and are used as string keys?
 func (r mapReflect) toMapKey(key string) reflect.Value {
 	val := r.Value
-	return reflect.ValueOf(key).Convert(val.Type().Key())
+	kt := val.Type().Key()
+	if kt == stringKeyType {
+		return reflect.ValueOf(key)
+	}
+	return reflect.ValueOf(key).Convert(kt)
 }
 
 func (r mapReflect) Iterate(fn func(string, Value) bool) bool {
@@ -151,6 +157,68 @@ func (r mapReflect) ZipUsing(a Allocator, other Map, order MapTraverseOrder, fn 
 	return defaultMapZip(a, &r, other, order, fn)
 }
 
+func (r mapReflect) ZipVisitorUsing(a Allocator, other Map, order MapTraverseOrder, v MapZipVisitor) bool {
+	if otherMapReflect, ok := other.(*mapReflect); ok && order == Unordered {
+		if r.Empty() && (otherMapReflect == nil || otherMapReflect.Empty()) {
+			return true
+		}
+		lhs := r.Value
+		if lhs.Type() == stringMapType && (otherMapReflect == nil || otherMapReflect.Value.Type() == stringMapType) {
+			lhsMap := lhs.Interface().(map[string]string)
+			var rhsMap map[string]string
+			if otherMapReflect != nil {
+				rhsMap = otherMapReflect.Value.Interface().(map[string]string)
+			}
+			var vlhs, vrhs stringVal
+			for k, rv := range rhsMap {
+				vrhs.s = rv
+				var lhsVal Value
+				if lv, ok := lhsMap[k]; ok {
+					vlhs.s = lv
+					lhsVal = &vlhs
+				}
+				if !v.VisitMapEntry(k, lhsVal, &vrhs) {
+					return false
+				}
+			}
+			for k, lv := range lhsMap {
+				if _, ok := rhsMap[k]; ok {
+					continue
+				}
+				vlhs.s = lv
+				if !v.VisitMapEntry(k, &vlhs, nil) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return r.ZipUsing(a, other, order, v.VisitMapEntry)
+}
+
+type stringVal struct {
+	s string
+}
+
+func (v *stringVal) IsMap() bool                  { return false }
+func (v *stringVal) IsList() bool                 { return false }
+func (v *stringVal) IsBool() bool                 { return false }
+func (v *stringVal) IsInt() bool                  { return false }
+func (v *stringVal) IsFloat() bool                { return false }
+func (v *stringVal) IsString() bool               { return true }
+func (v *stringVal) IsNull() bool                 { return false }
+func (v *stringVal) AsMap() Map                   { panic("not a map") }
+func (v *stringVal) AsMapUsing(Allocator) Map     { panic("not a map") }
+func (v *stringVal) AsList() List                 { panic("not a list") }
+func (v *stringVal) AsListUsing(Allocator) List   { panic("not a list") }
+func (v *stringVal) AsBool() bool                 { panic("not a bool") }
+func (v *stringVal) AsInt() int64                 { panic("not an int") }
+func (v *stringVal) AsFloat() float64             { panic("not a float") }
+func (v *stringVal) AsString() string             { return v.s }
+func (v *stringVal) Unstructured() interface{}    { return v.s }
+
+var stringMapType = reflect.TypeOf(map[string]string(nil))
+
 // unorderedReflectZip provides an optimized unordered zip for mapReflect types.
 func (r mapReflect) unorderedReflectZip(a Allocator, other *mapReflect, fn func(key string, lhs, rhs Value) bool) bool {
 	if r.Empty() && (other == nil || other.Empty()) {
@@ -158,6 +226,35 @@ func (r mapReflect) unorderedReflectZip(a Allocator, other *mapReflect, fn func(
 	}
 
 	lhs := r.Value
+	if lhs.Type() == stringMapType && (other == nil || other.Value.Type() == stringMapType) {
+		lhsMap := lhs.Interface().(map[string]string)
+		var rhsMap map[string]string
+		if other != nil {
+			rhsMap = other.Value.Interface().(map[string]string)
+		}
+		var vlhs, vrhs stringVal
+		for k, rv := range rhsMap {
+			vrhs.s = rv
+			var lhsVal Value
+			if lv, ok := lhsMap[k]; ok {
+				vlhs.s = lv
+				lhsVal = &vlhs
+			}
+			if !fn(k, lhsVal, &vrhs) {
+				return false
+			}
+		}
+		for k, lv := range lhsMap {
+			if _, ok := rhsMap[k]; ok {
+				continue
+			}
+			vlhs.s = lv
+			if !fn(k, &vlhs, nil) {
+				return false
+			}
+		}
+		return true
+	}
 	lhsEntry := TypeReflectEntryOf(lhs.Type().Elem())
 
 	// map lookup via reflection is expensive enough that it is better to keep track of visited keys

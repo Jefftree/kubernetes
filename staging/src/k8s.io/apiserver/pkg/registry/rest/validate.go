@@ -20,8 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"unsafe"
 
 	"k8s.io/apimachinery/pkg/api/operation"
 	"k8s.io/apimachinery/pkg/api/validate"
@@ -122,11 +125,130 @@ type ValidationConfigOption struct {
 // Returns a field.ErrorList containing any validation errors. An internal error
 // is included if requestInfo is missing from the context or if version
 // conversion fails.
+type declarativeConvKey struct {
+	scheme  *runtime.Scheme
+	inType  reflect.Type
+	version schema.GroupVersion
+}
+
+type declarativeConvEntry struct {
+	key     declarativeConvKey
+	outGVK  schema.GroupVersionKind
+	outSize uintptr
+	pool    sync.Pool
+}
+
+type declarativeConvShard struct {
+	mu      sync.Mutex
+	entries [8]*declarativeConvEntry
+	next    uint32
+}
+
+var declarativeConvShards [32]declarativeConvShard
+
+func getDeclarativeConvEntry(scheme *runtime.Scheme, obj runtime.Object, gv schema.GroupVersion) *declarativeConvEntry {
+	if scheme == nil || obj == nil {
+		return nil
+	}
+	inType := reflect.TypeOf(obj)
+	if inType.Kind() != reflect.Pointer || inType.Elem().Kind() != reflect.Struct {
+		return nil
+	}
+	key := declarativeConvKey{scheme: scheme, inType: inType, version: gv}
+	h := (uint64(uintptr(unsafe.Pointer(scheme))) ^ uint64(reflect.ValueOf(inType).Pointer())) * 0x9e3779b97f4a7c15
+	for i := 0; i < len(gv.Version); i++ {
+		h = (h ^ uint64(gv.Version[i])) * 1099511628211
+	}
+	shard := &declarativeConvShards[(h^(h>>16))&31]
+	shard.mu.Lock()
+	for _, e := range shard.entries {
+		if e != nil && e.key == key {
+			shard.mu.Unlock()
+			return e
+		}
+	}
+	shard.mu.Unlock()
+
+	kinds, _, err := scheme.ObjectKinds(obj)
+	if err != nil {
+		return nil
+	}
+	outGVK, ok := gv.KindForGroupVersionKinds(kinds)
+	if !ok {
+		return nil
+	}
+	for _, k := range kinds {
+		if k == outGVK {
+			return nil
+		}
+	}
+	sample, err := scheme.New(outGVK)
+	if err != nil {
+		return nil
+	}
+	outType := reflect.TypeOf(sample)
+	if outType.Kind() != reflect.Pointer || outType.Elem().Kind() != reflect.Struct {
+		return nil
+	}
+	entry := &declarativeConvEntry{
+		key:     key,
+		outGVK:  outGVK,
+		outSize: outType.Elem().Size(),
+	}
+	entry.pool.New = func() any {
+		o, _ := scheme.New(outGVK)
+		return o
+	}
+	entry.pool.Put(sample)
+
+	shard.mu.Lock()
+	shard.entries[shard.next&7] = entry
+	shard.next++
+	shard.mu.Unlock()
+	return entry
+}
+
+func zeroAndPutDeclarativeObj(entry *declarativeConvEntry, obj runtime.Object) {
+	p := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]
+	clear(unsafe.Slice((*byte)(p), entry.outSize))
+	entry.pool.Put(obj)
+}
+
 func validateDeclaratively(ctx context.Context, scheme *runtime.Scheme, obj, oldObj runtime.Object, o *ValidationConfigOption) field.ErrorList {
 	// Find versionedGroupVersion, which identifies the API version to use for declarative validation.
 	versionedGroupVersion, subresources, err := requestInfo(ctx, o.SubresourceGVKMapper)
 	if err != nil {
 		return field.ErrorList{field.InternalError(nil, err)}
+	}
+	if entry := getDeclarativeConvEntry(scheme, obj, versionedGroupVersion); entry != nil {
+		versionedObj := entry.pool.Get().(runtime.Object)
+		defer zeroAndPutDeclarativeObj(entry, versionedObj)
+		if err := scheme.Convert(obj, versionedObj, nil); err != nil {
+			return field.ErrorList{field.InternalError(nil, fmt.Errorf("unexpected error converting to versioned type: %w", err))}
+		}
+		if entry.outGVK.Version == runtime.APIVersionInternal {
+			versionedObj.GetObjectKind().SetGroupVersionKind(schema.GroupVersionKind{})
+		} else {
+			versionedObj.GetObjectKind().SetGroupVersionKind(entry.outGVK)
+		}
+		switch o.OpType {
+		case operation.Create:
+			return scheme.Validate(ctx, o.Options, versionedObj, subresources...)
+		case operation.Update:
+			if oldObj != nil && reflect.TypeOf(oldObj) == entry.key.inType {
+				versionedOldObj := entry.pool.Get().(runtime.Object)
+				defer zeroAndPutDeclarativeObj(entry, versionedOldObj)
+				if err := scheme.Convert(oldObj, versionedOldObj, nil); err != nil {
+					return field.ErrorList{field.InternalError(nil, fmt.Errorf("unexpected error converting to versioned type: %w", err))}
+				}
+				if entry.outGVK.Version == runtime.APIVersionInternal {
+					versionedOldObj.GetObjectKind().SetGroupVersionKind(schema.GroupVersionKind{})
+				} else {
+					versionedOldObj.GetObjectKind().SetGroupVersionKind(entry.outGVK)
+				}
+				return scheme.ValidateUpdate(ctx, o.Options, versionedObj, versionedOldObj, subresources...)
+			}
+		}
 	}
 	versionedObj, err := scheme.UnsafeConvertToVersion(obj, versionedGroupVersion)
 	if err != nil {
@@ -388,22 +510,43 @@ func WithAllDeclarativeEnforcedForTest(ctx context.Context) context.Context {
 //
 // For testing purposes, WithAllDeclarativeEnforcedForTest enforces all declarative validations regardless
 // of lifecycle and filters all covered handwritten validations.
+func runDeclarativeValidationWithRecoverLazy(ctx context.Context, scheme *runtime.Scheme, obj, oldObj runtime.Object, opType operation.Type, config DeclarativeValidationConfig) (errs field.ErrorList) {
+	defer func() {
+		if r := recover(); r != nil {
+			validationIdentifier, _ := metricIdentifier(ctx, scheme, obj, opType)
+			validationmetrics.Metrics.IncDeclarativeValidationPanicMetric(validationIdentifier)
+			errs = append(errs, field.InternalError(nil, fmt.Errorf("panic during declarative validation: %v", r)))
+		}
+	}()
+	cfg := ValidationConfigOption{
+		OpType:                      opType,
+		DeclarativeValidationConfig: config,
+	}
+	return validateDeclaratively(ctx, scheme, obj, oldObj, &cfg)
+}
+
 func ValidateDeclarativelyWithMigrationChecks(ctx context.Context, scheme *runtime.Scheme, obj, oldObj runtime.Object, errs field.ErrorList, opType operation.Type, config DeclarativeValidationConfig) field.ErrorList {
 	// These errors must be errors returned by the handwritten validation.
-	errs = errs.MarkFromImperative()
+	if len(errs) > 0 {
+		errs = errs.MarkFromImperative()
+	}
+
+	declarativeErrs := runDeclarativeValidationWithRecoverLazy(ctx, scheme, obj, oldObj, opType, config)
+	if len(errs) == 0 && len(declarativeErrs) == 0 {
+		return errs
+	}
+
 	validationIdentifier, err := metricIdentifier(ctx, scheme, obj, opType)
 	if err != nil {
 		// Log the error, but continue with the best-effort identifier.
 		klog.FromContext(ctx).Error(err, "failed to generate complete validation identifier for declarative validation")
 	}
 
-	cfg := &ValidationConfigOption{
+	cfg := ValidationConfigOption{
 		OpType:                      opType,
 		ValidationIdentifier:        validationIdentifier,
 		DeclarativeValidationConfig: config,
 	}
-
-	declarativeErrs := runDeclarativeValidationWithRecover(ctx, scheme, obj, oldObj, cfg)
 
 	betaEnabled := utilfeature.DefaultFeatureGate.Enabled(features.DeclarativeValidationBeta)
 	if utilfeature.DefaultFeatureGate.Enabled(features.DeclarativeValidation) {
@@ -415,7 +558,7 @@ func ValidateDeclarativelyWithMigrationChecks(ctx context.Context, scheme *runti
 				mismatchCandidateErrs = append(mismatchCandidateErrs, err)
 			}
 		}
-		compareDeclarativeErrorsAndEmitMismatches(ctx, errs, mismatchCandidateErrs, validationIdentifier, betaEnabled, *cfg)
+		compareDeclarativeErrorsAndEmitMismatches(ctx, errs, mismatchCandidateErrs, validationIdentifier, betaEnabled, cfg)
 	}
 
 	// Collect the declarative errors that are enforced (i.e. surfaced to the user) in the current mode.

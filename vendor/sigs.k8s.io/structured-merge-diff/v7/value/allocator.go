@@ -91,25 +91,25 @@ func (p *heapAllocator) Free(_ any) {}
 // for all temporary value access.
 func NewFreelistAllocator() Allocator {
 	return &freelistAllocator{
-		valueUnstructured: &freelist[*valueUnstructured]{new: func() *valueUnstructured {
+		valueUnstructured: &freelist[*valueUnstructured]{list: make([]*valueUnstructured, 0, 8), new: func() *valueUnstructured {
 			return &valueUnstructured{}
 		}},
-		listUnstructuredRange: &freelist[*listUnstructuredRange]{new: func() *listUnstructuredRange {
+		listUnstructuredRange: &freelist[*listUnstructuredRange]{list: make([]*listUnstructuredRange, 0, 4), new: func() *listUnstructuredRange {
 			return &listUnstructuredRange{vv: &valueUnstructured{}}
 		}},
-		valueReflect: &freelist[*valueReflect]{new: func() *valueReflect {
+		valueReflect: &freelist[*valueReflect]{list: make([]*valueReflect, 0, 16), new: func() *valueReflect {
 			return &valueReflect{}
 		}},
-		mapReflect: &freelist[*mapReflect]{new: func() *mapReflect {
+		mapReflect: &freelist[*mapReflect]{list: make([]*mapReflect, 0, 8), new: func() *mapReflect {
 			return &mapReflect{}
 		}},
-		structReflect: &freelist[*structReflect]{new: func() *structReflect {
+		structReflect: &freelist[*structReflect]{list: make([]*structReflect, 0, 16), new: func() *structReflect {
 			return &structReflect{}
 		}},
-		listReflect: &freelist[*listReflect]{new: func() *listReflect {
+		listReflect: &freelist[*listReflect]{list: make([]*listReflect, 0, 8), new: func() *listReflect {
 			return &listReflect{}
 		}},
-		listReflectRange: &freelist[*listReflectRange]{new: func() *listReflectRange {
+		listReflectRange: &freelist[*listReflectRange]{list: make([]*listReflectRange, 0, 4), new: func() *listReflectRange {
 			return &listReflectRange{vr: &valueReflect{}}
 		}},
 	}

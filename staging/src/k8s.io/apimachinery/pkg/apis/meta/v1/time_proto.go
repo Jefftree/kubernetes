@@ -54,7 +54,8 @@ func (m *Time) Size() (n int) {
 	if m == nil || m.Time.IsZero() {
 		return 0
 	}
-	return m.ProtoTime().Size()
+	ts := Timestamp{Seconds: m.Time.Unix()}
+	return ts.Size()
 }
 
 // Reset implements the protobuf marshalling interface.
@@ -80,7 +81,8 @@ func (m *Time) Marshal() (data []byte, err error) {
 	if m == nil || m.Time.IsZero() {
 		return nil, nil
 	}
-	return m.ProtoTime().Marshal()
+	ts := Timestamp{Seconds: m.Time.Unix()}
+	return ts.Marshal()
 }
 
 // MarshalTo implements the protobuf marshaling interface.
@@ -88,7 +90,8 @@ func (m *Time) MarshalTo(data []byte) (int, error) {
 	if m == nil || m.Time.IsZero() {
 		return 0, nil
 	}
-	return m.ProtoTime().MarshalTo(data)
+	ts := Timestamp{Seconds: m.Time.Unix()}
+	return ts.MarshalTo(data)
 }
 
 // MarshalToSizedBuffer implements the protobuf reverse marshaling interface.
@@ -96,5 +99,6 @@ func (m *Time) MarshalToSizedBuffer(data []byte) (int, error) {
 	if m == nil || m.Time.IsZero() {
 		return 0, nil
 	}
-	return m.ProtoTime().MarshalToSizedBuffer(data)
+	ts := Timestamp{Seconds: m.Time.Unix()}
+	return ts.MarshalToSizedBuffer(data)
 }

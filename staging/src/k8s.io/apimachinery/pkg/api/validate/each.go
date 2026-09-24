@@ -17,9 +17,12 @@ limitations under the License.
 package validate
 
 import (
+	"bytes"
 	"context"
+	"reflect"
 	"slices"
 	"sort"
+	"unsafe"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/operation"
@@ -292,6 +295,72 @@ func PtrSliceUnique[T any](_ context.Context, _ operation.Operation, fldPath *fi
 // constraints of MatchFunc while leveraging the underlying semantic equality
 // logic. It can be used by any other function that needs to call DeepEqual.
 func SemanticDeepEqual[T any](a, b T) bool {
+	if unsafe.Sizeof(a) > 0 && bytes.Equal(
+		unsafe.Slice((*byte)(unsafe.Pointer(&a)), unsafe.Sizeof(a)),
+		unsafe.Slice((*byte)(unsafe.Pointer(&b)), unsafe.Sizeof(b)),
+	) {
+		return true
+	}
+	t := reflect.TypeFor[T]()
+	switch t.Kind() {
+	case reflect.Pointer:
+		p1 := *(*unsafe.Pointer)(unsafe.Pointer(&a))
+		p2 := *(*unsafe.Pointer)(unsafe.Pointer(&b))
+		if p1 == p2 {
+			return true
+		}
+		if p1 == nil || p2 == nil {
+			return false
+		}
+		elemType := t.Elem()
+		if elemSize := elemType.Size(); elemSize > 0 && bytes.Equal(
+			unsafe.Slice((*byte)(p1), elemSize),
+			unsafe.Slice((*byte)(p2), elemSize),
+		) {
+			return true
+		}
+		return equality.Semantic.DeepEqualValue(
+			reflect.NewAt(elemType, p1).Elem(),
+			reflect.NewAt(elemType, p2).Elem(),
+		)
+	case reflect.Slice:
+		type sliceHeader struct {
+			Data unsafe.Pointer
+			Len  int
+			Cap  int
+		}
+		shA := (*sliceHeader)(unsafe.Pointer(&a))
+		shB := (*sliceHeader)(unsafe.Pointer(&b))
+		if shA.Len != shB.Len {
+			return false
+		}
+		if shA.Len == 0 || shA.Data == shB.Data {
+			return true
+		}
+		elemType := t.Elem()
+		if elemSize := elemType.Size(); elemSize > 0 {
+			if bytes.Equal(
+				unsafe.Slice((*byte)(shA.Data), uintptr(shA.Len)*elemSize),
+				unsafe.Slice((*byte)(shB.Data), uintptr(shB.Len)*elemSize),
+			) {
+				return true
+			}
+			for i := 0; i < shA.Len; i++ {
+				p1 := unsafe.Add(shA.Data, uintptr(i)*elemSize)
+				p2 := unsafe.Add(shB.Data, uintptr(i)*elemSize)
+				if bytes.Equal(unsafe.Slice((*byte)(p1), elemSize), unsafe.Slice((*byte)(p2), elemSize)) {
+					continue
+				}
+				if !equality.Semantic.DeepEqualValue(
+					reflect.NewAt(elemType, p1).Elem(),
+					reflect.NewAt(elemType, p2).Elem(),
+				) {
+					return false
+				}
+			}
+			return true
+		}
+	}
 	return equality.Semantic.DeepEqual(a, b)
 }
 

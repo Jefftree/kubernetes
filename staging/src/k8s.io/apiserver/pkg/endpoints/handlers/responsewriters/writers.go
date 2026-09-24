@@ -24,7 +24,9 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
+	"unsafe"
 
 	"go.opentelemetry.io/otel/attribute"
 
@@ -84,39 +86,62 @@ func StreamObject(statusCode int, gv schema.GroupVersion, s runtime.NegotiatedSe
 	io.Copy(writer, out)
 }
 
+var deferredResponseWriterPool = sync.Pool{
+	New: func() any {
+		return &deferredResponseWriter{}
+	},
+}
+
 // SerializeObject renders an object in the content type negotiated by the client using the provided encoder.
 // The context is optional and can be nil. This method will perform optional content compression if requested by
 // a client and the feature gate for APIResponseCompression is enabled.
 func SerializeObject(mediaType string, encoder runtime.Encoder, hw http.ResponseWriter, req *http.Request, statusCode int, object runtime.Object) {
 	ctx := req.Context()
-	ctx, span := tracing.Start(ctx, "SerializeObject",
-		attribute.String("audit-id", audit.GetAuditIDTruncated(ctx)),
-		attribute.String("method", req.Method),
-		attribute.String("url", req.URL.Path),
-		attribute.String("protocol", req.Proto),
-		attribute.String("mediaType", mediaType),
-		attribute.String("encoder", string(encoder.Identifier())))
-	req = req.WithContext(ctx)
-	defer span.End(5 * time.Second)
-
-	w := &deferredResponseWriter{
-		mediaType:       mediaType,
-		statusCode:      statusCode,
-		contentEncoding: responseContentEncodingSupported(req),
-		hw:              hw,
-		ctx:             ctx,
+	if tracing.IsEnabled(ctx) {
+		var span *tracing.Span
+		ctx, span = tracing.Start(ctx, "SerializeObject",
+			attribute.String("audit-id", audit.GetAuditIDTruncated(ctx)),
+			attribute.String("method", req.Method),
+			attribute.String("url", req.URL.Path),
+			attribute.String("protocol", req.Proto),
+			attribute.String("mediaType", mediaType),
+			attribute.String("encoder", string(encoder.Identifier())))
+		req = req.WithContext(ctx)
+		defer span.End(5 * time.Second)
 	}
 
-	var memoryAllocator runtime.MemoryAllocator
+	w := deferredResponseWriterPool.Get().(*deferredResponseWriter)
+	w.mediaType = mediaType
+	w.statusCode = statusCode
+	w.contentEncoding = responseContentEncodingSupported(req)
+	w.hw = hw
+	w.ctx = ctx
+	w.hasWritten = false
+	w.hasBuffered = false
+	w.totalBytes = 0
+	w.lastWriteErr = nil
+	if w.buffer != nil {
+		w.buffer = w.buffer[:0]
+	}
+	defer func() {
+		w.hw = nil
+		w.w = nil
+		w.ctx = nil
+		w.lastWriteErr = nil
+		if cap(w.buffer) > defaultGzipThresholdBytes {
+			w.buffer = nil
+		}
+		deferredResponseWriterPool.Put(w)
+	}()
+
+	var err error
 	if encoderWithAllocator, supportsAllocator := encoder.(runtime.EncoderWithAllocator); supportsAllocator {
-		memoryAllocator = runtime.AllocatorPool.Get().(*runtime.Allocator)
-		encoder = runtime.NewEncoderWithAllocator(encoderWithAllocator, memoryAllocator)
-	}
-	if memoryAllocator != nil {
+		memoryAllocator := runtime.AllocatorPool.Get().(*runtime.Allocator)
 		defer runtime.AllocatorPool.Put(memoryAllocator)
+		err = encoderWithAllocator.EncodeWithAllocator(object, w, memoryAllocator)
+	} else {
+		err = encoder.Encode(object, w)
 	}
-
-	err := encoder.Encode(object, w)
 	if err == nil {
 		err = w.Close()
 		if err != nil {
@@ -247,15 +272,38 @@ func (w *deferredResponseWriter) unbufferedWrite(p []byte) (n int, err error) {
 		w.w = hw
 	}
 
-	span := tracing.SpanFromContext(w.ctx)
-	span.AddEvent("About to start writing response",
-		attribute.String("writer", fmt.Sprintf("%T", w.w)),
-		attribute.Int("size", len(p)),
-	)
+	if span := tracing.SpanFromContext(w.ctx); span != nil {
+		span.AddEvent("About to start writing response",
+			attribute.String("writer", fmt.Sprintf("%T", w.w)),
+			attribute.Int("size", len(p)),
+		)
+	}
 
-	header.Set("Content-Type", w.mediaType)
+	header["Content-Type"] = mediaTypeHeaderSlice(w.mediaType)
 	hw.WriteHeader(w.statusCode)
 	return w.w.Write(p)
+}
+
+var (
+	protobufMediaTypeHeaderSlice = []string{runtime.ContentTypeProtobuf}[:1:1]
+	jsonMediaTypeHeaderSlice     = []string{runtime.ContentTypeJSON}[:1:1]
+	yamlMediaTypeHeaderSlice     = []string{runtime.ContentTypeYAML}[:1:1]
+	cborMediaTypeHeaderSlice     = []string{runtime.ContentTypeCBOR}[:1:1]
+)
+
+func mediaTypeHeaderSlice(mediaType string) []string {
+	switch mediaType {
+	case runtime.ContentTypeProtobuf:
+		return protobufMediaTypeHeaderSlice
+	case runtime.ContentTypeJSON:
+		return jsonMediaTypeHeaderSlice
+	case runtime.ContentTypeYAML:
+		return yamlMediaTypeHeaderSlice
+	case runtime.ContentTypeCBOR:
+		return cborMediaTypeHeaderSlice
+	default:
+		return []string{mediaType}[:1:1]
+	}
 }
 
 func (w *deferredResponseWriter) Close() (err error) {
@@ -265,6 +313,9 @@ func (w *deferredResponseWriter) Close() (err error) {
 		}
 
 		span := tracing.SpanFromContext(w.ctx)
+		if span == nil {
+			return
+		}
 
 		if w.lastWriteErr != nil {
 			span.AddEvent("Write call failed",
@@ -282,7 +333,7 @@ func (w *deferredResponseWriter) Close() (err error) {
 		}
 		// never reached defaultGzipThresholdBytes, no need to do the gzip writer cleanup
 		_, err := w.unbufferedWrite(w.buffer)
-		w.buffer = nil
+		w.buffer = w.buffer[:0]
 		return err
 	}
 
@@ -293,6 +344,96 @@ func (w *deferredResponseWriter) Close() (err error) {
 		gzipPool.Put(t)
 	}
 	return err
+}
+
+type gvInterfaceEntry struct {
+	gv  schema.GroupVersion
+	gvr runtime.GroupVersioner
+}
+
+var (
+	gvInterfaceMu      sync.Mutex
+	gvInterfaceEntries [32]gvInterfaceEntry
+	gvInterfaceNext    uint32
+)
+
+func cachedGroupVersioner(gv schema.GroupVersion) runtime.GroupVersioner {
+	gvInterfaceMu.Lock()
+	for i := range gvInterfaceEntries {
+		e := &gvInterfaceEntries[i]
+		if e.gvr != nil && e.gv == gv {
+			res := e.gvr
+			gvInterfaceMu.Unlock()
+			return res
+		}
+	}
+	var res runtime.GroupVersioner = gv
+	gvInterfaceEntries[gvInterfaceNext&31] = gvInterfaceEntry{gv: gv, gvr: res}
+	gvInterfaceNext++
+	gvInterfaceMu.Unlock()
+	return res
+}
+
+type writerIfaceWords struct {
+	typ  uintptr
+	data uintptr
+}
+
+func writerIfaceKey(v any) writerIfaceWords {
+	return *(*writerIfaceWords)(unsafe.Pointer(&v))
+}
+
+type negotiatedEncoderCacheEntry struct {
+	sKey    writerIfaceWords
+	serKey  writerIfaceWords
+	s       runtime.NegotiatedSerializer
+	ser     runtime.Serializer
+	gv      schema.GroupVersion
+	cbor    bool
+	encoder runtime.Encoder
+}
+
+var (
+	negotiatedEncoderCacheMu   sync.RWMutex
+	negotiatedEncoderCache     [64]negotiatedEncoderCacheEntry
+	negotiatedEncoderCacheNext uint32
+)
+
+func cachedEncoderForVersion(s runtime.NegotiatedSerializer, ser runtime.Serializer, gv schema.GroupVersion, cbor bool) runtime.Encoder {
+	sKey := writerIfaceKey(s)
+	serKey := writerIfaceKey(ser)
+	negotiatedEncoderCacheMu.RLock()
+	for i := range negotiatedEncoderCache {
+		e := &negotiatedEncoderCache[i]
+		if e.encoder != nil && e.sKey == sKey && e.serKey == serKey && e.gv == gv && e.cbor == cbor {
+			enc := e.encoder
+			negotiatedEncoderCacheMu.RUnlock()
+			return enc
+		}
+	}
+	negotiatedEncoderCacheMu.RUnlock()
+
+	gvr := cachedGroupVersioner(gv)
+	var enc runtime.Encoder
+	if cbor {
+		enc = s.EncoderForVersion(runtime.UseNondeterministicEncoding(ser), gvr)
+	} else {
+		enc = s.EncoderForVersion(ser, gvr)
+	}
+	negotiatedEncoderCacheMu.Lock()
+	idx := negotiatedEncoderCacheNext & uint32(len(negotiatedEncoderCache)-1)
+	negotiatedEncoderCacheNext++
+	negotiatedEncoderCache[idx] = negotiatedEncoderCacheEntry{
+		sKey:    sKey,
+		serKey:  serKey,
+		s:       s,
+		ser:     ser,
+		gv:      gv,
+		cbor:    cbor,
+		encoder: enc,
+	}
+	negotiatedEncoderCacheMu.Unlock()
+	return enc
 }
 
 // WriteObjectNegotiated renders an object in the content type negotiated by the client.
@@ -321,19 +462,18 @@ func WriteObjectNegotiated(s runtime.NegotiatedSerializer, restrictions negotiat
 
 	audit.LogResponseObject(req.Context(), object, gv, s)
 
-	var encoder runtime.Encoder
-	if utilfeature.DefaultFeatureGate.Enabled(features.CBORServingAndStorage) {
-		encoder = s.EncoderForVersion(runtime.UseNondeterministicEncoding(serializer.Serializer), gv)
-	} else {
-		encoder = s.EncoderForVersion(serializer.Serializer, gv)
+	encoder := cachedEncoderForVersion(s, serializer.Serializer, gv, utilfeature.DefaultFeatureGate.Enabled(features.CBORServingAndStorage))
+	outMediaType := serializer.MediaType
+	if listGVKInContentType {
+		outMediaType = generateMediaTypeWithGVK(serializer.MediaType, mediaType.Convert)
 	}
-	request.TrackSerializeResponseObjectLatency(req.Context(), func() {
-		if listGVKInContentType {
-			SerializeObject(generateMediaTypeWithGVK(serializer.MediaType, mediaType.Convert), encoder, w, req, statusCode, object)
-		} else {
-			SerializeObject(serializer.MediaType, encoder, w, req, statusCode, object)
-		}
-	})
+	if tracker, ok := request.LatencyTrackersFrom(req.Context()); ok {
+		start := time.Now()
+		SerializeObject(outMediaType, encoder, w, req, statusCode, object)
+		tracker.SerializationTracker.TrackDuration(time.Since(start))
+	} else {
+		SerializeObject(outMediaType, encoder, w, req, statusCode, object)
+	}
 }
 
 func generateMediaTypeWithGVK(mediaType string, gvk *schema.GroupVersionKind) string {

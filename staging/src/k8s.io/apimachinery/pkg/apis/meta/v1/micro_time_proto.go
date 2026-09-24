@@ -41,7 +41,9 @@ func (m *MicroTime) Size() (n int) {
 	if m == nil || m.Time.IsZero() {
 		return 0
 	}
-	return m.ProtoMicroTime().Size()
+	truncatedNanoseconds := time.Duration(m.Time.Nanosecond()).Truncate(time.Microsecond)
+	ts := Timestamp{Seconds: m.Time.Unix(), Nanos: int32(truncatedNanoseconds)}
+	return ts.Size()
 }
 
 // Reset implements the protobuf marshalling interface.
@@ -66,7 +68,9 @@ func (m *MicroTime) Marshal() (data []byte, err error) {
 	if m == nil || m.Time.IsZero() {
 		return nil, nil
 	}
-	return m.ProtoMicroTime().Marshal()
+	truncatedNanoseconds := time.Duration(m.Time.Nanosecond()).Truncate(time.Microsecond)
+	ts := Timestamp{Seconds: m.Time.Unix(), Nanos: int32(truncatedNanoseconds)}
+	return ts.Marshal()
 }
 
 // MarshalTo implements the protobuf marshalling interface.
@@ -74,7 +78,9 @@ func (m *MicroTime) MarshalTo(data []byte) (int, error) {
 	if m == nil || m.Time.IsZero() {
 		return 0, nil
 	}
-	return m.ProtoMicroTime().MarshalTo(data)
+	truncatedNanoseconds := time.Duration(m.Time.Nanosecond()).Truncate(time.Microsecond)
+	ts := Timestamp{Seconds: m.Time.Unix(), Nanos: int32(truncatedNanoseconds)}
+	return ts.MarshalTo(data)
 }
 
 // MarshalToSizedBuffer implements the protobuf marshalling interface.
@@ -82,5 +88,7 @@ func (m *MicroTime) MarshalToSizedBuffer(data []byte) (int, error) {
 	if m == nil || m.Time.IsZero() {
 		return 0, nil
 	}
-	return m.ProtoMicroTime().MarshalToSizedBuffer(data)
+	truncatedNanoseconds := time.Duration(m.Time.Nanosecond()).Truncate(time.Microsecond)
+	ts := Timestamp{Seconds: m.Time.Unix(), Nanos: int32(truncatedNanoseconds)}
+	return ts.MarshalToSizedBuffer(data)
 }

@@ -45,7 +45,11 @@ type Converter struct {
 
 	// Set of conversions that should be treated as a no-op
 	ignoredUntypedConversions map[typePair]struct{}
+
+	defaultScope scope
 }
+
+var defaultMeta = &Meta{}
 
 // NewConverter creates a new Converter object.
 // Arg NameFunc is just for backward compatibility.
@@ -55,6 +59,7 @@ func NewConverter(NameFunc) *Converter {
 		generatedConversionFuncs:  NewConversionFuncs(),
 		ignoredUntypedConversions: make(map[typePair]struct{}),
 	}
+	c.defaultScope = scope{converter: c, meta: defaultMeta}
 	c.RegisterUntypedConversionFunc(
 		(*[]byte)(nil), (*[]byte)(nil),
 		func(a, b interface{}, s Scope) error {
@@ -69,12 +74,13 @@ func NewConverter(NameFunc) *Converter {
 func (c *Converter) WithConversions(fns ConversionFuncs) *Converter {
 	copied := *c
 	copied.conversionFuncs = c.conversionFuncs.Merge(fns)
+	copied.defaultScope = scope{converter: &copied, meta: defaultMeta}
 	return &copied
 }
 
 // DefaultMeta returns meta for a given type.
 func (c *Converter) DefaultMeta(t reflect.Type) *Meta {
-	return &Meta{}
+	return defaultMeta
 }
 
 // Convert_Slice_byte_To_Slice_byte prevents recursing into every byte
@@ -197,9 +203,14 @@ func (c *Converter) RegisterIgnoredConversion(from, to interface{}) error {
 // Not safe for objects with cyclic references!
 func (c *Converter) Convert(src, dest interface{}, meta *Meta) error {
 	pair := typePair{reflect.TypeOf(src), reflect.TypeOf(dest)}
-	scope := &scope{
-		converter: c,
-		meta:      meta,
+	var s Scope
+	if (meta == nil || meta == defaultMeta) && c.defaultScope.converter == c {
+		s = &c.defaultScope
+	} else {
+		s = &scope{
+			converter: c,
+			meta:      meta,
+		}
 	}
 
 	// ignore conversions of this type
@@ -207,10 +218,10 @@ func (c *Converter) Convert(src, dest interface{}, meta *Meta) error {
 		return nil
 	}
 	if fn, ok := c.conversionFuncs.untyped[pair]; ok {
-		return fn(src, dest, scope)
+		return fn(src, dest, s)
 	}
 	if fn, ok := c.generatedConversionFuncs.untyped[pair]; ok {
-		return fn(src, dest, scope)
+		return fn(src, dest, s)
 	}
 
 	dv, err := EnforcePtr(dest)

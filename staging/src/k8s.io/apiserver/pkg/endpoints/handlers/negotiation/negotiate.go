@@ -256,6 +256,33 @@ func NegotiateMediaTypeOptions(header string, accepted []runtime.SerializerInfo,
 		}, true
 	}
 
+	if !strings.Contains(header, ";") {
+		rem := header
+		for len(rem) > 0 {
+			var clause string
+			clause, rem, _ = strings.Cut(rem, ",")
+			clause = strings.TrimSpace(clause)
+			cType, cSubType, ok := strings.Cut(clause, "/")
+			if !ok {
+				continue
+			}
+			cType = strings.TrimSpace(cType)
+			cSubType = strings.TrimSpace(cSubType)
+			for i := range accepted {
+				accepts := &accepted[i]
+				if (cType == accepts.MediaTypeType && (cSubType == accepts.MediaTypeSubType || cSubType == "*")) ||
+					(cType == "*" && cSubType == "*") {
+					if endpoint.AllowsMediaTypeTransform(accepts.MediaTypeType, accepts.MediaTypeSubType, nil) {
+						return MediaTypeOptions{
+							Accepted: *accepts,
+						}, true
+					}
+				}
+			}
+		}
+		return MediaTypeOptions{}, false
+	}
+
 	clauses := goautoneg.ParseAccept(header)
 	for i := range clauses {
 		clause := &clauses[i]

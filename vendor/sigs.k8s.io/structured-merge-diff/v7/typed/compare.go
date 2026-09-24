@@ -19,11 +19,29 @@ package typed
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
 	"sigs.k8s.io/structured-merge-diff/v7/schema"
 	"sigs.k8s.io/structured-merge-diff/v7/value"
 )
+
+var stringPtrCache [512]atomic.Pointer[string]
+
+func internStringPtr(s string) *string {
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	slot := &stringPtrCache[h&511]
+	if p := slot.Load(); p != nil && *p == s {
+		return p
+	}
+	sCopy := string([]byte(s))
+	slot.Store(&sCopy)
+	return &sCopy
+}
 
 // Comparison is the return value of a TypedValue.Compare() operation.
 //
@@ -101,6 +119,9 @@ type compareWalker struct {
 	spareWalkers *[]*compareWalker
 
 	allocator value.Allocator
+
+	zipMapType *schema.Map
+	zipMapErrs ValidationErrors
 }
 
 // compare compares stuff.
@@ -227,6 +248,102 @@ func (w *compareWalker) visitListItems(t *schema.List, lhs, rhs value.List) (err
 	if lLen > maxLength {
 		maxLength = lLen
 	}
+
+	if lLen <= 16 && rLen <= 16 {
+		var (
+			lItemsBuf [16]value.Value
+			lPEsBuf   [16]fieldpath.PathElement
+			lValid    [16]bool
+			rItemsBuf [16]value.Value
+			rPEsBuf   [16]fieldpath.PathElement
+			rValid    [16]bool
+			hasDups   bool
+		)
+		for i := 0; i < lLen; i++ {
+			child := lhs.AtUsing(w.allocator, i)
+			lItemsBuf[i] = child
+			pe, err := listItemToPathElement(w.allocator, w.schema, t, child)
+			if err != nil {
+				errs = append(errs, errorf("element %v: %v", i, err.Error())...)
+				continue
+			}
+			lPEsBuf[i] = pe
+			lValid[i] = true
+			if !hasDups {
+				for k := 0; k < i; k++ {
+					if lValid[k] && lPEsBuf[k].Equals(pe) {
+						hasDups = true
+						break
+					}
+				}
+			}
+		}
+		for j := 0; j < rLen; j++ {
+			rValue := rhs.AtUsing(w.allocator, j)
+			rItemsBuf[j] = rValue
+			pe, err := listItemToPathElement(w.allocator, w.schema, t, rValue)
+			if err != nil {
+				errs = append(errs, errorf("element %v: %v", j, err.Error())...)
+				continue
+			}
+			rPEsBuf[j] = pe
+			rValid[j] = true
+			if !hasDups {
+				for k := 0; k < j; k++ {
+					if rValid[k] && rPEsBuf[k].Equals(pe) {
+						hasDups = true
+						break
+					}
+				}
+			}
+		}
+		if !hasDups {
+			var rMatched uint16
+			for i := 0; i < lLen; i++ {
+				if !lValid[i] {
+					continue
+				}
+				pe := lPEsBuf[i]
+				var rVal value.Value
+				for j := 0; j < rLen; j++ {
+					if rValid[j] && (rMatched&(1<<uint(j))) == 0 && rPEsBuf[j].Equals(pe) {
+						rMatched |= 1 << uint(j)
+						rVal = rItemsBuf[j]
+						break
+					}
+				}
+				errs = append(errs, w.compareListItem(t, pe, lItemsBuf[i], rVal)...)
+			}
+			for j := 0; j < rLen; j++ {
+				if rValid[j] && (rMatched&(1<<uint(j))) == 0 {
+					errs = append(errs, w.compareListItem(t, rPEsBuf[j], nil, rItemsBuf[j])...)
+				}
+			}
+			for i := 0; i < lLen; i++ {
+				if lItemsBuf[i] != nil {
+					w.allocator.Free(lItemsBuf[i])
+				}
+			}
+			for j := 0; j < rLen; j++ {
+				if rItemsBuf[j] != nil {
+					w.allocator.Free(rItemsBuf[j])
+				}
+			}
+			return errs
+		}
+		for i := 0; i < lLen; i++ {
+			if lItemsBuf[i] != nil {
+				w.allocator.Free(lItemsBuf[i])
+			}
+		}
+		for j := 0; j < rLen; j++ {
+			if rItemsBuf[j] != nil {
+				w.allocator.Free(rItemsBuf[j])
+			}
+		}
+		errs = nil
+	}
+
 	// Contains all the unique PEs between lhs and rhs, exactly once.
 	// Order doesn't matter since we're just tracking ownership in a set.
 	allPEs := make([]fieldpath.PathElement, 0, maxLength)
@@ -371,7 +488,10 @@ func (w *compareWalker) compareListItem(t *schema.List, pe fieldpath.PathElement
 	w2 := w.prepareDescent(pe, t.ElementType, w.comparison)
 	w2.lhs = lChild
 	w2.rhs = rChild
-	errs := w2.compare(pe.String)
+	errs := w2.compare(nil)
+	if len(errs) > 0 {
+		errs = errs.WithPrefix(pe.String())
+	}
 	w.finishDescent(w2)
 	return errs
 }
@@ -416,28 +536,63 @@ func (w *compareWalker) doList(t *schema.List) (errs ValidationErrors) {
 	return errs
 }
 
-func (w *compareWalker) visitMapItem(t *schema.Map, out map[string]interface{}, key string, lhs, rhs value.Value) (errs ValidationErrors) {
+func (w *compareWalker) visitMapItem(t *schema.Map, key string, lhs, rhs value.Value) (errs ValidationErrors) {
 	fieldType := t.ElementType
-	if sf, ok := t.FindField(key); ok {
+	var pe fieldpath.PathElement
+	if sf := t.FindFieldPtr(key); sf != nil {
 		fieldType = sf.Type
+		pe.FieldName = &sf.Name
+	} else {
+		if lhs != nil && rhs != nil && lhs.IsString() && rhs.IsString() && lhs.AsString() == rhs.AsString() {
+			if fieldType.Inlined.Scalar != nil && *fieldType.Inlined.Scalar == schema.Scalar("string") {
+				return nil
+			}
+		}
+		pe.FieldName = internStringPtr(key)
 	}
-	pe := fieldpath.PathElement{FieldName: &key}
+	if lhs != nil && rhs != nil && fieldType.Inlined.Scalar != nil {
+		switch *fieldType.Inlined.Scalar {
+		case schema.Scalar("string"):
+			if lhs.IsString() && rhs.IsString() && lhs.AsString() == rhs.AsString() {
+				return nil
+			}
+		case schema.Scalar("numeric"):
+			if lhs.IsInt() && rhs.IsInt() && lhs.AsInt() == rhs.AsInt() {
+				return nil
+			}
+		case schema.Scalar("boolean"):
+			if lhs.IsBool() && rhs.IsBool() && lhs.AsBool() == rhs.AsBool() {
+				return nil
+			}
+		}
+	}
 	w2 := w.prepareDescent(pe, fieldType, w.comparison)
 	w2.lhs = lhs
 	w2.rhs = rhs
-	errs = append(errs, w2.compare(pe.String)...)
+	subErrs := w2.compare(nil)
+	if len(subErrs) > 0 {
+		errs = append(errs, subErrs.WithPrefix(pe.String())...)
+	}
 	w.finishDescent(w2)
 	return errs
 }
 
-func (w *compareWalker) visitMapItems(t *schema.Map, lhs, rhs value.Map) (errs ValidationErrors) {
-	out := map[string]interface{}{}
+func (w *compareWalker) VisitMapEntry(key string, lhsValue, rhsValue value.Value) bool {
+	if subErrs := w.visitMapItem(w.zipMapType, key, lhsValue, rhsValue); len(subErrs) > 0 {
+		w.zipMapErrs = append(w.zipMapErrs, subErrs...)
+	}
+	return true
+}
 
-	value.MapZipUsing(w.allocator, lhs, rhs, value.Unordered, func(key string, lhsValue, rhsValue value.Value) bool {
-		errs = append(errs, w.visitMapItem(t, out, key, lhsValue, rhsValue)...)
-		return true
-	})
-
+func (w *compareWalker) visitMapItems(t *schema.Map, lhs, rhs value.Map) ValidationErrors {
+	prevType := w.zipMapType
+	prevErrs := w.zipMapErrs
+	w.zipMapType = t
+	w.zipMapErrs = nil
+	value.MapZipVisitorUsing(w.allocator, lhs, rhs, value.Unordered, w)
+	errs := w.zipMapErrs
+	w.zipMapType = prevType
+	w.zipMapErrs = prevErrs
 	return errs
 }
 

@@ -29,6 +29,7 @@ import (
 
 	jsonutil "k8s.io/apimachinery/pkg/util/json"
 
+	kjson "sigs.k8s.io/json"
 	"sigs.k8s.io/yaml"
 )
 
@@ -36,6 +37,12 @@ import (
 // If v is a *map[string]interface{}, *[]interface{}, or *interface{} numbers
 // are converted to int64 or float64
 func Unmarshal(data []byte, v interface{}) error {
+	if m, ok := v.(*map[string]interface{}); ok && IsJSONBuffer(data) {
+		if err := kjson.UnmarshalCaseSensitivePreserveInts(data, m); err == nil {
+			return nil
+		}
+		*m = make(map[string]interface{})
+	}
 	preserveIntFloat := func(d *json.Decoder) *json.Decoder {
 		d.UseNumber()
 		return d

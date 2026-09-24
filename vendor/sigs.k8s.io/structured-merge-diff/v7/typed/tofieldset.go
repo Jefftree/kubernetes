@@ -150,18 +150,21 @@ func (v *toFieldSetWalker) doList(t *schema.List) (errs ValidationErrors) {
 
 func (v *toFieldSetWalker) visitMapItems(t *schema.Map, m value.Map) (errs ValidationErrors) {
 	m.Iterate(func(key string, val value.Value) bool {
-		pe := fieldpath.PathElement{FieldName: &key}
-
+		var pe fieldpath.PathElement
 		tr := t.ElementType
-		if sf, ok := t.FindField(key); ok {
+		sf := t.FindFieldPtr(key)
+		if sf != nil {
 			tr = sf.Type
+			pe.FieldName = &sf.Name
+		} else {
+			pe.FieldName = internStringPtr(key)
 		}
 		v2 := v.prepareDescent(pe, tr)
 		v2.value = val
 		errs = append(errs, v2.toFieldSet()...)
 		if val.IsNull() || (val.IsMap() && val.AsMap().Length() == 0) {
 			v2.set.Insert(v2.path)
-		} else if _, ok := t.FindField(key); !ok {
+		} else if sf == nil {
 			v2.set.Insert(v2.path)
 		}
 		v.finishDescent(v2)

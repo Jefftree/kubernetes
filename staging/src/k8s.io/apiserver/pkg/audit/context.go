@@ -58,7 +58,8 @@ type AuditContext struct {
 
 	// event is the audit Event object that is being captured to be written in
 	// the API audit log.
-	event auditinternal.Event
+	event            auditinternal.Event
+	requestObjectVal runtime.Unknown
 
 	// unguarded copy of auditID from the event
 	auditID atomic.Value
@@ -176,12 +177,13 @@ func (ac *AuditContext) LogResponseObject(status *metav1.Status, obj *runtime.Un
 
 // LogRequestPatch fills in the given patch as the request object into an audit event.
 func (ac *AuditContext) LogRequestPatch(patch []byte) {
-	ac.visitEvent(func(ae *auditinternal.Event) {
-		ae.RequestObject = &runtime.Unknown{
-			Raw:         patch,
-			ContentType: runtime.ContentTypeJSON,
-		}
-	})
+	ac.lock.Lock()
+	if ac.event.RequestObject == nil {
+		ac.event.RequestObject = &ac.requestObjectVal
+	}
+	ac.event.RequestObject.Raw = patch
+	ac.event.RequestObject.ContentType = runtime.ContentTypeJSON
+	ac.lock.Unlock()
 }
 
 // GetEventUser returns a copy of the User associated with the audit Event.

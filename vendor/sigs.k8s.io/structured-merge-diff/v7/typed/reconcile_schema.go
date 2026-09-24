@@ -19,10 +19,19 @@ package typed
 import (
 	"fmt"
 	"sync"
+	"unsafe"
 
 	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
 	"sigs.k8s.io/structured-merge-diff/v7/schema"
 )
+
+func unsafePointerFieldSet(s *fieldpath.Set) unsafe.Pointer {
+	return unsafe.Pointer(s)
+}
+
+func unsafePointerSchema(s *schema.Schema) unsafe.Pointer {
+	return unsafe.Pointer(s)
+}
 
 var fmPool = sync.Pool{
 	New: func() interface{} { return &reconcileWithSchemaWalker{} },
@@ -109,6 +118,21 @@ func (v *reconcileWithSchemaWalker) finishDescent(v2 *reconcileWithSchemaWalker)
 	*v.spareWalkers = append(*v.spareWalkers, v2)
 }
 
+type reconcileCacheEntry struct {
+	fieldset     *fieldpath.Set
+	schema       *schema.Schema
+	namedType    string
+	membersLen   int
+	childrenSize int
+}
+
+const reconcileCacheSize = 2048
+
+var (
+	reconcileCacheMu sync.RWMutex
+	reconcileCache   [reconcileCacheSize]reconcileCacheEntry
+)
+
 // ReconcileFieldSetWithSchema reconciles the a field set with any changes to the
 // object's schema since the field set was written. Returns the reconciled field set, or nil of
 // no changes were made to the field set.
@@ -117,6 +141,26 @@ func (v *reconcileWithSchemaWalker) finishDescent(v2 *reconcileWithSchemaWalker)
 // - changing types from atomic to granular
 // - changing types from granular to atomic
 func ReconcileFieldSetWithSchema(fieldset *fieldpath.Set, tv *TypedValue) (*fieldpath.Set, error) {
+	if fieldset == nil || fieldset.Empty() {
+		return nil, nil
+	}
+	var namedType string
+	if tv.typeRef.NamedType != nil {
+		namedType = *tv.typeRef.NamedType
+	}
+	membersLen := fieldset.Members.Size()
+	childrenSize := fieldset.Children.Size()
+	var slot uint64
+	if namedType != "" {
+		slot = (uint64(uintptr(unsafePointerFieldSet(fieldset)))>>4 ^ uint64(uintptr(unsafePointerSchema(tv.schema)))>>4 ^ uint64(membersLen) ^ (uint64(childrenSize) << 8)) & (reconcileCacheSize - 1)
+		reconcileCacheMu.RLock()
+		entry := reconcileCache[slot]
+		reconcileCacheMu.RUnlock()
+		if entry.fieldset == fieldset && entry.schema == tv.schema && entry.namedType == namedType && entry.membersLen == membersLen && entry.childrenSize == childrenSize {
+			return nil, nil
+		}
+	}
+
 	v := fmPool.Get().(*reconcileWithSchemaWalker)
 	v.fieldSet = fieldset
 	v.value = tv
@@ -141,6 +185,17 @@ func ReconcileFieldSetWithSchema(fieldset *fieldpath.Set, tv *TypedValue) (*fiel
 			out = out.Union(v.toAdd)
 		}
 		return out, nil
+	}
+	if namedType != "" {
+		reconcileCacheMu.Lock()
+		reconcileCache[slot] = reconcileCacheEntry{
+			fieldset:     fieldset,
+			schema:       tv.schema,
+			namedType:    namedType,
+			membersLen:   membersLen,
+			childrenSize: childrenSize,
+		}
+		reconcileCacheMu.Unlock()
 	}
 	return nil, nil
 }

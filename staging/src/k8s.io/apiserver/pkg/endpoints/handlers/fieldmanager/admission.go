@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/util/managedfields"
 	"k8s.io/apiserver/pkg/admission"
@@ -36,6 +37,9 @@ func NewManagedFieldsValidatingAdmissionController(wrap admission.Interface) adm
 	if wrap == nil {
 		return nil
 	}
+	if !admission.HasMutationHandler(wrap, admission.Create) && !admission.HasMutationHandler(wrap, admission.Update) {
+		return wrap
+	}
 	return &managedFieldsValidatingAdmissionController{wrap: wrap}
 }
 
@@ -47,6 +51,11 @@ var _ admission.Interface = &managedFieldsValidatingAdmissionController{}
 var _ admission.MutationInterface = &managedFieldsValidatingAdmissionController{}
 var _ admission.ValidationInterface = &managedFieldsValidatingAdmissionController{}
 
+// Unwrap returns the wrapped admission.Interface.
+func (admit *managedFieldsValidatingAdmissionController) Unwrap() admission.Interface {
+	return admit.wrap
+}
+
 // Handles calls the wrapped admission.Interface if applicable
 func (admit *managedFieldsValidatingAdmissionController) Handles(operation admission.Operation) bool {
 	return admit.wrap.Handles(operation)
@@ -55,6 +64,9 @@ func (admit *managedFieldsValidatingAdmissionController) Handles(operation admis
 // Admit calls the wrapped admission.Interface if applicable and resets the managedFields to their state before admission if they
 // got modified in an invalid way
 func (admit *managedFieldsValidatingAdmissionController) Admit(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) (err error) {
+	if !admission.HasMutationHandler(admit.wrap, a.GetOperation()) {
+		return nil
+	}
 	mutationInterface, isMutationInterface := admit.wrap.(admission.MutationInterface)
 	if !isMutationInterface {
 		return nil
@@ -67,18 +79,71 @@ func (admit *managedFieldsValidatingAdmissionController) Admit(ctx context.Conte
 		return mutationInterface.Admit(ctx, a, o)
 	}
 	managedFieldsBeforeAdmission := objectMeta.GetManagedFields()
+	var beforeEntriesBuf [8]metav1.ManagedFieldsEntry
+	var beforeFieldsV1Buf [8]metav1.FieldsV1
+	var beforeEntries []metav1.ManagedFieldsEntry
+	var beforeFieldsV1 []metav1.FieldsV1
+	if n := len(managedFieldsBeforeAdmission); n > 0 {
+		if n <= len(beforeEntriesBuf) {
+			beforeEntries = beforeEntriesBuf[:n]
+			beforeFieldsV1 = beforeFieldsV1Buf[:n]
+		} else {
+			beforeEntries = make([]metav1.ManagedFieldsEntry, n)
+			beforeFieldsV1 = make([]metav1.FieldsV1, n)
+		}
+		for i := range managedFieldsBeforeAdmission {
+			beforeEntries[i] = managedFieldsBeforeAdmission[i]
+			if managedFieldsBeforeAdmission[i].FieldsV1 != nil {
+				beforeFieldsV1[i] = *managedFieldsBeforeAdmission[i].FieldsV1
+			}
+		}
+	}
 	if err := mutationInterface.Admit(ctx, a, o); err != nil {
 		return err
 	}
 	managedFieldsAfterAdmission := objectMeta.GetManagedFields()
+	if managedFieldsUnchanged(beforeEntries, beforeFieldsV1, managedFieldsAfterAdmission) {
+		return nil
+	}
 	if err := managedfields.ValidateManagedFields(managedFieldsAfterAdmission); err != nil {
-		objectMeta.SetManagedFields(managedFieldsBeforeAdmission)
+		for i := range beforeEntries {
+			if beforeEntries[i].FieldsV1 != nil {
+				f := beforeFieldsV1[i]
+				beforeEntries[i].FieldsV1 = &f
+			}
+		}
+		objectMeta.SetManagedFields(beforeEntries)
 		warning.AddWarning(ctx, "",
 			fmt.Sprintf(InvalidManagedFieldsAfterMutatingAdmissionWarningFormat,
 				err.Error()),
 		)
 	}
 	return nil
+}
+
+func managedFieldsUnchanged(before []metav1.ManagedFieldsEntry, beforeFieldsV1 []metav1.FieldsV1, after []metav1.ManagedFieldsEntry) bool {
+	if len(before) != len(after) {
+		return false
+	}
+	for i := range before {
+		b := &before[i]
+		a := &after[i]
+		if b.Manager != a.Manager ||
+			b.Operation != a.Operation ||
+			b.APIVersion != a.APIVersion ||
+			b.FieldsType != a.FieldsType ||
+			b.Subresource != a.Subresource ||
+			b.Time != a.Time {
+			return false
+		}
+		if (b.FieldsV1 == nil) != (a.FieldsV1 == nil) {
+			return false
+		}
+		if b.FieldsV1 != nil && !beforeFieldsV1[i].Equal(*a.FieldsV1) {
+			return false
+		}
+	}
+	return true
 }
 
 // Validate calls the wrapped admission.Interface if aplicable

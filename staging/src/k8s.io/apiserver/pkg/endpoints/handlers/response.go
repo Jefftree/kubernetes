@@ -312,6 +312,23 @@ func targetEncodingForTransform(scope *RequestScope, mediaType negotiation.Media
 // Will write the complete response object.
 // transformResponseObject is used only for handling non-streaming requests.
 func transformResponseObject(ctx context.Context, scope *RequestScope, req *http.Request, w http.ResponseWriter, statusCode int, mediaType negotiation.MediaTypeOptions, result runtime.Object) {
+	if mediaType.Convert == nil {
+		if meta.IsListType(result) && meta.LenList(result) == 0 {
+			if err := meta.SetList(result, []runtime.Object{}); err != nil {
+				scope.err(err, w, req)
+				return
+			}
+		}
+		if tracker, ok := endpointsrequest.LatencyTrackersFrom(ctx); ok {
+			tracker.TransformTracker.TrackDuration(0)
+		}
+		responsewriters.WriteObjectNegotiated(scope.Serializer, scope, scope.Kind.GroupVersion(), w, req, statusCode, result, false)
+		return
+	}
+	transformResponseObjectSlow(ctx, scope, req, w, statusCode, mediaType, result)
+}
+
+func transformResponseObjectSlow(ctx context.Context, scope *RequestScope, req *http.Request, w http.ResponseWriter, statusCode int, mediaType negotiation.MediaTypeOptions, result runtime.Object) {
 	options, err := optionsForTransform(mediaType, req)
 	if err != nil {
 		scope.err(err, w, req)

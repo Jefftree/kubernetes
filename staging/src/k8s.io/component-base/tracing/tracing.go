@@ -23,21 +23,45 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"k8s.io/klog/v2"
 	utiltrace "k8s.io/utils/trace"
 )
 
 const instrumentationScope = "k8s.io/component-base/tracing"
+
+var noopSpan = &Span{
+	otelSpan: trace.SpanFromContext(context.Background()),
+}
+
+// IsEnabled returns true if OpenTelemetry tracing, utiltrace, or klog V(2) is active for the context.
+func IsEnabled(ctx context.Context) bool {
+	return trace.SpanFromContext(ctx).SpanContext().IsValid() || utiltrace.FromContext(ctx) != nil || klog.V(2).Enabled()
+}
 
 // Start creates spans using both OpenTelemetry, and the k8s.io/utils/trace package.
 // It only creates an OpenTelemetry span if the incoming context already includes a span.
 func Start(ctx context.Context, name string, attributes ...attribute.KeyValue) (context.Context, *Span) {
 	// If the incoming context already includes an OpenTelemetry span, create a child span with the provided name and attributes.
 	// If the caller is not using OpenTelemetry, or has tracing disabled (e.g. with a component-specific feature flag), this is a noop.
-	ctx, otelSpan := trace.SpanFromContext(ctx).TracerProvider().Tracer(instrumentationScope).Start(ctx, name, trace.WithAttributes(attributes...))
-	// If there is already a utiltrace span in the context, use that as our parent span.
-	utilSpan := utiltrace.FromContext(ctx).Nest(name, attributesToFields(attributes)...)
-	// Set the trace as active in the context so that subsequent Start calls create nested spans.
-	return utiltrace.ContextWithTrace(ctx, utilSpan), &Span{
+	parentOtel := trace.SpanFromContext(ctx)
+	otelSpan := parentOtel
+	if parentOtel.SpanContext().IsValid() {
+		ctx, otelSpan = parentOtel.TracerProvider().Tracer(instrumentationScope).Start(ctx, name, trace.WithAttributes(attributes...))
+	}
+	// If there is already a utiltrace span in the context, or klog V(2) is enabled, create a nested/root utiltrace span.
+	var utilSpan *utiltrace.Trace
+	if parentUtil := utiltrace.FromContext(ctx); parentUtil != nil || klog.V(2).Enabled() {
+		if len(attributes) == 0 {
+			utilSpan = parentUtil.Nest(name)
+		} else {
+			utilSpan = parentUtil.Nest(name, attributesToFields(attributes)...)
+		}
+		ctx = utiltrace.ContextWithTrace(ctx, utilSpan)
+	}
+	if !otelSpan.IsRecording() && utilSpan == nil {
+		return ctx, noopSpan
+	}
+	return ctx, &Span{
 		otelSpan: otelSpan,
 		utilSpan: utilSpan,
 	}
@@ -54,15 +78,29 @@ type Span struct {
 
 // AddEvent adds a point-in-time event with a name and attributes.
 func (s *Span) AddEvent(name string, attributes ...attribute.KeyValue) {
-	s.otelSpan.AddEvent(name, trace.WithAttributes(attributes...))
+	if s == nil {
+		return
+	}
+	if s.otelSpan != nil && s.otelSpan.IsRecording() {
+		s.otelSpan.AddEvent(name, trace.WithAttributes(attributes...))
+	}
 	if s.utilSpan != nil {
-		s.utilSpan.Step(name, attributesToFields(attributes)...)
+		if len(attributes) == 0 {
+			s.utilSpan.Step(name)
+		} else {
+			s.utilSpan.Step(name, attributesToFields(attributes)...)
+		}
 	}
 }
 
 // End ends the span, and logs if the span duration is greater than the logThreshold.
 func (s *Span) End(logThreshold time.Duration) {
-	s.otelSpan.End()
+	if s == nil {
+		return
+	}
+	if s.otelSpan != nil && s.otelSpan.IsRecording() {
+		s.otelSpan.End()
+	}
 	if s.utilSpan != nil {
 		s.utilSpan.LogIfLong(logThreshold)
 	}
@@ -71,10 +109,18 @@ func (s *Span) End(logThreshold time.Duration) {
 // RecordError will record err as an exception span event for this span.
 // If this span is not being recorded or err is nil then this method does nothing.
 func (s *Span) RecordError(err error, attributes ...attribute.KeyValue) {
-	s.otelSpan.RecordError(err, trace.WithAttributes(attributes...))
+	if s == nil {
+		return
+	}
+	if err != nil && s.otelSpan != nil && s.otelSpan.IsRecording() {
+		s.otelSpan.RecordError(err, trace.WithAttributes(attributes...))
+	}
 }
 
 func attributesToFields(attributes []attribute.KeyValue) []utiltrace.Field {
+	if len(attributes) == 0 {
+		return nil
+	}
 	fields := make([]utiltrace.Field, len(attributes))
 	for i := range attributes {
 		attr := attributes[i]
@@ -86,9 +132,14 @@ func attributesToFields(attributes []attribute.KeyValue) []utiltrace.Field {
 // SpanFromContext returns the *Span from the current context. It is composed of the active
 // OpenTelemetry and k8s.io/utils/trace spans.
 func SpanFromContext(ctx context.Context) *Span {
+	otelSpan := trace.SpanFromContext(ctx)
+	utilSpan := utiltrace.FromContext(ctx)
+	if !otelSpan.IsRecording() && utilSpan == nil {
+		return noopSpan
+	}
 	return &Span{
-		otelSpan: trace.SpanFromContext(ctx),
-		utilSpan: utiltrace.FromContext(ctx),
+		otelSpan: otelSpan,
+		utilSpan: utilSpan,
 	}
 }
 

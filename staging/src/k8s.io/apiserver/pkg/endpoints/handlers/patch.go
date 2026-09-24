@@ -17,12 +17,16 @@ limitations under the License.
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
+	"sync"
 	"time"
+	"unsafe"
 
 	"go.opentelemetry.io/otel/attribute"
 	jsonpatch "gopkg.in/evanphx/json-patch.v4"
@@ -65,14 +69,122 @@ const (
 	maxJSONPatchOperations = 10000
 )
 
+type patchIfaceWords struct {
+	typ  uintptr
+	data uintptr
+}
+
+func patchIfaceKey(v any) patchIfaceWords {
+	return *(*patchIfaceWords)(unsafe.Pointer(&v))
+}
+
+type patchHandlerCacheEntry struct {
+	rKey       patchIfaceWords
+	scope      *RequestScope
+	admitKey   patchIfaceWords
+	r          rest.Patcher
+	admit      admission.Interface
+	patchTypes []string
+	handler    http.HandlerFunc
+}
+
+var (
+	patchHandlerCacheMu   sync.RWMutex
+	patchHandlerCache     [64]patchHandlerCacheEntry
+	patchHandlerCacheNext uint32
+)
+
 // PatchResource returns a function that will handle a resource patch.
 func PatchResource(r rest.Patcher, scope *RequestScope, admit admission.Interface, patchTypes []string) http.HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request) {
+	rKey := patchIfaceKey(r)
+	admitKey := patchIfaceKey(admit)
+	patchHandlerCacheMu.RLock()
+	for i := range patchHandlerCache {
+		e := &patchHandlerCache[i]
+		if e.handler != nil && e.scope == scope && e.rKey == rKey && e.admitKey == admitKey && len(e.patchTypes) == len(patchTypes) {
+			match := true
+			for j := range patchTypes {
+				if e.patchTypes[j] != patchTypes[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				h := e.handler
+				patchHandlerCacheMu.RUnlock()
+				return h
+			}
+		}
+	}
+	patchHandlerCacheMu.RUnlock()
+
+	patchTypeSet := sets.NewString(patchTypes...)
+	admit = fieldmanager.NewManagedFieldsValidatingAdmissionController(admission.WithAudit(admit))
+	mutatingAdmission, _ := admit.(admission.MutationInterface)
+	hasUpdateValidation := admission.HasValidationHandler(admit, admission.Update)
+	hasCreateValidation := admission.HasValidationHandler(admit, admission.Create)
+
+	var codecCacheMu sync.Mutex
+	var jsonStrictCodec, jsonNonStrictCodec, yamlStrictCodec, yamlNonStrictCodec runtime.Codec
+	getCachedCodec := func(baseContentType string, strict bool) (runtime.Codec, bool) {
+		codecCacheMu.Lock()
+		defer codecCacheMu.Unlock()
+		switch baseContentType {
+		case runtime.ContentTypeJSON:
+			if strict && jsonStrictCodec != nil {
+				return jsonStrictCodec, true
+			}
+			if !strict && jsonNonStrictCodec != nil {
+				return jsonNonStrictCodec, true
+			}
+		case runtime.ContentTypeYAML:
+			if strict && yamlStrictCodec != nil {
+				return yamlStrictCodec, true
+			}
+			if !strict && yamlNonStrictCodec != nil {
+				return yamlNonStrictCodec, true
+			}
+		}
+		s, ok := runtime.SerializerInfoForMediaType(scope.Serializer.SupportedMediaTypes(), baseContentType)
+		if !ok {
+			return nil, false
+		}
+		decodeSerializer := s.Serializer
+		if strict {
+			decodeSerializer = s.StrictSerializer
+		}
+		c := runtime.NewCodec(
+			scope.Serializer.EncoderForVersion(s.Serializer, scope.Kind.GroupVersion()),
+			scope.Serializer.DecoderToVersion(decodeSerializer, scope.HubGroupVersion),
+		)
+		switch baseContentType {
+		case runtime.ContentTypeJSON:
+			if strict {
+				jsonStrictCodec = c
+			} else {
+				jsonNonStrictCodec = c
+			}
+		case runtime.ContentTypeYAML:
+			if strict {
+				yamlStrictCodec = c
+			} else {
+				yamlNonStrictCodec = c
+			}
+		}
+		return c, true
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		ctx := req.Context()
 		// For performance tracking purposes.
-		ctx, span := tracing.Start(ctx, "Patch", traceFields(req)...)
-		req = req.WithContext(ctx)
-		defer span.End(500 * time.Millisecond)
+		var span *tracing.Span
+		if tracing.IsEnabled(ctx) {
+			ctx, span = tracing.Start(ctx, "Patch", traceFields(req)...)
+			req = req.WithContext(ctx)
+			defer span.End(500 * time.Millisecond)
+		} else {
+			_, span = tracing.Start(ctx, "Patch")
+		}
 
 		// Do this first, otherwise name extraction can fail for unrecognized content types
 		// TODO: handle this in negotiation
@@ -84,7 +196,7 @@ func PatchResource(r rest.Patcher, scope *RequestScope, admit admission.Interfac
 		patchType := types.PatchType(contentType)
 
 		// Ensure the patchType is one we support
-		if !sets.NewString(patchTypes...).Has(contentType) {
+		if !patchTypeSet.Has(contentType) {
 			scope.err(negotiation.NewUnsupportedMediaTypeError(patchTypes), w, req)
 			return
 		}
@@ -100,7 +212,9 @@ func PatchResource(r rest.Patcher, scope *RequestScope, admit admission.Interfac
 		ctx, cancel := context.WithTimeout(ctx, requestTimeoutUpperBound)
 		defer cancel()
 
-		ctx = request.WithNamespace(ctx, namespace)
+		if request.NamespaceValue(ctx) != namespace {
+			ctx = request.WithNamespace(ctx, namespace)
+		}
 
 		outputMediaType, _, err := negotiation.NegotiateOutputMediaType(req, scope.Serializer, scope)
 		if err != nil {
@@ -114,22 +228,50 @@ func PatchResource(r rest.Patcher, scope *RequestScope, admit admission.Interfac
 			scope.err(err, w, req)
 			return
 		}
-		span.AddEvent("limitedReadBody succeeded", attribute.Int("len", len(patchBytes)))
+		if tracing.IsEnabled(ctx) {
+			span.AddEvent("limitedReadBody succeeded", attribute.Int("len", len(patchBytes)))
+		}
 
-		options := &metav1.PatchOptions{}
-		if err := metainternalversionscheme.ParameterCodec.DecodeParameters(req.URL.Query(), scope.MetaGroupVersion, options); err != nil {
-			err = errors.NewBadRequest(err.Error())
-			scope.err(err, w, req)
-			return
+		p := patcherPool.Get().(*patcher)
+		p.namer = scope.Namer
+		p.creater = scope.Creater
+		p.defaulter = scope.Defaulter
+		p.typer = scope.Typer
+		p.unsafeConvertor = scope.UnsafeConvertor
+		p.kind = scope.Kind
+		p.resource = scope.Resource
+		p.subresource = scope.Subresource
+		p.objectInterfaces = scope
+		p.hubGroupVersion = scope.HubGroupVersion
+		p.admissionCheck = mutatingAdmission
+		p.restPatcher = r
+		p.name = name
+		p.patchType = patchType
+		p.patchBytes = patchBytes
+		p.userAgent = req.UserAgent()
+		p.stripManagedFieldsOnRetry = false
+		p.forceAllowCreate = false
+		p.optionsVal = metav1.PatchOptions{}
+		options := &p.optionsVal
+		rawQuery := req.URL.RawQuery
+		if len(rawQuery) > 0 {
+			if strings.HasPrefix(rawQuery, "fieldManager=") && !strings.ContainsAny(rawQuery[len("fieldManager="):], "&+%") {
+				options.FieldManager = rawQuery[len("fieldManager="):]
+			} else if err := metainternalversionscheme.ParameterCodec.DecodeParameters(req.URL.Query(), scope.MetaGroupVersion, options); err != nil {
+				err = errors.NewBadRequest(err.Error())
+				scope.err(err, w, req)
+				return
+			}
 		}
 		if errs := validation.ValidatePatchOptions(options, patchType); len(errs) > 0 {
 			err := errors.NewInvalid(schema.GroupKind{Group: metav1.GroupName, Kind: "PatchOptions"}, "", errs)
 			scope.err(err, w, req)
 			return
 		}
-		options.TypeMeta.SetGroupVersionKind(metav1.SchemeGroupVersion.WithKind("PatchOptions"))
-
-		admit = admission.WithAudit(admit)
+		options.TypeMeta = metav1.TypeMeta{
+			APIVersion: "meta.k8s.io/v1",
+			Kind:       "PatchOptions",
+		}
 
 		// Decode and convert the patch payload to JSON for storage into audit.
 		// the decision to reject the request for failure to decode before we record the request for audit.
@@ -142,7 +284,9 @@ func PatchResource(r rest.Patcher, scope *RequestScope, admit admission.Interfac
 		}
 
 		audit.LogRequestPatch(req.Context(), patchForAudit)
-		span.AddEvent("Recorded the audit event")
+		if tracing.IsEnabled(ctx) {
+			span.AddEvent("Recorded the audit event")
+		}
 
 		var baseContentType string
 		switch patchType {
@@ -163,114 +307,119 @@ func PatchResource(r rest.Patcher, scope *RequestScope, admit admission.Interfac
 			baseContentType = runtime.ContentTypeJSON
 		}
 
-		s, ok := runtime.SerializerInfoForMediaType(scope.Serializer.SupportedMediaTypes(), baseContentType)
+		validationDirective := fieldValidation(options.FieldValidation)
+		useStrict := validationDirective == metav1.FieldValidationWarn || validationDirective == metav1.FieldValidationStrict
+		codec, ok := getCachedCodec(baseContentType, useStrict)
 		if !ok {
 			scope.err(fmt.Errorf("no serializer defined for %v", baseContentType), w, req)
 			return
 		}
-		gv := scope.Kind.GroupVersion()
-
-		validationDirective := fieldValidation(options.FieldValidation)
-		decodeSerializer := s.Serializer
-		if validationDirective == metav1.FieldValidationWarn || validationDirective == metav1.FieldValidationStrict {
-			decodeSerializer = s.StrictSerializer
-		}
-
-		codec := runtime.NewCodec(
-			scope.Serializer.EncoderForVersion(s.Serializer, gv),
-			scope.Serializer.DecoderToVersion(decodeSerializer, scope.HubGroupVersion),
-		)
 
 		userInfo, _ := request.UserFrom(ctx)
-		staticCreateAttributes := admission.NewAttributesRecord(
-			nil,
-			nil,
-			scope.Kind,
-			namespace,
-			name,
-			scope.Resource,
-			scope.Subresource,
-			admission.Create,
-			patchToCreateOptions(options),
-			dryrun.IsDryRun(options.DryRun),
-			userInfo)
-		staticUpdateAttributes := admission.NewAttributesRecord(
-			nil,
-			nil,
-			scope.Kind,
-			namespace,
-			name,
-			scope.Resource,
-			scope.Subresource,
-			admission.Update,
-			patchToUpdateOptions(options),
-			dryrun.IsDryRun(options.DryRun),
-			userInfo,
-		)
+		isDryRun := dryrun.IsDryRun(options.DryRun)
 
-		admit = fieldmanager.NewManagedFieldsValidatingAdmissionController(admit)
-
-		mutatingAdmission, _ := admit.(admission.MutationInterface)
-		createAuthorizerAttributes := authorizer.AttributesRecord{
-			User:            userInfo,
-			ResourceRequest: true,
-			Path:            req.URL.Path,
-			Verb:            "create",
-			APIGroup:        scope.Resource.Group,
-			APIVersion:      scope.Resource.Version,
-			Resource:        scope.Resource.Resource,
-			Subresource:     scope.Subresource,
-			Namespace:       namespace,
-			Name:            name,
+		var updateValidation rest.ValidateObjectUpdateFunc
+		if hasUpdateValidation {
+			staticUpdateAttributes := admission.NewAttributesRecord(
+				nil,
+				nil,
+				scope.Kind,
+				namespace,
+				name,
+				scope.Resource,
+				scope.Subresource,
+				admission.Update,
+				patchToUpdateOptions(options),
+				isDryRun,
+				userInfo,
+			)
+			updateValidation = rest.AdmissionToValidateObjectUpdateFunc(admit, staticUpdateAttributes, scope)
 		}
 
-		p := patcher{
-			namer:               scope.Namer,
-			creater:             scope.Creater,
-			defaulter:           scope.Defaulter,
-			typer:               scope.Typer,
-			unsafeConvertor:     scope.UnsafeConvertor,
-			kind:                scope.Kind,
-			resource:            scope.Resource,
-			subresource:         scope.Subresource,
-			dryRun:              dryrun.IsDryRun(options.DryRun),
-			validationDirective: validationDirective,
-
-			objectInterfaces: scope,
-
-			hubGroupVersion: scope.HubGroupVersion,
-
-			createValidation: withAuthorization(rest.AdmissionToValidateObjectFunc(admit, staticCreateAttributes, scope), scope.Authorizer, createAuthorizerAttributes),
-			updateValidation: rest.AdmissionToValidateObjectUpdateFunc(admit, staticUpdateAttributes, scope),
-			admissionCheck:   mutatingAdmission,
-
-			codec: codec,
-
-			options: options,
-
-			restPatcher: r,
-			name:        name,
-			patchType:   patchType,
-			patchBytes:  patchBytes,
-			userAgent:   req.UserAgent(),
+		var createValidation rest.ValidateObjectFunc
+		if patchType != types.ApplyYAMLPatchType && patchType != types.ApplyCBORPatchType {
+			createValidation = rest.ValidateAllObjectFunc
+		} else {
+			createAuthorizerAttributes := authorizer.AttributesRecord{
+				User:            userInfo,
+				ResourceRequest: true,
+				Path:            req.URL.Path,
+				Verb:            "create",
+				APIGroup:        scope.Resource.Group,
+				APIVersion:      scope.Resource.Version,
+				Resource:        scope.Resource.Resource,
+				Subresource:     scope.Subresource,
+				Namespace:       namespace,
+				Name:            name,
+			}
+			var staticCreateAttributes admission.Attributes
+			if hasCreateValidation {
+				staticCreateAttributes = admission.NewAttributesRecord(
+					nil,
+					nil,
+					scope.Kind,
+					namespace,
+					name,
+					scope.Resource,
+					scope.Subresource,
+					admission.Create,
+					patchToCreateOptions(options),
+					isDryRun,
+					userInfo)
+			}
+			createValidation = withAuthorization(rest.AdmissionToValidateObjectFunc(admit, staticCreateAttributes, scope), scope.Authorizer, createAuthorizerAttributes)
 		}
+
+		p.dryRun = isDryRun
+		p.validationDirective = validationDirective
+		p.createValidation = createValidation
+		p.updateValidation = updateValidation
+		p.codec = codec
+		p.options = options
 
 		result, wasCreated, err := p.patchResource(ctx, scope)
+		if !errors.IsTimeout(err) {
+			p.patchBytes = nil
+			p.requestCtx = nil
+			p.mechanism = nil
+			p.smp.schemaReferenceObj = nil
+			p.smp.fieldManager = nil
+			p.jp.fieldManager = nil
+			patcherPool.Put(p)
+		}
 		if err != nil {
 			scope.err(err, w, req)
 			return
 		}
-		span.AddEvent("Object stored in database")
+		if tracing.IsEnabled(ctx) {
+			span.AddEvent("Object stored in database")
+		}
 
 		status := http.StatusOK
 		if wasCreated {
 			status = http.StatusCreated
 		}
 
-		span.AddEvent("About to write a response")
-		defer span.AddEvent("Writing http response done")
+		if tracing.IsEnabled(ctx) {
+			span.AddEvent("About to write a response")
+			defer span.AddEvent("Writing http response done")
+		}
 		transformResponseObject(ctx, scope, req, w, status, outputMediaType, result)
+	})
+	patchHandlerCacheMu.Lock()
+	idx := patchHandlerCacheNext & uint32(len(patchHandlerCache)-1)
+	patchHandlerCacheNext++
+	patchHandlerCache[idx] = patchHandlerCacheEntry{
+		rKey:       rKey,
+		scope:      scope,
+		admitKey:   admitKey,
+		r:          r,
+		admit:      admit,
+		patchTypes: patchTypes,
+		handler:    handler,
 	}
+	patchHandlerCacheMu.Unlock()
+	return handler
 }
 
 type mutateObjectUpdateFunc func(ctx context.Context, obj, old runtime.Object) error
@@ -304,7 +453,9 @@ type patcher struct {
 
 	codec runtime.Codec
 
-	options *metav1.PatchOptions
+	options          *metav1.PatchOptions
+	optionsVal       metav1.PatchOptions
+	updateOptionsVal metav1.UpdateOptions
 
 	// Operation information
 	restPatcher rest.Patcher
@@ -314,10 +465,60 @@ type patcher struct {
 	userAgent   string
 
 	// Set at invocation-time (by applyPatch) and immutable thereafter
-	namespace         string
-	updatedObjectInfo rest.UpdatedObjectInfo
-	mechanism         patchMechanism
-	forceAllowCreate  bool
+	namespace                 string
+	requestCtx                context.Context
+	stripManagedFieldsOnRetry bool
+	updatedObjectInfo         rest.UpdatedObjectInfo
+	mechanism                 patchMechanism
+	jp                        jsonPatcher
+	smp                       smpPatcher
+	forceAllowCreate          bool
+	updateOptionsPtr          *metav1.UpdateOptions
+	wasCreated                bool
+	runUpdateFn               finisher.ResultFunc
+}
+
+var patcherPool = sync.Pool{
+	New: func() any {
+		p := &patcher{}
+		p.runUpdateFn = p.runUpdate
+		return p
+	},
+}
+
+func (p *patcher) runUpdate() (runtime.Object, error) {
+	result, created, err := p.restPatcher.Update(p.requestCtx, p.name, p.updatedObjectInfo, p.createValidation, p.updateValidation, p.forceAllowCreate, p.updateOptionsPtr)
+	p.wasCreated = created
+	if isTooLargeError(err) && p.patchType != types.ApplyYAMLPatchType && p.patchType != types.ApplyCBORPatchType {
+		if _, accessorErr := meta.Accessor(p.restPatcher.New()); accessorErr == nil {
+			p.stripManagedFieldsOnRetry = true
+			result, created, err = p.restPatcher.Update(p.requestCtx, p.name, p.updatedObjectInfo, p.createValidation, p.updateValidation, p.forceAllowCreate, p.updateOptionsPtr)
+			p.wasCreated = created
+		}
+	}
+	return result, err
+}
+
+func (p *patcher) Preconditions() *metav1.Preconditions {
+	return nil
+}
+
+func (p *patcher) UpdatedObject(ctx context.Context, oldObj runtime.Object) (runtime.Object, error) {
+	newObj, err := p.applyPatch(ctx, nil, oldObj)
+	if err != nil {
+		return nil, err
+	}
+	newObj, err = p.applyAdmission(ctx, newObj, oldObj)
+	if err != nil {
+		return nil, err
+	}
+	dedupOwnerReferencesAndAddWarning(newObj, p.requestCtx, true)
+	if p.stripManagedFieldsOnRetry {
+		if accessor, err := meta.Accessor(newObj); err == nil {
+			accessor.SetManagedFields(nil)
+		}
+	}
+	return newObj, nil
 }
 
 type patchMechanism interface {
@@ -332,6 +533,29 @@ type jsonPatcher struct {
 }
 
 func (p *jsonPatcher) applyPatchToCurrentObject(requestContext context.Context, currentObject runtime.Object) (runtime.Object, error) {
+	var savedManagedFields []metav1.ManagedFieldsEntry
+	var currentAccessor metav1.Object
+	if p.fieldManager != nil && (p.subresource != "" || !bytes.Contains(p.patchBytes, []byte("managedFields"))) {
+		if accessor, err := meta.Accessor(currentObject); err == nil {
+			if mf := accessor.GetManagedFields(); len(mf) > 0 {
+				currentAccessor = accessor
+				savedManagedFields = mf
+				currentAccessor.SetManagedFields(nil)
+				defer func() {
+					if currentAccessor != nil {
+						currentAccessor.SetManagedFields(savedManagedFields)
+					}
+				}()
+			}
+		}
+	}
+
+	var savedHub savedHubFields
+	if p.patchType == types.MergePatchType {
+		savedHub = saveAndZeroUnpatchedHubFields(currentObject, p.patchBytes)
+		defer savedHub.restore(nil)
+	}
+
 	// Encode will convert & return a versioned object in JSON.
 	currentObjJS, err := runtime.Encode(p.codec, currentObject)
 	if err != nil {
@@ -373,6 +597,12 @@ func (p *jsonPatcher) applyPatchToCurrentObject(requestContext context.Context, 
 				field.Invalid(field.NewPath("patch"), string(patchedObjJS), runtime.NewStrictDecodingError(appliedStrictErrs).Error()),
 			})
 		}
+	}
+
+	savedHub.restore(objToUpdate)
+	if currentAccessor != nil {
+		currentAccessor.SetManagedFields(savedManagedFields)
+		currentAccessor = nil
 	}
 
 	if p.options == nil {
@@ -455,6 +685,9 @@ type smpPatcher struct {
 }
 
 func (p *smpPatcher) applyPatchToCurrentObject(requestContext context.Context, currentObject runtime.Object) (runtime.Object, error) {
+	savedHub := saveAndZeroUnpatchedHubFields(currentObject, p.patchBytes)
+	defer savedHub.restore(nil)
+
 	// Since the patch is applied on versioned objects, we need to convert the
 	// current object to versioned representation first.
 	currentVersionedObject, err := p.unsafeConvertor.ConvertToVersion(currentObject, p.kind.GroupVersion())
@@ -465,14 +698,35 @@ func (p *smpPatcher) applyPatchToCurrentObject(requestContext context.Context, c
 	if err != nil {
 		return nil, err
 	}
+	var savedManagedFields []metav1.ManagedFieldsEntry
+	var currentAccessor metav1.Object
+	if p.fieldManager != nil && (p.subresource != "" || !bytes.Contains(p.patchBytes, []byte("managedFields"))) {
+		if accessor, err := meta.Accessor(currentVersionedObject); err == nil {
+			if mf := accessor.GetManagedFields(); len(mf) > 0 {
+				currentAccessor = accessor
+				savedManagedFields = mf
+				currentAccessor.SetManagedFields(nil)
+				defer func() {
+					if currentAccessor != nil {
+						currentAccessor.SetManagedFields(savedManagedFields)
+					}
+				}()
+			}
+		}
+	}
 	if err := strategicPatchObject(requestContext, p.defaulter, currentVersionedObject, p.patchBytes, versionedObjToUpdate, p.schemaReferenceObj, p.validationDirective); err != nil {
 		return nil, err
+	}
+	if currentAccessor != nil {
+		currentAccessor.SetManagedFields(savedManagedFields)
+		currentAccessor = nil
 	}
 	// Convert the object back to the hub version
 	newObj, err := p.unsafeConvertor.ConvertToVersion(versionedObjToUpdate, p.hubGroupVersion)
 	if err != nil {
 		return nil, err
 	}
+	savedHub.restore(newObj)
 
 	newObj = p.fieldManager.UpdateNoErrors(currentObject, newObj, managerOrUserAgent(p.options.FieldManager, p.userAgent))
 	return newObj, nil
@@ -548,6 +802,646 @@ func (p *applyPatcher) createNewObject(requestContext context.Context) (runtime.
 	return p.applyPatchToCurrentObject(requestContext, obj)
 }
 
+type patchSubFieldInfo struct {
+	parentIdx int
+	fieldIdx  int
+	key       string
+	keyBytes  []byte
+	pool      sync.Pool
+}
+
+type patchStructFieldsInfo struct {
+	structType       reflect.Type
+	specIdx          int
+	specOffset       uintptr
+	specSize         uintptr
+	specPool         sync.Pool
+	zeroSpec         reflect.Value
+	statusIdx        int
+	statusOffset     uintptr
+	statusSize       uintptr
+	statusPool       sync.Pool
+	statusSubFields  []patchSubFieldInfo
+	metaIdx          int
+	metaPool         sync.Pool
+	metaSubFields    []patchSubFieldInfo
+	metaAllSubFields []patchSubFieldInfo
+}
+
+type savedSubField struct {
+	sub      *patchSubFieldInfo
+	curField reflect.Value
+	savedVal *reflect.Value
+}
+
+type savedHubFields struct {
+	info        *patchStructFieldsInfo
+	curSpec     reflect.Value
+	savedSpec   *reflect.Value
+	hasSpec     bool
+	curStatus   reflect.Value
+	savedStatus *reflect.Value
+	hasStatus   bool
+	subFields   [24]savedSubField
+	numSub      int
+}
+
+func saveAndZeroUnpatchedHubFields(currentObject runtime.Object, patchBytes []byte) savedHubFields {
+	var s savedHubFields
+	if bytes.IndexByte(patchBytes, '\\') >= 0 {
+		return s
+	}
+	trimmed := bytes.TrimLeft(patchBytes, " \t\r\n")
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return s
+	}
+	objHasUID, err := hasUID(currentObject)
+	if err != nil || !objHasUID {
+		return s
+	}
+	rv := reflect.ValueOf(currentObject)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return s
+	}
+	elem := rv.Elem()
+	if elem.Kind() != reflect.Struct {
+		return s
+	}
+	info := getPatchStructFieldsInfo(elem.Type())
+	s.info = info
+	if info.specIdx >= 0 && !bytes.Contains(patchBytes, []byte("spec")) {
+		s.curSpec = elem.Field(info.specIdx)
+		s.savedSpec = info.specPool.Get().(*reflect.Value)
+		s.savedSpec.Set(s.curSpec)
+		s.curSpec.Set(info.zeroSpec)
+		s.hasSpec = true
+	}
+	if info.statusIdx >= 0 && !bytes.Contains(patchBytes, []byte("status")) {
+		s.curStatus = elem.Field(info.statusIdx)
+		s.savedStatus = info.statusPool.Get().(*reflect.Value)
+		s.savedStatus.Set(s.curStatus)
+		s.curStatus.SetZero()
+		s.hasStatus = true
+	} else if info.statusIdx >= 0 && len(info.statusSubFields) > 0 {
+		statusElem := elem.Field(info.statusIdx)
+		for i := range info.statusSubFields {
+			if s.numSub >= len(s.subFields) {
+				break
+			}
+			sub := &info.statusSubFields[i]
+			f := statusElem.Field(sub.fieldIdx)
+			if !f.IsZero() && !bytes.Contains(patchBytes, sub.keyBytes) {
+				sv := sub.pool.Get().(*reflect.Value)
+				sv.Set(f)
+				f.SetZero()
+				s.subFields[s.numSub] = savedSubField{sub: sub, curField: f, savedVal: sv}
+				s.numSub++
+			}
+		}
+	}
+	for i := range info.metaSubFields {
+		if s.numSub >= len(s.subFields) {
+			break
+		}
+		sub := &info.metaSubFields[i]
+		f := elem.Field(sub.parentIdx).Field(sub.fieldIdx)
+		if !f.IsZero() && !bytes.Contains(patchBytes, sub.keyBytes) {
+			sv := sub.pool.Get().(*reflect.Value)
+			sv.Set(f)
+			f.SetZero()
+			s.subFields[s.numSub] = savedSubField{sub: sub, curField: f, savedVal: sv}
+			s.numSub++
+		}
+	}
+	return s
+}
+
+func (s *savedHubFields) restore(newObject runtime.Object) {
+	if !s.hasSpec && !s.hasStatus && s.numSub == 0 {
+		return
+	}
+	var newElem reflect.Value
+	if newObject != nil {
+		if rv := reflect.ValueOf(newObject); rv.Kind() == reflect.Ptr && !rv.IsNil() {
+			if e := rv.Elem(); e.Kind() == reflect.Struct && e.Type() == s.info.structType {
+				newElem = e
+			}
+		}
+	}
+	for i := s.numSub - 1; i >= 0; i-- {
+		entry := &s.subFields[i]
+		entry.curField.Set(*entry.savedVal)
+		if newElem.IsValid() {
+			newElem.Field(entry.sub.parentIdx).Field(entry.sub.fieldIdx).Set(*entry.savedVal)
+		}
+		entry.savedVal.SetZero()
+		entry.sub.pool.Put(entry.savedVal)
+		s.subFields[i] = savedSubField{}
+	}
+	s.numSub = 0
+	if s.hasStatus {
+		s.curStatus.Set(*s.savedStatus)
+		if newElem.IsValid() {
+			newElem.Field(s.info.statusIdx).Set(*s.savedStatus)
+		}
+		s.savedStatus.SetZero()
+		s.info.statusPool.Put(s.savedStatus)
+		s.hasStatus = false
+	}
+	if s.hasSpec {
+		s.curSpec.Set(*s.savedSpec)
+		if newElem.IsValid() {
+			newElem.Field(s.info.specIdx).Set(*s.savedSpec)
+		}
+		s.savedSpec.SetZero()
+		s.info.specPool.Put(s.savedSpec)
+		s.hasSpec = false
+	}
+}
+
+var patchStructFieldsCache sync.Map // map[reflect.Type]*patchStructFieldsInfo
+
+func getPatchStructFieldsInfo(t reflect.Type) *patchStructFieldsInfo {
+	if v, ok := patchStructFieldsCache.Load(t); ok {
+		return v.(*patchStructFieldsInfo)
+	}
+	info := &patchStructFieldsInfo{
+		structType: t,
+		specIdx:    -1,
+		statusIdx:  -1,
+		metaIdx:    -1,
+	}
+	if sf, ok := t.FieldByName("Spec"); ok && !sf.Anonymous && len(sf.Index) == 1 && sf.Type.Kind() == reflect.Struct {
+		info.specIdx = sf.Index[0]
+		info.specOffset = sf.Offset
+		info.specSize = sf.Type.Size()
+		specType := sf.Type
+		info.specPool.New = func() any {
+			v := reflect.New(specType).Elem()
+			return &v
+		}
+		zeroSpec := reflect.New(specType).Elem()
+		if esl := zeroSpec.FieldByName("EnableServiceLinks"); esl.IsValid() && esl.Kind() == reflect.Ptr && esl.Type().Elem().Kind() == reflect.Bool {
+			b := reflect.New(esl.Type().Elem())
+			b.Elem().SetBool(true)
+			esl.Set(b)
+		}
+		if sc := zeroSpec.FieldByName("SecurityContext"); sc.IsValid() && sc.Kind() == reflect.Ptr && sc.Type().Elem().Kind() == reflect.Struct {
+			sc.Set(reflect.New(sc.Type().Elem()))
+		}
+		if tgp := zeroSpec.FieldByName("TerminationGracePeriodSeconds"); tgp.IsValid() && tgp.Kind() == reflect.Ptr && tgp.Type().Elem().Kind() == reflect.Int64 {
+			p := reflect.New(tgp.Type().Elem())
+			p.Elem().SetInt(30)
+			tgp.Set(p)
+		}
+		info.zeroSpec = zeroSpec
+	}
+	if sf, ok := t.FieldByName("Status"); ok && !sf.Anonymous && len(sf.Index) == 1 && sf.Type.Kind() == reflect.Struct {
+		info.statusIdx = sf.Index[0]
+		info.statusOffset = sf.Offset
+		info.statusSize = sf.Type.Size()
+		statusType := sf.Type
+		info.statusPool.New = func() any {
+			v := reflect.New(statusType).Elem()
+			return &v
+		}
+		for i := 0; i < statusType.NumField(); i++ {
+			f := statusType.Field(i)
+			if !f.IsExported() || f.Anonymous {
+				continue
+			}
+			k := f.Type.Kind()
+			var key, jsonKey string
+			switch f.Name {
+			case "PodIP":
+				key = "podIP"
+				jsonKey = "podIP"
+			case "PodIPs":
+				key = "podIP"
+				jsonKey = "podIPs"
+			case "HostIP":
+				key = "hostIP"
+				jsonKey = "hostIP"
+			case "HostIPs":
+				key = "hostIP"
+				jsonKey = "hostIPs"
+			case "QOSClass":
+				key = "qosClass"
+				jsonKey = "qosClass"
+			default:
+				if k == reflect.Slice || k == reflect.Map || k == reflect.Ptr || k == reflect.String {
+					key = strings.ToLower(f.Name[:1]) + f.Name[1:]
+					jsonKey = key
+				}
+			}
+			if key != "" {
+				ft := f.Type
+				sub := patchSubFieldInfo{
+					parentIdx: info.statusIdx,
+					fieldIdx:  i,
+					key:       jsonKey,
+					keyBytes:  []byte(key),
+				}
+				sub.pool.New = func() any {
+					v := reflect.New(ft).Elem()
+					return &v
+				}
+				info.statusSubFields = append(info.statusSubFields, sub)
+			}
+		}
+	}
+	if sf, ok := t.FieldByName("ObjectMeta"); ok && len(sf.Index) == 1 && sf.Type.Kind() == reflect.Struct {
+		metaIdx := sf.Index[0]
+		metaType := sf.Type
+		if t.Name() != "ReplicationController" {
+			info.metaIdx = metaIdx
+			info.metaPool.New = func() any {
+				v := reflect.New(metaType).Elem()
+				return &v
+			}
+		}
+		metaFields := []struct {
+			name string
+			key  string
+			hub  bool
+		}{
+			{"Annotations", "annotations", true},
+			{"OwnerReferences", "ownerReferences", true},
+			{"Finalizers", "finalizers", true},
+			{"Name", "name", false},
+			{"Namespace", "namespace", false},
+			{"UID", "uid", false},
+			{"ResourceVersion", "resourceVersion", false},
+			{"Generation", "generation", false},
+			{"CreationTimestamp", "creationTimestamp", false},
+		}
+		if t.Name() != "ReplicationController" {
+			metaFields = append(metaFields, struct {
+				name string
+				key  string
+				hub  bool
+			}{"Labels", "labels", true})
+		}
+		for _, mf := range metaFields {
+			if f, ok := metaType.FieldByName(mf.name); ok && len(f.Index) == 1 {
+				ft := f.Type
+				sub := patchSubFieldInfo{
+					parentIdx: metaIdx,
+					fieldIdx:  f.Index[0],
+					key:       mf.key,
+					keyBytes:  []byte(mf.key),
+				}
+				sub.pool.New = func() any {
+					v := reflect.New(ft).Elem()
+					return &v
+				}
+				if mf.hub {
+					info.metaSubFields = append(info.metaSubFields, sub)
+				}
+				info.metaAllSubFields = append(info.metaAllSubFields, sub)
+			}
+		}
+	}
+	actual, _ := patchStructFieldsCache.LoadOrStore(t, info)
+	return actual.(*patchStructFieldsInfo)
+}
+
+func patchShallowFieldEqual(a, b reflect.Value, offset, size uintptr) bool {
+	if size == 0 {
+		return false
+	}
+	ptrA := unsafe.Add(a.Addr().UnsafePointer(), offset)
+	ptrB := unsafe.Add(b.Addr().UnsafePointer(), offset)
+	return bytes.Equal(unsafe.Slice((*byte)(ptrA), size), unsafe.Slice((*byte)(ptrB), size))
+}
+
+type strategicZeroState struct {
+	info            *patchStructFieldsInfo
+	skipSpec        bool
+	skipStatus      bool
+	skipMeta        bool
+	origSpecField   reflect.Value
+	origStatusField reflect.Value
+	origMetaField   reflect.Value
+	savedSpec       *reflect.Value
+	savedStatus     *reflect.Value
+	savedMeta       *reflect.Value
+	subFields       [24]savedSubField
+	numSub          int
+	restoredSub     int
+}
+
+func (s *strategicZeroState) restore() {
+	for i := s.numSub - 1; i >= 0; i-- {
+		entry := &s.subFields[i]
+		if entry.savedVal != nil {
+			entry.curField.Set(*entry.savedVal)
+			entry.savedVal.SetZero()
+			entry.sub.pool.Put(entry.savedVal)
+			entry.savedVal = nil
+		}
+	}
+	s.restoredSub = s.numSub
+	s.numSub = 0
+	if s.skipMeta {
+		s.origMetaField.Set(*s.savedMeta)
+		s.savedMeta.SetZero()
+		s.info.metaPool.Put(s.savedMeta)
+		s.skipMeta = false
+	}
+	if s.skipStatus {
+		s.origStatusField.Set(*s.savedStatus)
+		s.savedStatus.SetZero()
+		s.info.statusPool.Put(s.savedStatus)
+		s.skipStatus = false
+	}
+	if s.skipSpec {
+		s.origSpecField.Set(*s.savedSpec)
+		s.savedSpec.SetZero()
+		s.info.specPool.Put(s.savedSpec)
+		s.skipSpec = false
+	}
+}
+
+func (s *strategicZeroState) copyRestoredToUpdate(updateElem reflect.Value) {
+	if s.origStatusField.IsValid() {
+		updateElem.Field(s.info.statusIdx).Set(s.origStatusField)
+	}
+	if s.origSpecField.IsValid() {
+		updateElem.Field(s.info.specIdx).Set(s.origSpecField)
+	}
+	if s.origMetaField.IsValid() {
+		updateElem.Field(s.info.metaIdx).Set(s.origMetaField)
+	}
+	for i := 0; i < s.restoredSub; i++ {
+		entry := &s.subFields[i]
+		updateElem.Field(entry.sub.parentIdx).Field(entry.sub.fieldIdx).Set(entry.curField)
+	}
+}
+
+var (
+	patchBoolTrueAny  interface{} = true
+	patchBoolFalseAny interface{} = false
+
+	patchKnownValueAnys = map[string]interface{}{
+		"":                interface{}(""),
+		"True":            interface{}("True"),
+		"False":           interface{}("False"),
+		"Unknown":         interface{}("Unknown"),
+		"Ready":           interface{}("Ready"),
+		"ContainersReady": interface{}("ContainersReady"),
+		"PodScheduled":    interface{}("PodScheduled"),
+		"Initialized":     interface{}("Initialized"),
+		"Running":         interface{}("Running"),
+		"Pending":         interface{}("Pending"),
+		"Succeeded":       interface{}("Succeeded"),
+		"Failed":          interface{}("Failed"),
+		"Always":          interface{}("Always"),
+		"IfNotPresent":    interface{}("IfNotPresent"),
+		"Never":           interface{}("Never"),
+	}
+)
+
+type patchValueCacheEntry struct {
+	str string
+	val interface{}
+}
+
+var patchValueCache [64]struct {
+	mu      sync.Mutex
+	entries [64]patchValueCacheEntry
+}
+
+func fastPatchKeyString(raw []byte) string {
+	switch len(raw) {
+	case 4:
+		switch string(raw) {
+		case "type":
+			return "type"
+		case "spec":
+			return "spec"
+		case "name":
+			return "name"
+		}
+	case 5:
+		switch string(raw) {
+		case "phase":
+			return "phase"
+		case "podIP":
+			return "podIP"
+		case "image":
+			return "image"
+		}
+	case 6:
+		switch string(raw) {
+		case "status":
+			return "status"
+		case "labels":
+			return "labels"
+		case "reason":
+			return "reason"
+		case "podIPs":
+			return "podIPs"
+		case "hostIP":
+			return "hostIP"
+		}
+	case 7:
+		switch string(raw) {
+		case "message":
+			return "message"
+		case "hostIPs":
+			return "hostIPs"
+		}
+	case 8:
+		switch string(raw) {
+		case "metadata":
+			return "metadata"
+		case "qosClass":
+			return "qosClass"
+		}
+	case 10:
+		switch string(raw) {
+		case "conditions":
+			return "conditions"
+		case "containers":
+			return "containers"
+		case "finalizers":
+			return "finalizers"
+		}
+	case 11:
+		if string(raw) == "annotations" {
+			return "annotations"
+		}
+	case 13:
+		if string(raw) == "bench-updated" {
+			return "bench-updated"
+		}
+	case 17:
+		if string(raw) == "containerStatuses" {
+			return "containerStatuses"
+		}
+	case 18:
+		if string(raw) == "lastTransitionTime" {
+			return "lastTransitionTime"
+		}
+	}
+	return string(raw)
+}
+
+func fastPatchValueAny(raw []byte) interface{} {
+	if len(raw) <= 16 {
+		if v, ok := patchKnownValueAnys[string(raw)]; ok {
+			return v
+		}
+	}
+	return runtime.BytesToUnstructuredStringAny(raw)
+}
+
+func skipFastJSONWS(b []byte, pos int) int {
+	for pos < len(b) {
+		switch b[pos] {
+		case ' ', '\t', '\r', '\n':
+			pos++
+		default:
+			return pos
+		}
+	}
+	return pos
+}
+
+func parseFastJSONStringRaw(b []byte, pos int) ([]byte, int, bool) {
+	if pos >= len(b) || b[pos] != '"' {
+		return nil, 0, false
+	}
+	start := pos + 1
+	for i := start; i < len(b); i++ {
+		c := b[i]
+		if c == '"' {
+			return b[start:i], i + 1, true
+		}
+		if c < 0x20 || c == '\\' {
+			return nil, 0, false
+		}
+	}
+	return nil, 0, false
+}
+
+func parseFastJSONValue(b []byte, pos int) (interface{}, int, bool) {
+	pos = skipFastJSONWS(b, pos)
+	if pos >= len(b) {
+		return nil, 0, false
+	}
+	switch b[pos] {
+	case '{':
+		return parseFastJSONObject(b, pos)
+	case '[':
+		pos = skipFastJSONWS(b, pos+1)
+		if pos < len(b) && b[pos] == ']' {
+			return []interface{}{}, pos + 1, true
+		}
+		arr := make([]interface{}, 0, 2)
+		for {
+			elem, nextPos, ok := parseFastJSONValue(b, pos)
+			if !ok {
+				return nil, 0, false
+			}
+			arr = append(arr, elem)
+			pos = skipFastJSONWS(b, nextPos)
+			if pos >= len(b) {
+				return nil, 0, false
+			}
+			if b[pos] == ']' {
+				return arr, pos + 1, true
+			}
+			if b[pos] != ',' {
+				return nil, 0, false
+			}
+			pos = skipFastJSONWS(b, pos+1)
+			if pos < len(b) && b[pos] == ']' {
+				return nil, 0, false
+			}
+		}
+	case '"':
+		raw, nextPos, ok := parseFastJSONStringRaw(b, pos)
+		if !ok {
+			return nil, 0, false
+		}
+		return fastPatchValueAny(raw), nextPos, true
+	case 't':
+		if pos+4 <= len(b) && string(b[pos:pos+4]) == "true" {
+			return patchBoolTrueAny, pos + 4, true
+		}
+	case 'f':
+		if pos+5 <= len(b) && string(b[pos:pos+5]) == "false" {
+			return patchBoolFalseAny, pos + 5, true
+		}
+	case 'n':
+		if pos+4 <= len(b) && string(b[pos:pos+4]) == "null" {
+			return nil, pos + 4, true
+		}
+	}
+	return nil, 0, false
+}
+
+func parseFastJSONObject(b []byte, pos int) (map[string]interface{}, int, bool) {
+	pos = skipFastJSONWS(b, pos)
+	if pos >= len(b) || b[pos] != '{' {
+		return nil, 0, false
+	}
+	pos = skipFastJSONWS(b, pos+1)
+	if pos < len(b) && b[pos] == '}' {
+		return make(map[string]interface{}), pos + 1, true
+	}
+	m := make(map[string]interface{}, 2)
+	for {
+		rawKey, nextPos, ok := parseFastJSONStringRaw(b, pos)
+		if !ok {
+			return nil, 0, false
+		}
+		key := fastPatchKeyString(rawKey)
+		if _, dup := m[key]; dup {
+			return nil, 0, false
+		}
+		pos = skipFastJSONWS(b, nextPos)
+		if pos >= len(b) || b[pos] != ':' {
+			return nil, 0, false
+		}
+		val, valEnd, ok := parseFastJSONValue(b, pos+1)
+		if !ok {
+			return nil, 0, false
+		}
+		m[key] = val
+		pos = skipFastJSONWS(b, valEnd)
+		if pos >= len(b) {
+			return nil, 0, false
+		}
+		if b[pos] == '}' {
+			return m, pos + 1, true
+		}
+		if b[pos] != ',' {
+			return nil, 0, false
+		}
+		pos = skipFastJSONWS(b, pos+1)
+		if pos >= len(b) || b[pos] != '"' {
+			return nil, 0, false
+		}
+	}
+}
+
+func fastUnmarshalPatchMap(b []byte) (map[string]interface{}, bool) {
+	if bytes.IndexByte(b, '\\') >= 0 {
+		return nil, false
+	}
+	m, endPos, ok := parseFastJSONObject(b, 0)
+	if !ok {
+		return nil, false
+	}
+	if skipFastJSONWS(b, endPos) != len(b) {
+		return nil, false
+	}
+	return m, true
+}
+
 // strategicPatchObject applies a strategic merge patch of `patchBytes` to
 // `originalObject` and stores the result in `objToUpdate`.
 // It additionally returns the map[string]interface{} representation of the
@@ -562,27 +1456,177 @@ func strategicPatchObject(
 	schemaReferenceObj runtime.Object,
 	validationDirective string,
 ) error {
+	var patchMap map[string]interface{}
+	var strictErrs []error
+	var err error
+	if fm, ok := fastUnmarshalPatchMap(patchBytes); ok {
+		patchMap = fm
+	} else {
+		patchMap = make(map[string]interface{})
+		if validationDirective == metav1.FieldValidationWarn || validationDirective == metav1.FieldValidationStrict {
+			strictErrs, err = kjson.UnmarshalStrict(patchBytes, &patchMap)
+			if err != nil {
+				return errors.NewBadRequest(err.Error())
+			}
+		} else {
+			if err = kjson.UnmarshalCaseSensitivePreserveInts(patchBytes, &patchMap); err != nil {
+				return errors.NewBadRequest(err.Error())
+			}
+		}
+	}
+
+	var (
+		s                    strategicZeroState
+		origElem, updateElem reflect.Value
+	)
+	if objHasUID, uidErr := hasUID(originalObject); uidErr == nil && objHasUID {
+		origRV := reflect.ValueOf(originalObject)
+		updateRV := reflect.ValueOf(objToUpdate)
+		if origRV.Kind() == reflect.Ptr && updateRV.Kind() == reflect.Ptr && origRV.Type() == updateRV.Type() && !origRV.IsNil() && !updateRV.IsNil() {
+			origElem = origRV.Elem()
+			updateElem = updateRV.Elem()
+			if origElem.Kind() == reflect.Struct {
+				s.info = getPatchStructFieldsInfo(origElem.Type())
+				if _, hasSpec := patchMap["spec"]; !hasSpec && s.info.specIdx >= 0 {
+					s.origSpecField = origElem.Field(s.info.specIdx)
+					s.savedSpec = s.info.specPool.Get().(*reflect.Value)
+					s.savedSpec.Set(s.origSpecField)
+					s.origSpecField.SetZero()
+					s.skipSpec = true
+				}
+				if statusVal, hasStatus := patchMap["status"]; !hasStatus && s.info.statusIdx >= 0 {
+					s.origStatusField = origElem.Field(s.info.statusIdx)
+					s.savedStatus = s.info.statusPool.Get().(*reflect.Value)
+					s.savedStatus.Set(s.origStatusField)
+					s.origStatusField.SetZero()
+					s.skipStatus = true
+				} else if statusPatch, ok := statusVal.(map[string]interface{}); ok && s.info.statusIdx >= 0 && len(s.info.statusSubFields) > 0 {
+					statusElem := origElem.Field(s.info.statusIdx)
+					for i := range s.info.statusSubFields {
+						if s.numSub >= len(s.subFields) {
+							break
+						}
+						sub := &s.info.statusSubFields[i]
+						f := statusElem.Field(sub.fieldIdx)
+						if f.IsZero() {
+							continue
+						}
+						_, hasKey := statusPatch[sub.key]
+						if !hasKey && (sub.key == "podIP" || sub.key == "podIPs") {
+							_, has1 := statusPatch["podIP"]
+							_, has2 := statusPatch["podIPs"]
+							hasKey = has1 || has2
+						} else if !hasKey && (sub.key == "hostIP" || sub.key == "hostIPs") {
+							_, has1 := statusPatch["hostIP"]
+							_, has2 := statusPatch["hostIPs"]
+							hasKey = has1 || has2
+						}
+						if !hasKey {
+							sv := sub.pool.Get().(*reflect.Value)
+							sv.Set(f)
+							f.SetZero()
+							s.subFields[s.numSub] = savedSubField{sub: sub, curField: f, savedVal: sv}
+							s.numSub++
+						}
+					}
+				}
+				hasTopDirectives := false
+				for k := range patchMap {
+					if len(k) > 0 && k[0] == '$' {
+						hasTopDirectives = true
+						break
+					}
+				}
+				if !hasTopDirectives {
+					if metaVal, hasMeta := patchMap["metadata"]; !hasMeta && s.info.metaIdx >= 0 {
+						s.origMetaField = origElem.Field(s.info.metaIdx)
+						s.savedMeta = s.info.metaPool.Get().(*reflect.Value)
+						s.savedMeta.Set(s.origMetaField)
+						s.origMetaField.SetZero()
+						s.skipMeta = true
+					} else {
+						metaPatch, _ := metaVal.(map[string]interface{})
+						hasMetaDirectives := false
+						for k := range metaPatch {
+							if len(k) > 0 && k[0] == '$' {
+								hasMetaDirectives = true
+								break
+							}
+						}
+						metaSubList := s.info.metaSubFields
+						if !hasMetaDirectives {
+							metaSubList = s.info.metaAllSubFields
+						}
+						for i := range metaSubList {
+							if s.numSub >= len(s.subFields) {
+								break
+							}
+							sub := &metaSubList[i]
+							f := origElem.Field(sub.parentIdx).Field(sub.fieldIdx)
+							if f.IsZero() {
+								continue
+							}
+							if metaPatch != nil {
+								if _, hasKey := metaPatch[sub.key]; hasKey {
+									continue
+								}
+							}
+							sv := sub.pool.Get().(*reflect.Value)
+							sv.Set(f)
+							f.SetZero()
+							s.subFields[s.numSub] = savedSubField{sub: sub, curField: f, savedVal: sv}
+							s.numSub++
+						}
+					}
+				}
+				if s.skipSpec || s.skipStatus || s.skipMeta || s.numSub > 0 {
+					defer s.restore()
+				}
+			}
+		}
+	}
+
 	originalObjMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(originalObject)
+	if s.skipStatus {
+		if originalObjMap != nil {
+			delete(originalObjMap, "status")
+		}
+	}
+	if s.skipSpec {
+		if originalObjMap != nil {
+			delete(originalObjMap, "spec")
+		}
+	}
+	if s.skipMeta {
+		if originalObjMap != nil {
+			delete(originalObjMap, "metadata")
+		}
+	}
+	if s.numSub > 0 && originalObjMap != nil {
+		statusMap, _ := originalObjMap["status"].(map[string]interface{})
+		metaMap, _ := originalObjMap["metadata"].(map[string]interface{})
+		for i := 0; i < s.numSub; i++ {
+			sub := s.subFields[i].sub
+			if sub.parentIdx == s.info.statusIdx {
+				if statusMap != nil {
+					delete(statusMap, sub.key)
+				}
+			} else if metaMap != nil {
+				delete(metaMap, sub.key)
+			}
+		}
+	}
+	s.restore()
 	if err != nil {
 		return err
 	}
 
-	patchMap := make(map[string]interface{})
-	var strictErrs []error
-	if validationDirective == metav1.FieldValidationWarn || validationDirective == metav1.FieldValidationStrict {
-		strictErrs, err = kjson.UnmarshalStrict(patchBytes, &patchMap)
-		if err != nil {
-			return errors.NewBadRequest(err.Error())
-		}
-	} else {
-		if err = kjson.UnmarshalCaseSensitivePreserveInts(patchBytes, &patchMap); err != nil {
-			return errors.NewBadRequest(err.Error())
-		}
-	}
+	s.copyRestoredToUpdate(updateElem)
 
 	if err := applyPatchToObject(requestContext, defaulter, originalObjMap, patchMap, objToUpdate, schemaReferenceObj, strictErrs, validationDirective); err != nil {
 		return err
 	}
+	s.copyRestoredToUpdate(updateElem)
 	return nil
 }
 
@@ -641,44 +1685,82 @@ func (p *patcher) admissionAttributes(ctx context.Context, updatedObject runtime
 // TODO: rename this function because the name implies it is related to applyPatcher
 func (p *patcher) applyAdmission(ctx context.Context, patchedObject runtime.Object, currentObject runtime.Object) (runtime.Object, error) {
 	tracing.SpanFromContext(ctx).AddEvent("About to check admission control")
+	if p.admissionCheck == nil {
+		return patchedObject, nil
+	}
 	var operation admission.Operation
-	var options runtime.Object
 	if hasUID, err := hasUID(currentObject); err != nil {
 		return nil, err
 	} else if !hasUID {
 		operation = admission.Create
 		currentObject = nil
-		options = patchToCreateOptions(p.options)
 	} else {
 		operation = admission.Update
-		options = patchToUpdateOptions(p.options)
 	}
-	if p.admissionCheck != nil && p.admissionCheck.Handles(operation) {
+	if admission.HasMutationHandler(p.admissionCheck, operation) {
+		var options runtime.Object
+		if operation == admission.Create {
+			options = patchToCreateOptions(p.options)
+		} else {
+			options = patchToUpdateOptions(p.options)
+		}
+		if currentObject != nil {
+			patchedRV := reflect.ValueOf(patchedObject)
+			currentRV := reflect.ValueOf(currentObject)
+			if patchedRV.Kind() == reflect.Ptr && currentRV.Kind() == reflect.Ptr && patchedRV.Type() == currentRV.Type() && !patchedRV.IsNil() && !currentRV.IsNil() {
+				patchedElem := patchedRV.Elem()
+				currentElem := currentRV.Elem()
+				if patchedElem.Kind() == reflect.Struct {
+					info := getPatchStructFieldsInfo(patchedElem.Type())
+					if (info.specIdx >= 0 && patchShallowFieldEqual(patchedElem, currentElem, info.specOffset, info.specSize)) ||
+						(info.statusIdx >= 0 && patchShallowFieldEqual(patchedElem, currentElem, info.statusOffset, info.statusSize)) {
+						patchedObject = patchedObject.DeepCopyObject()
+					}
+				}
+			}
+		}
 		attributes := p.admissionAttributes(ctx, patchedObject, currentObject, operation, options)
 		return patchedObject, p.admissionCheck.Admit(ctx, attributes, p.objectInterfaces)
 	}
 	return patchedObject, nil
 }
 
+var (
+	schemaReferenceObjMu    sync.RWMutex
+	schemaReferenceObjCache = make(map[schema.GroupVersionKind]runtime.Object, 16)
+)
+
 // patchResource divides PatchResource for easier unit testing
 func (p *patcher) patchResource(ctx context.Context, scope *RequestScope) (runtime.Object, bool, error) {
 	p.namespace = request.NamespaceValue(ctx)
+	p.requestCtx = ctx
 	switch p.patchType {
 	case types.JSONPatchType, types.MergePatchType:
-		p.mechanism = &jsonPatcher{
+		p.jp = jsonPatcher{
 			patcher:      p,
 			fieldManager: scope.FieldManager,
 		}
+		p.mechanism = &p.jp
 	case types.StrategicMergePatchType:
-		schemaReferenceObj, err := p.unsafeConvertor.ConvertToVersion(p.restPatcher.New(), p.kind.GroupVersion())
-		if err != nil {
-			return nil, false, err
+		schemaReferenceObjMu.RLock()
+		schemaReferenceObj, ok := schemaReferenceObjCache[p.kind]
+		schemaReferenceObjMu.RUnlock()
+		if !ok {
+			var err error
+			schemaReferenceObj, err = p.unsafeConvertor.ConvertToVersion(p.restPatcher.New(), p.kind.GroupVersion())
+			if err != nil {
+				return nil, false, err
+			}
+			schemaReferenceObjMu.Lock()
+			schemaReferenceObjCache[p.kind] = schemaReferenceObj
+			schemaReferenceObjMu.Unlock()
 		}
-		p.mechanism = &smpPatcher{
+		p.smp = smpPatcher{
 			patcher:            p,
 			schemaReferenceObj: schemaReferenceObj,
 			fieldManager:       scope.FieldManager,
 		}
+		p.mechanism = &p.smp
 	// this case is unreachable if ServerSideApply is not enabled because we will have already rejected the content type
 	case types.ApplyYAMLPatchType:
 		p.mechanism = newApplyPatcher(p, scope.FieldManager, yaml.Unmarshal, yaml.UnmarshalStrict)
@@ -699,44 +1781,26 @@ func (p *patcher) patchResource(ctx context.Context, scope *RequestScope) (runti
 	default:
 		return nil, false, fmt.Errorf("%v: unimplemented patch type", p.patchType)
 	}
-	dedupOwnerReferencesTransformer := func(_ context.Context, obj, _ runtime.Object) (runtime.Object, error) {
-		// Dedup owner references after mutating admission happens
-		dedupOwnerReferencesAndAddWarning(obj, ctx, true)
-		return obj, nil
-	}
 
-	transformers := []rest.TransformFunc{p.applyPatch, p.applyAdmission, dedupOwnerReferencesTransformer}
-
-	wasCreated := false
-	p.updatedObjectInfo = rest.DefaultUpdatedObjectInfo(nil, transformers...)
-	requestFunc := func() (runtime.Object, error) {
-		// Pass in UpdateOptions to override UpdateStrategy.AllowUpdateOnCreate
-		options := patchToUpdateOptions(p.options)
-		updateObject, created, updateErr := p.restPatcher.Update(ctx, p.name, p.updatedObjectInfo, p.createValidation, p.updateValidation, p.forceAllowCreate, options)
-		wasCreated = created
-		return updateObject, updateErr
-	}
-	result, err := finisher.FinishRequest(ctx, func() (runtime.Object, error) {
-
-		result, err := requestFunc()
-		// If the object wasn't committed to storage because it's serialized size was too large,
-		// it is safe to remove managedFields (which can be large) and try again.
-		if isTooLargeError(err) && p.patchType != types.ApplyYAMLPatchType && p.patchType != types.ApplyCBORPatchType {
-			if _, accessorErr := meta.Accessor(p.restPatcher.New()); accessorErr == nil {
-				p.updatedObjectInfo = rest.DefaultUpdatedObjectInfo(nil,
-					p.applyPatch,
-					p.applyAdmission,
-					dedupOwnerReferencesTransformer,
-					func(_ context.Context, obj, _ runtime.Object) (runtime.Object, error) {
-						accessor, _ := meta.Accessor(obj)
-						accessor.SetManagedFields(nil)
-						return obj, nil
-					})
-				result, err = requestFunc()
-			}
+	p.wasCreated = false
+	p.updatedObjectInfo = p
+	p.updateOptionsPtr = nil
+	if p.options != nil {
+		p.updateOptionsVal = metav1.UpdateOptions{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "meta.k8s.io/v1",
+				Kind:       "UpdateOptions",
+			},
+			DryRun:          p.options.DryRun,
+			FieldManager:    p.options.FieldManager,
+			FieldValidation: p.options.FieldValidation,
 		}
-		return result, err
-	})
+		p.updateOptionsPtr = &p.updateOptionsVal
+	}
+	if p.runUpdateFn == nil {
+		p.runUpdateFn = p.runUpdate
+	}
+	result, err := finisher.FinishRequest(ctx, p.runUpdateFn)
 
 	// In case of a timeout error, the goroutine handling the request is still running.
 	// https://github.com/kubernetes/kubernetes/blob/d2c12afa4593e50a187075157d38748292b02733/staging/src/k8s.io/apiserver/pkg/endpoints/handlers/finisher/finisher.go#L127-L146
@@ -745,7 +1809,7 @@ func (p *patcher) patchResource(ctx context.Context, scope *RequestScope) (runti
 	if errors.IsTimeout(err) {
 		return result, false, err
 	}
-	return result, wasCreated, err
+	return result, p.wasCreated, err
 }
 
 // applyPatchToObject applies a strategic merge patch of <patchMap> to

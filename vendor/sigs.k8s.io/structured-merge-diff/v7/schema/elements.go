@@ -148,8 +148,10 @@ type Map struct {
 	// leave this unset to get the default behavior.
 	ElementRelationship ElementRelationship `yaml:"elementRelationship,omitempty"`
 
-	once sync.Once
-	m    atomic.Pointer[map[string]StructField]
+	once    sync.Once
+	m       atomic.Pointer[map[string]StructField]
+	oncePtr sync.Once
+	mPtr    atomic.Pointer[map[string]*StructField]
 }
 
 // FindField is a convenience function that returns the referenced StructField,
@@ -164,6 +166,18 @@ func (m *Map) FindField(name string) (StructField, bool) {
 	})
 	sf, ok := (*m.m.Load())[name]
 	return sf, ok
+}
+
+// FindFieldPtr returns a pointer to the StructField in m.Fields if it exists, or nil.
+func (m *Map) FindFieldPtr(name string) *StructField {
+	m.oncePtr.Do(func() {
+		mm := make(map[string]*StructField, len(m.Fields))
+		for i := range m.Fields {
+			mm[m.Fields[i].Name] = &m.Fields[i]
+		}
+		m.mPtr.Store(&mm)
+	})
+	return (*m.mPtr.Load())[name]
 }
 
 // CopyInto clones this instance of Map into dst
@@ -189,6 +203,13 @@ func (m *Map) CopyInto(dst *Map) {
 		dst.once = sync.Once{}
 		dst.once.Do(func() {
 			dst.m.Store(mm)
+		})
+	}
+	mmPtr := m.mPtr.Load()
+	if mmPtr != nil {
+		dst.oncePtr = sync.Once{}
+		dst.oncePtr.Do(func() {
+			dst.mPtr.Store(mmPtr)
 		})
 	}
 }

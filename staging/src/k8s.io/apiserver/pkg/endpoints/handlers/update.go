@@ -204,6 +204,12 @@ func UpdateResource(r rest.Updater, scope *RequestScope, admit admission.Interfa
 
 		span.AddEvent("About to store object in database")
 		wasCreated := false
+		var updateValidation rest.ValidateObjectUpdateFunc
+		if admission.HasValidationHandler(admit, admission.Update) {
+			updateValidation = rest.AdmissionToValidateObjectUpdateFunc(
+				admit,
+				admission.NewAttributesRecord(nil, nil, scope.Kind, namespace, name, scope.Resource, scope.Subresource, admission.Update, options, dryrun.IsDryRun(options.DryRun), userInfo), scope)
+		}
 		requestFunc := func() (runtime.Object, error) {
 			obj, created, err := r.Update(
 				ctx,
@@ -213,9 +219,7 @@ func UpdateResource(r rest.Updater, scope *RequestScope, admit admission.Interfa
 					admit,
 					admission.NewAttributesRecord(nil, nil, scope.Kind, namespace, name, scope.Resource, scope.Subresource, admission.Create, updateToCreateOptions(options), dryrun.IsDryRun(options.DryRun), userInfo), scope),
 					scope.Authorizer, createAuthorizerAttributes),
-				rest.AdmissionToValidateObjectUpdateFunc(
-					admit,
-					admission.NewAttributesRecord(nil, nil, scope.Kind, namespace, name, scope.Resource, scope.Subresource, admission.Update, options, dryrun.IsDryRun(options.DryRun), userInfo), scope),
+				updateValidation,
 				false,
 				options,
 			)

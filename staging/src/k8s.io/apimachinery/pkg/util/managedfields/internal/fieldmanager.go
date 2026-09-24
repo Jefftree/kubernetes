@@ -128,6 +128,12 @@ func (f *FieldManager) Update(liveObj, newObj runtime.Object, manager string) (o
 	}
 
 	RemoveObjectManagedFields(newObj)
+	if liveAccessor, aErr := meta.Accessor(liveObj); aErr == nil {
+		if liveManagedFields := liveAccessor.GetManagedFields(); len(liveManagedFields) > 0 {
+			liveAccessor.SetManagedFields(nil)
+			defer liveAccessor.SetManagedFields(liveManagedFields)
+		}
+	}
 
 	if object, managed, err = f.fieldManager.Update(liveObj, newObj, managed, manager); err != nil {
 		return nil, err
@@ -193,9 +199,14 @@ func (f *FieldManager) Apply(liveObj, appliedObj runtime.Object, manager string,
 	}
 
 	// Decode the managed fields in the live object, since it isn't allowed in the patch.
-	managed, err := DecodeManagedFields(accessor.GetManagedFields())
+	liveManagedFields := accessor.GetManagedFields()
+	managed, err := DecodeManagedFields(liveManagedFields)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode managed fields: %v", err)
+	}
+	if len(liveManagedFields) > 0 {
+		accessor.SetManagedFields(nil)
+		defer accessor.SetManagedFields(liveManagedFields)
 	}
 
 	object, managed, err = f.fieldManager.Apply(liveObj, appliedObj, managed, manager, force)

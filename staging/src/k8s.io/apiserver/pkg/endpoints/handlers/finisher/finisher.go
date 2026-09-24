@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	goruntime "runtime"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -84,13 +85,19 @@ func FinishRequest(ctx context.Context, fn ResultFunc) (runtime.Object, error) {
 	return finishRequest(ctx, fn, postTimeoutLoggerWait, logPostTimeoutResult)
 }
 
+var resultChPool = sync.Pool{
+	New: func() any {
+		return make(chan result, 1)
+	},
+}
+
 func finishRequest(ctx context.Context, fn ResultFunc, postTimeoutWait time.Duration, postTimeoutLogger PostTimeoutLoggerFunc) (runtime.Object, error) {
 	// the channel needs to be buffered since the post-timeout receiver goroutine
 	// waits up to 5 minutes for the child goroutine to return.
-	resultCh := make(chan *result, 1)
+	resultCh := resultChPool.Get().(chan result)
 
 	go func() {
-		result := &result{}
+		var res result
 
 		// panics don't cross goroutine boundaries, so we have to handle ourselves
 		defer func() {
@@ -107,23 +114,24 @@ func finishRequest(ctx context.Context, fn ResultFunc, postTimeoutWait time.Dura
 				}
 
 				// store the panic reason into the result.
-				result.reason = reason
+				res.reason = reason
 			}
 
 			// Propagate the result to the parent goroutine
-			resultCh <- result
+			resultCh <- res
 		}()
 
 		if object, err := fn(); err != nil {
-			result.err = err
+			res.err = err
 		} else {
-			result.object = object
+			res.object = object
 		}
 	}()
 
 	select {
-	case result := <-resultCh:
-		return result.Return()
+	case res := <-resultCh:
+		resultChPool.Put(resultCh)
+		return res.Return()
 	case <-ctx.Done():
 		// we are going to send a timeout response to the caller, but the asynchronous goroutine
 		// (sender) is still executing the ResultFunc function.
@@ -133,14 +141,15 @@ func finishRequest(ctx context.Context, fn ResultFunc, postTimeoutWait time.Dura
 			go func() {
 				timedOutAt := time.Now()
 
-				var result *result
+				var resPtr *result
 				select {
-				case result = <-resultCh:
+				case r := <-resultCh:
+					resPtr = &r
 				case <-time.After(postTimeoutWait):
 					// we will not wait forever, if we are here then we know that some sender
 					// goroutines are taking longer than postTimeoutWait.
 				}
-				postTimeoutLogger(timedOutAt, result)
+				postTimeoutLogger(timedOutAt, resPtr)
 			}()
 		}()
 		return nil, errors.NewTimeoutError(fmt.Sprintf("request did not complete within requested timeout - %s", ctx.Err()), 0)

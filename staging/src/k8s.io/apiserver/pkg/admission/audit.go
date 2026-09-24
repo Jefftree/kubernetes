@@ -43,6 +43,11 @@ func WithAudit(i Interface) Interface {
 	return &auditHandler{Interface: i}
 }
 
+// Unwrap returns the wrapped admission.Interface.
+func (handler *auditHandler) Unwrap() Interface {
+	return handler.Interface
+}
+
 func (handler *auditHandler) Admit(ctx context.Context, a Attributes, o ObjectInterfaces) error {
 	if !handler.Interface.Handles(a.GetOperation()) {
 		return nil

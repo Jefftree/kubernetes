@@ -266,7 +266,20 @@ func (s *PathElementSet) Insert(pe PathElement) {
 
 // Union returns a set containing elements that appear in either s or s2.
 func (s *PathElementSet) Union(s2 *PathElementSet) *PathElementSet {
-	out := &PathElementSet{}
+	out := s.unionVal(s2)
+	return &out
+}
+
+func (s *PathElementSet) unionVal(s2 *PathElementSet) PathElementSet {
+	if len(s.members) == 0 {
+		return *s2
+	}
+	if len(s2.members) == 0 {
+		return *s
+	}
+	out := PathElementSet{
+		members: make(sortedPathElements, 0, len(s.members)+len(s2.members)),
+	}
 
 	i, j := 0, 0
 	for i < len(s.members) && j < len(s2.members) {
@@ -293,14 +306,23 @@ func (s *PathElementSet) Union(s2 *PathElementSet) *PathElementSet {
 
 // Intersection returns a set containing elements which appear in both s and s2.
 func (s *PathElementSet) Intersection(s2 *PathElementSet) *PathElementSet {
-	out := &PathElementSet{}
+	out := s.intersectionVal(s2)
+	return &out
+}
+
+func (s *PathElementSet) intersectionVal(s2 *PathElementSet) PathElementSet {
+	if len(s.members) == 0 || len(s2.members) == 0 {
+		return PathElementSet{}
+	}
+	var out PathElementSet
 
 	i, j := 0, 0
 	for i < len(s.members) && j < len(s2.members) {
-		if s.members[i].Less(s2.members[j]) {
+		c := s.members[i].Compare(s2.members[j])
+		if c < 0 {
 			i++
 		} else {
-			if !s2.members[j].Less(s.members[i]) {
+			if c == 0 {
 				out.members = append(out.members, s.members[i])
 				i++
 			}
@@ -313,24 +335,46 @@ func (s *PathElementSet) Intersection(s2 *PathElementSet) *PathElementSet {
 
 // Difference returns a set containing elements which appear in s but not in s2.
 func (s *PathElementSet) Difference(s2 *PathElementSet) *PathElementSet {
-	out := &PathElementSet{}
+	out, _ := s.differenceVal(s2)
+	return &out
+}
+
+func (s *PathElementSet) differenceVal(s2 *PathElementSet) (PathElementSet, bool) {
+	if len(s.members) == 0 || len(s2.members) == 0 {
+		return *s, false
+	}
+	var out PathElementSet
+	changed := false
 
 	i, j := 0, 0
 	for i < len(s.members) && j < len(s2.members) {
-		if s.members[i].Less(s2.members[j]) {
-			out.members = append(out.members, s.members[i])
+		c := s.members[i].Compare(s2.members[j])
+		if c < 0 {
+			if changed {
+				out.members = append(out.members, s.members[i])
+			}
 			i++
 		} else {
-			if !s2.members[j].Less(s.members[i]) {
+			if c == 0 {
+				if !changed {
+					changed = true
+					if i > 0 {
+						out.members = make(sortedPathElements, i, len(s.members)-1)
+						copy(out.members, s.members[:i])
+					}
+				}
 				i++
 			}
 			j++
 		}
 	}
+	if !changed {
+		return *s, false
+	}
 	if i < len(s.members) {
 		out.members = append(out.members, s.members[i:]...)
 	}
-	return out
+	return out, true
 }
 
 // Size retuns the number of elements in the set.

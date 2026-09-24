@@ -18,7 +18,9 @@ package v1
 
 import (
 	"encoding/json"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	cbor "k8s.io/apimachinery/pkg/runtime/serializer/cbor/direct"
 )
@@ -96,11 +98,44 @@ func (t Time) Rfc3339Copy() Time {
 	return Time{copied}
 }
 
+type timeParseCacheEntry struct {
+	raw [20]byte
+	t   time.Time
+}
+
+type timeUnstructuredCacheEntry struct {
+	sec  int64
+	nsec int32
+	val  interface{}
+}
+
+var (
+	timeParseCache        [256]atomic.Pointer[timeParseCacheEntry]
+	timeUnstructuredCache [256]atomic.Pointer[timeUnstructuredCacheEntry]
+)
+
 // UnmarshalJSON implements the json.Unmarshaller interface.
 func (t *Time) UnmarshalJSON(b []byte) error {
 	if len(b) == 4 && string(b) == "null" {
 		t.Time = time.Time{}
 		return nil
+	}
+
+	if len(b) == 22 && b[0] == '"' && b[21] == '"' {
+		var raw [20]byte
+		copy(raw[:], b[1:21])
+		idx := (uint64(raw[17])<<16 | uint64(raw[18])<<8 | uint64(raw[14])) & 255
+		if e := timeParseCache[idx].Load(); e != nil && e.raw == raw {
+			t.Time = e.t
+			return nil
+		}
+		pt, err := time.Parse(time.RFC3339, unsafe.String(&b[1], 20))
+		if err == nil {
+			localT := pt.Local()
+			timeParseCache[idx].Store(&timeParseCacheEntry{raw: raw, t: localT})
+			t.Time = localT
+			return nil
+		}
 	}
 
 	var str string
@@ -185,9 +220,17 @@ func (t Time) ToUnstructured() interface{} {
 	if t.IsZero() {
 		return nil
 	}
-	buf := make([]byte, 0, len(time.RFC3339))
-	buf = t.UTC().AppendFormat(buf, time.RFC3339)
-	return string(buf)
+	sec := t.Unix()
+	nsec := int32(t.Nanosecond())
+	idx := (uint64(sec) ^ uint64(nsec)) & 255
+	if e := timeUnstructuredCache[idx].Load(); e != nil && e.sec == sec && e.nsec == nsec {
+		return e.val
+	}
+	var b [len(time.RFC3339)]byte
+	s := string(t.UTC().AppendFormat(b[:0], time.RFC3339))
+	var val interface{} = s
+	timeUnstructuredCache[idx].Store(&timeUnstructuredCacheEntry{sec: sec, nsec: nsec, val: val})
+	return val
 }
 
 // OpenAPISchemaType is used by the kube-openapi generator when constructing

@@ -71,70 +71,107 @@ type Updater struct {
 }
 
 func (s *Updater) update(oldObject, newObject *typed.TypedValue, version fieldpath.APIVersion, managers fieldpath.ManagedFields, workflow string, force bool) (fieldpath.ManagedFields, *typed.Comparison, error) {
-	conflicts := fieldpath.ManagedFields{}
-	removed := fieldpath.ManagedFields{}
+	var conflicts fieldpath.ManagedFields
+	var removed fieldpath.ManagedFields
 	compare, err := oldObject.Compare(newObject)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to compare objects: %v", err)
 	}
 
-	var versions map[fieldpath.APIVersion]*typed.Comparison
-
 	if s.IgnoredFields != nil && s.IgnoreFilter != nil {
 		return nil, nil, fmt.Errorf("IgnoreFilter and IgnoreFilter may not both be set")
 	}
+	var baseCompare *typed.Comparison
 	if s.IgnoredFields != nil {
-		versions = map[fieldpath.APIVersion]*typed.Comparison{
-			version: compare.ExcludeFields(s.IgnoredFields[version]),
-		}
+		baseCompare = compare.ExcludeFields(s.IgnoredFields[version])
 	} else {
-		versions = map[fieldpath.APIVersion]*typed.Comparison{
-			version: compare.FilterFields(s.IgnoreFilter[version]),
-		}
+		baseCompare = compare.FilterFields(s.IgnoreFilter[version])
 	}
+	var baseModifiedAndAdded *fieldpath.Set
+	if baseCompare.Modified.Empty() {
+		baseModifiedAndAdded = baseCompare.Added
+	} else if baseCompare.Added.Empty() {
+		baseModifiedAndAdded = baseCompare.Modified
+	} else {
+		baseModifiedAndAdded = baseCompare.Modified.Union(baseCompare.Added)
+	}
+
+	var versions map[fieldpath.APIVersion]*typed.Comparison
+	var versionsModifiedAndAdded map[fieldpath.APIVersion]*fieldpath.Set
 
 	for manager, managerSet := range managers {
 		if manager == workflow {
 			continue
 		}
-		compare, ok := versions[managerSet.APIVersion()]
-		if !ok {
-			var err error
-			versionedOldObject, err := s.Converter.Convert(oldObject, managerSet.APIVersion())
-			if err != nil {
-				if s.Converter.IsMissingVersionError(err) {
-					delete(managers, manager)
-					continue
+		var mgrCompare *typed.Comparison
+		var mgrModifiedAndAdded *fieldpath.Set
+		if managerSet.APIVersion() == version {
+			mgrCompare = baseCompare
+			mgrModifiedAndAdded = baseModifiedAndAdded
+		} else {
+			var ok bool
+			if versions != nil {
+				mgrCompare, ok = versions[managerSet.APIVersion()]
+				mgrModifiedAndAdded = versionsModifiedAndAdded[managerSet.APIVersion()]
+			}
+			if !ok {
+				versionedOldObject, err := s.Converter.Convert(oldObject, managerSet.APIVersion())
+				if err != nil {
+					if s.Converter.IsMissingVersionError(err) {
+						delete(managers, manager)
+						continue
+					}
+					return nil, nil, fmt.Errorf("failed to convert old object: %v", err)
 				}
-				return nil, nil, fmt.Errorf("failed to convert old object: %v", err)
-			}
-			versionedNewObject, err := s.Converter.Convert(newObject, managerSet.APIVersion())
-			if err != nil {
-				if s.Converter.IsMissingVersionError(err) {
-					delete(managers, manager)
-					continue
+				versionedNewObject, err := s.Converter.Convert(newObject, managerSet.APIVersion())
+				if err != nil {
+					if s.Converter.IsMissingVersionError(err) {
+						delete(managers, manager)
+						continue
+					}
+					return nil, nil, fmt.Errorf("failed to convert new object: %v", err)
 				}
-				return nil, nil, fmt.Errorf("failed to convert new object: %v", err)
-			}
-			compare, err = versionedOldObject.Compare(versionedNewObject)
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to compare objects: %v", err)
-			}
+				rawCompare, err := versionedOldObject.Compare(versionedNewObject)
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to compare objects: %v", err)
+				}
 
-			if s.IgnoredFields != nil {
-				versions[managerSet.APIVersion()] = compare.ExcludeFields(s.IgnoredFields[managerSet.APIVersion()])
-			} else {
-				versions[managerSet.APIVersion()] = compare.FilterFields(s.IgnoreFilter[managerSet.APIVersion()])
+				if s.IgnoredFields != nil {
+					mgrCompare = rawCompare.ExcludeFields(s.IgnoredFields[managerSet.APIVersion()])
+				} else {
+					mgrCompare = rawCompare.FilterFields(s.IgnoreFilter[managerSet.APIVersion()])
+				}
+				if mgrCompare.Modified.Empty() {
+					mgrModifiedAndAdded = mgrCompare.Added
+				} else if mgrCompare.Added.Empty() {
+					mgrModifiedAndAdded = mgrCompare.Modified
+				} else {
+					mgrModifiedAndAdded = mgrCompare.Modified.Union(mgrCompare.Added)
+				}
+				if versions == nil {
+					versions = make(map[fieldpath.APIVersion]*typed.Comparison, 2)
+					versionsModifiedAndAdded = make(map[fieldpath.APIVersion]*fieldpath.Set, 2)
+				}
+				versions[managerSet.APIVersion()] = mgrCompare
+				versionsModifiedAndAdded[managerSet.APIVersion()] = mgrModifiedAndAdded
 			}
 		}
 
-		conflictSet := managerSet.Set().Intersection(compare.Modified.Union(compare.Added))
-		if !conflictSet.Empty() {
-			conflicts[manager] = fieldpath.NewVersionedSet(conflictSet, managerSet.APIVersion(), false)
+		if !mgrModifiedAndAdded.Empty() {
+			conflictSet := managerSet.Set().Intersection(mgrModifiedAndAdded)
+			if !conflictSet.Empty() {
+				if conflicts == nil {
+					conflicts = fieldpath.ManagedFields{}
+				}
+				conflicts[manager] = fieldpath.NewVersionedSet(conflictSet, managerSet.APIVersion(), false)
+			}
 		}
 
-		if !compare.Removed.Empty() {
-			removed[manager] = fieldpath.NewVersionedSet(compare.Removed, managerSet.APIVersion(), false)
+		if !mgrCompare.Removed.Empty() {
+			if removed == nil {
+				removed = fieldpath.ManagedFields{}
+			}
+			removed[manager] = fieldpath.NewVersionedSet(mgrCompare.Removed, managerSet.APIVersion(), false)
 		}
 	}
 

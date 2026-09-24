@@ -35,6 +35,31 @@ var labelKeyRegexp = regexp.MustCompile("^" + labelKeyFmt + "$")
 // Deprecated: use IsLabelKey instead.
 var IsQualifiedName = IsLabelKey
 
+func isValidLabelKeyName(s string) bool {
+	n := len(s)
+	if n == 0 {
+		return false
+	}
+	c0 := s[0]
+	if !((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || (c0 >= '0' && c0 <= '9')) {
+		return false
+	}
+	if n == 1 {
+		return true
+	}
+	cn := s[n-1]
+	if !((cn >= 'a' && cn <= 'z') || (cn >= 'A' && cn <= 'Z') || (cn >= '0' && cn <= '9')) {
+		return false
+	}
+	for i := 1; i < n-1; i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
 // IsLabelKey tests whether the value passed is a valid label key. This format
 // is used to validate many fields in the Kubernetes API.
 // Label keys consist of an optional prefix and a name, separated by a '/'.
@@ -42,22 +67,19 @@ var IsQualifiedName = IsLabelKey
 // empty list (or nil) is returned.
 func IsLabelKey(value string) []string {
 	var errs []string
-	parts := strings.Split(value, "/")
 	var name string
-	switch len(parts) {
-	case 1:
-		name = parts[0]
-	case 2:
-		var prefix string
-		prefix, name = parts[0], parts[1]
+	if prefix, suffix, hasSlash := strings.Cut(value, "/"); !hasSlash {
+		name = value
+	} else if strings.IndexByte(suffix, '/') != -1 {
+		return append(errs, "a valid label key "+RegexError(labelKeyErrMsg, labelKeyFmt, "MyName", "my.name", "123-abc")+
+			" with an optional DNS subdomain prefix and '/' (e.g. 'example.com/MyName')")
+	} else {
+		name = suffix
 		if len(prefix) == 0 {
 			errs = append(errs, "prefix part "+EmptyError())
 		} else if msgs := IsDNS1123Subdomain(prefix); len(msgs) != 0 {
 			errs = append(errs, prefixEach(msgs, "prefix part ")...)
 		}
-	default:
-		return append(errs, "a valid label key "+RegexError(labelKeyErrMsg, labelKeyFmt, "MyName", "my.name", "123-abc")+
-			" with an optional DNS subdomain prefix and '/' (e.g. 'example.com/MyName')")
 	}
 
 	if len(name) == 0 {
@@ -65,7 +87,7 @@ func IsLabelKey(value string) []string {
 	} else if len(name) > labelKeyMaxLength {
 		errs = append(errs, "name part "+MaxLenError(labelKeyMaxLength))
 	}
-	if !labelKeyRegexp.MatchString(name) {
+	if !isValidLabelKeyName(name) {
 		errs = append(errs, "name part "+RegexError(labelKeyErrMsg, labelKeyFmt, "MyName", "my.name", "123-abc"))
 	}
 	return errs
@@ -87,7 +109,7 @@ func IsLabelValue(value string) []string {
 	if len(value) > LabelValueMaxLength {
 		errs = append(errs, MaxLenError(LabelValueMaxLength))
 	}
-	if !labelValueRegexp.MatchString(value) {
+	if len(value) > 0 && !isValidLabelKeyName(value) {
 		errs = append(errs, RegexError(labelValueErrMsg, labelValueFmt, "MyValue", "my_value", "12345"))
 	}
 	return errs
@@ -109,8 +131,7 @@ func IsPrefixedLabelKey(value string) []string {
 		return errs
 	}
 
-	segments := strings.Split(value, "/")
-	if len(segments) != 2 {
+	if _, suffix, hasSlash := strings.Cut(value, "/"); !hasSlash || strings.IndexByte(suffix, '/') != -1 {
 		return []string{"must include a prefix (e.g. 'example.com/key')"}
 	}
 	return nil

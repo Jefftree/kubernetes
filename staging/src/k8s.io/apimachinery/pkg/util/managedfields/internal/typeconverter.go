@@ -65,6 +65,15 @@ func (c *typeConverter) ObjectToTyped(obj runtime.Object, opts ...typed.Validati
 	case *unstructured.Unstructured:
 		return t.FromUnstructured(o.UnstructuredContent(), opts...)
 	default:
+		for _, opt := range opts {
+			if opt == typed.AllowDuplicates && t.IsValid() {
+				v, err := value.NewValueReflect(obj)
+				if err != nil {
+					return nil, fmt.Errorf("error creating struct value reflector: %v", err)
+				}
+				return typed.AsTypedUnvalidated(v, t.Schema, t.TypeRef), nil
+			}
+		}
 		return t.FromStructured(obj, opts...)
 	}
 }
