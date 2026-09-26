@@ -21,11 +21,14 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"reflect"
 	goruntime "runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +50,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/apis/example"
 	examplev1 "k8s.io/apiserver/pkg/apis/example/v1"
+	"k8s.io/apiserver/pkg/endpoints/handlers"
 	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/cacher/delegator"
@@ -2456,6 +2460,185 @@ func BenchmarkCacher_GetList_AllPods(b *testing.B) {
 		if len(result.Items) != totalObjectNum {
 			b.Fatalf("expect %d but got %d", totalObjectNum, len(result.Items))
 		}
+	}
+}
+
+type paddedWatchBenchCounter struct {
+	count atomic.Int64
+	_     [56]byte
+}
+
+type noopWatchFramer struct{}
+
+func (noopWatchFramer) NewFrameWriter(w io.Writer) io.Writer         { return w }
+func (noopWatchFramer) NewFrameReader(r io.ReadCloser) io.ReadCloser { return r }
+
+type noopTimeoutFactory struct{}
+
+func (noopTimeoutFactory) TimeoutCh() (<-chan time.Time, func() bool) {
+	return nil, func() bool { return false }
+}
+
+type benchWatchResponseWriter struct {
+	header     http.Header
+	wroteEvent bool
+	onReady    func()
+	onEvent    func()
+}
+
+func (w *benchWatchResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *benchWatchResponseWriter) WriteHeader(int) {
+	if w.onReady != nil {
+		w.onReady()
+		w.onReady = nil
+	}
+}
+
+func (w *benchWatchResponseWriter) Write(p []byte) (int, error) {
+	w.wroteEvent = true
+	return len(p), nil
+}
+
+func (w *benchWatchResponseWriter) Flush() {
+	if w.wroteEvent {
+		w.wroteEvent = false
+		w.onEvent()
+	}
+}
+
+func BenchmarkCacher_Watch(b *testing.B) {
+	for _, watcherCount := range []int{1000, 5000} {
+		b.Run(fmt.Sprintf("watchers=%d", watcherCount), func(b *testing.B) {
+			pods := benchmarkPods(2)
+			delegator := newDelegatorWithPods(b, pods[:1])
+
+			ctx, cancel := context.WithCancel(b.Context())
+			defer cancel()
+
+			codec := codecs.LegacyCodec(examplev1.SchemeGroupVersion)
+			scope := &handlers.RequestScope{
+				Resource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"},
+				Kind:     examplev1.SchemeGroupVersion.WithKind("Pod"),
+			}
+
+			var shards [64]paddedWatchBenchCounter
+			var activeShards atomic.Int64
+			eventDone := make(chan struct{}, 1)
+			var shardWeight [64]int64
+			for i := range watcherCount {
+				shardWeight[i&63]++
+			}
+			armEvent := func() {
+				var nonZero int64
+				for s := range 64 {
+					if w := shardWeight[s]; w > 0 {
+						shards[s].count.Store(w)
+						nonZero++
+					}
+				}
+				activeShards.Store(nonZero)
+			}
+
+			var readyWg sync.WaitGroup
+			var serveWg sync.WaitGroup
+			readyWg.Add(watcherCount)
+			serveWg.Add(watcherCount)
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/api/v1/pods?watch=true", nil)
+			if err != nil {
+				b.Fatalf("new request: %v", err)
+			}
+
+			for i := range watcherCount {
+				w, err := delegator.Watch(ctx, "/pods/", storage.ListOptions{
+					ResourceVersion: "12345",
+					Recursive:       true,
+					Predicate:       storage.Everything,
+				})
+				if err != nil {
+					b.Fatalf("Watch: %v", err)
+				}
+				shardID := i & 63
+				rw := &benchWatchResponseWriter{
+					header:  make(http.Header, 2),
+					onReady: readyWg.Done,
+					onEvent: func() {
+						if shards[shardID].count.Add(-1) == 0 {
+							if activeShards.Add(-1) == 0 {
+								eventDone <- struct{}{}
+							}
+						}
+					},
+				}
+				ws := &handlers.WatchServer{
+					Watching:        w,
+					Scope:           scope,
+					MediaType:       runtime.ContentTypeProtobuf,
+					Framer:          noopWatchFramer{},
+					Encoder:         codec,
+					EmbeddedEncoder: codec,
+					TimeoutFactory:  noopTimeoutFactory{},
+				}
+				go func() {
+					defer serveWg.Done()
+					defer w.Stop()
+					ws.HandleHTTP(rw, req)
+				}()
+			}
+
+			readyWg.Wait()
+
+			podA := &pods[0]
+			podB := &pods[1]
+			podA.ResourceVersion = "12346"
+			podB.ResourceVersion = "12347"
+			flds := fields.Set{
+				"metadata.name":      podA.Name,
+				"metadata.namespace": podA.Namespace,
+				"spec.nodeName":      podA.Spec.NodeName,
+			}
+
+			// Warm up one fanout round before starting the timer.
+			armEvent()
+			delegator.cacher.dispatchEvent(&watchCacheEvent{
+				Type:            watch.Modified,
+				Object:          podA,
+				ObjFields:       flds,
+				PrevObject:      podB,
+				PrevObjFields:   flds,
+				Key:             "/pods/default/pod-0",
+				ResourceVersion: 12346,
+			})
+			<-eventDone
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				rv := uint64(12347 + i)
+				obj, prev := podA, podB
+				if i&1 == 1 {
+					obj, prev = podB, podA
+				}
+				ev := watchCacheEvent{
+					Type:            watch.Modified,
+					Object:          obj,
+					ObjFields:       flds,
+					PrevObject:      prev,
+					PrevObjFields:   flds,
+					Key:             "/pods/default/pod-0",
+					ResourceVersion: rv,
+				}
+				armEvent()
+				delegator.cacher.dispatchEvent(&ev)
+				<-eventDone
+			}
+			b.StopTimer()
+			cancel()
+			serveWg.Wait()
+		})
 	}
 }
 
