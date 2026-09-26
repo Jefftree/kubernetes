@@ -370,16 +370,16 @@ func updateResourceVersion(object runtime.Object, versioner storage.Versioner, r
 	}
 }
 
-func (c *cacheWatcher) convertToWatchEvent(event *watchCacheEvent) *watch.Event {
+func (c *cacheWatcher) convertToWatchEvent(event *watchCacheEvent) (watch.Event, bool) {
 	if event.Type == watch.Bookmark {
-		e := &watch.Event{Type: watch.Bookmark, Object: event.Object.DeepCopyObject()}
+		e := watch.Event{Type: watch.Bookmark, Object: event.Object.DeepCopyObject()}
 		if !c.wasBookmarkAfterRvSent() {
 			if err := storage.AnnotateInitialEventsEndBookmark(e.Object); err != nil {
 				utilruntime.HandleError(fmt.Errorf("error while accessing object's metadata gr: %v, identifier: %v, obj: %#v, err: %v", c.groupResource, c.identifier, e.Object, err))
-				return nil
+				return watch.Event{}, false
 			}
 		}
-		return e
+		return e, true
 	}
 
 	curObjPasses := event.Type != watch.Deleted && c.filter(event.Key, event.ObjLabels, event.ObjFields, event.Object)
@@ -389,14 +389,14 @@ func (c *cacheWatcher) convertToWatchEvent(event *watchCacheEvent) *watch.Event 
 	}
 	if !curObjPasses && !oldObjPasses {
 		// Watcher is not interested in that object.
-		return nil
+		return watch.Event{}, false
 	}
 
 	switch {
 	case curObjPasses && !oldObjPasses:
-		return &watch.Event{Type: watch.Added, Object: getMutableObject(event.Object)}
+		return watch.Event{Type: watch.Added, Object: getMutableObject(event.Object)}, true
 	case curObjPasses && oldObjPasses:
-		return &watch.Event{Type: watch.Modified, Object: getMutableObject(event.Object)}
+		return watch.Event{Type: watch.Modified, Object: getMutableObject(event.Object)}, true
 	case !curObjPasses && oldObjPasses:
 		// return a delete event with the previous object content, but with the event's resource version
 		oldObj := getMutableObject(event.PrevObject)
@@ -405,16 +405,16 @@ func (c *cacheWatcher) convertToWatchEvent(event *watchCacheEvent) *watch.Event 
 		// we don't need to update it. However, since cachingObject efficiently
 		// handles noop updates, we avoid this microoptimization here.
 		updateResourceVersion(oldObj, c.versioner, event.ResourceVersion)
-		return &watch.Event{Type: watch.Deleted, Object: oldObj}
+		return watch.Event{Type: watch.Deleted, Object: oldObj}, true
 	}
 
-	return nil
+	return watch.Event{}, false
 }
 
 // NOTE: sendWatchCacheEvent is assumed to not modify <event> !!!
 func (c *cacheWatcher) sendWatchCacheEvent(event *watchCacheEvent) (builtAt, sentAt time.Time) {
-	watchEvent := c.convertToWatchEvent(event)
-	if watchEvent == nil {
+	watchEvent, ok := c.convertToWatchEvent(event)
+	if !ok {
 		// Watcher is not interested in that object.
 		return time.Time{}, time.Time{}
 	}
@@ -439,7 +439,7 @@ func (c *cacheWatcher) sendWatchCacheEvent(event *watchCacheEvent) (builtAt, sen
 	}
 
 	select {
-	case c.result <- *watchEvent:
+	case c.result <- watchEvent:
 		c.markBookmarkAfterRvSent(event)
 		sentAt = c.clock.Now()
 	case <-c.done:
@@ -540,22 +540,20 @@ func (c *cacheWatcher) process(ctx context.Context, resourceVersion uint64) {
 	//   process, but we're leaving this to the tuning phase.
 	utilflowcontrol.WatchInitialized(ctx)
 
-	for {
-		select {
-		case event, ok := <-c.input:
-			if !ok {
-				return
-			}
-			dequeuedAt := c.clock.Now()
-			// only send events newer than resourceVersion
-			// or a bookmark event with an RV equal to resourceVersion
-			// if we haven't sent one to the client
-			if event.ResourceVersion > resourceVersion || (event.Type == watch.Bookmark && event.ResourceVersion == resourceVersion && !c.wasBookmarkAfterRvSent()) {
-				builtAt, sentAt := c.sendWatchCacheEvent(event)
-				c.observeDispatchMetrics(event, dequeuedAt, builtAt, sentAt)
-			}
-		case <-ctx.Done():
+	stop := context.AfterFunc(ctx, c.Stop)
+	defer stop()
+
+	for event := range c.input {
+		if ctx.Err() != nil {
 			return
+		}
+		dequeuedAt := c.clock.Now()
+		// only send events newer than resourceVersion
+		// or a bookmark event with an RV equal to resourceVersion
+		// if we haven't sent one to the client
+		if event.ResourceVersion > resourceVersion || (event.Type == watch.Bookmark && event.ResourceVersion == resourceVersion && !c.wasBookmarkAfterRvSent()) {
+			builtAt, sentAt := c.sendWatchCacheEvent(event)
+			c.observeDispatchMetrics(event, dequeuedAt, builtAt, sentAt)
 		}
 	}
 }
