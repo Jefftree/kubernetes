@@ -20,6 +20,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -268,4 +270,56 @@ func checkSpans[T sdktrace.ReadOnlySpan](t *testing.T, output []T, spanNames []s
 			t.Fatalf("index %d: got %s; expected span.Name == %s", idx, span.Name(), spanName)
 		}
 	}
+}
+
+func BenchmarkTrackStartedCompleted(b *testing.B) {
+	const numFilters = 10
+	newChain := func(handler http.Handler) http.Handler {
+		tp := noopoteltrace.NewTracerProvider()
+		clk := testingclock.NewFakePassiveClock(time.Now())
+		noop := func(context.Context, *requestFilterRecord, time.Time) {}
+		for i := 0; i < numFilters; i++ {
+			handler = trackCompleted(handler, clk, noop)
+			handler = trackStarted(handler, tp, "filter", clk)
+		}
+		return handler
+	}
+
+	b.Run("ServeHTTP", func(b *testing.B) {
+		chain := newChain(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/pods", nil)
+		w := httptest.NewRecorder()
+		b.ReportAllocs()
+		for b.Loop() {
+			chain.ServeHTTP(w, req)
+		}
+	})
+
+	// GCWithParkedRequests measures GC cost with many long-running requests (such as watches)
+	// parked inside the filter chain, where every goroutine stack holds all filter frames.
+	b.Run("GCWithParkedRequests", func(b *testing.B) {
+		const numRequests = 10000
+		release := make(chan struct{})
+		var started, finished sync.WaitGroup
+		started.Add(numRequests)
+		finished.Add(numRequests)
+		chain := newChain(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			started.Done()
+			<-release
+		}))
+		for i := 0; i < numRequests; i++ {
+			go func() {
+				defer finished.Done()
+				chain.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v1/pods?watch=true", nil))
+			}()
+		}
+		started.Wait()
+		runtime.GC()
+		for b.Loop() {
+			runtime.GC()
+		}
+		b.StopTimer()
+		close(release)
+		finished.Wait()
+	})
 }
