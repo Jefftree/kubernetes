@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
 	"k8s.io/apiserver/pkg/endpoints/metrics"
@@ -256,6 +257,23 @@ func listOpts(req *http.Request, scope *RequestScope) (metainternalversion.ListO
 }
 
 func handleWatch(ctx context.Context, rw rest.Watcher, scope *RequestScope, req *http.Request, w http.ResponseWriter, opts metainternalversion.ListOptions, outputMediaType negotiation.MediaTypeOptions, minRequestTimeout time.Duration) error {
+	req, handler, watcher, cancel, err := prepareWatch(ctx, rw, scope, req, w, opts, outputMediaType, minRequestTimeout)
+	if err != nil {
+		return err
+	}
+
+	// Run watch serving in a separate goroutine to allow freeing current stack memory
+	if t := routine.TaskFrom(req.Context()); t != nil {
+		t.Func = func() {
+			serveWatchStream(req, w, handler, watcher, cancel)
+		}
+		return nil
+	}
+	serveWatchStream(req, w, handler, watcher, cancel)
+	return nil
+}
+
+func prepareWatch(ctx context.Context, rw rest.Watcher, scope *RequestScope, req *http.Request, w http.ResponseWriter, opts metainternalversion.ListOptions, outputMediaType negotiation.MediaTypeOptions, minRequestTimeout time.Duration) (*http.Request, http.Handler, watch.Interface, context.CancelFunc, error) {
 	isWatchList := isListWatchRequest(opts)
 	var span *tracing.Span
 	var onWatchListComplete WatchListCompleteHook
@@ -266,7 +284,7 @@ func handleWatch(ctx context.Context, rw rest.Watcher, scope *RequestScope, req 
 	}
 
 	if rw == nil {
-		return errors.NewMethodNotSupported(scope.Resource.GroupResource(), "watch")
+		return nil, nil, nil, nil, errors.NewMethodNotSupported(scope.Resource.GroupResource(), "watch")
 	}
 	// TODO: Currently we explicitly ignore ?timeout= and use only ?timeoutSeconds=.
 	timeout := time.Duration(0)
@@ -279,36 +297,28 @@ func handleWatch(ctx context.Context, rw rest.Watcher, scope *RequestScope, req 
 
 	klog.V(3).InfoS("Starting watch", "path", req.URL.Path, "resourceVersion", opts.ResourceVersion, "labels", opts.LabelSelector, "fields", opts.FieldSelector, "sendInitialEvents", opts.SendInitialEvents, "timeout", timeout, "audit-ID", audit.GetAuditIDTruncated(ctx))
 	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer func() { cancel() }()
+	req = req.WithContext(ctx)
 	watcher, err := rw.Watch(ctx, &opts)
 	if err != nil {
-		return err
+		cancel()
+		return nil, nil, nil, nil, err
 	}
 	handler, err := serveWatchHandler(watcher, scope, outputMediaType, req, w, timeout, metrics.CleanListScope(ctx, &opts), isWatchList, onWatchListComplete)
 	if err != nil {
-		return err
+		watcher.Stop()
+		cancel()
+		return nil, nil, nil, nil, err
 	}
-	// Invalidate cancel() to defer until serve() is complete.
-	deferredCancel := cancel
-	cancel = func() {}
+	return req, handler, watcher, cancel, nil
+}
 
-	serve := func() {
-		defer deferredCancel()
-		requestInfo, _ := request.RequestInfoFrom(ctx)
-		metrics.RecordLongRunning(req, requestInfo, metrics.APIServerComponent, func() {
-			defer watcher.Stop()
-			handler.ServeHTTP(w, req)
-		})
-	}
-
-	// Run watch serving in a separate goroutine to allow freeing current stack memory
-	t := routine.TaskFrom(req.Context())
-	if t != nil {
-		t.Func = serve
-	} else {
-		serve()
-	}
-	return nil
+func serveWatchStream(req *http.Request, w http.ResponseWriter, handler http.Handler, watcher watch.Interface, cancel context.CancelFunc) {
+	requestInfo, _ := request.RequestInfoFrom(req.Context())
+	g := metrics.StartLongRunning(req, requestInfo, metrics.APIServerComponent)
+	handler.ServeHTTP(w, req)
+	g.Dec()
+	watcher.Stop()
+	cancel()
 }
 
 func handleList(ctx context.Context, r rest.Lister, scope *RequestScope, req *http.Request, w http.ResponseWriter, opts metainternalversion.ListOptions, outputMediaType negotiation.MediaTypeOptions) error {

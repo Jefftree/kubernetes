@@ -534,9 +534,8 @@ func RecordRequestTermination(req *http.Request, requestInfo *request.RequestInf
 	}
 }
 
-// RecordLongRunning tracks the execution of a long running request against the API server. It provides an accurate count
-// of the total number of open long running requests. requestInfo may be nil if the caller is not in the normal request flow.
-func RecordLongRunning(req *http.Request, requestInfo *request.RequestInfo, component string, fn func()) {
+// StartLongRunning increments the long-running request gauge and returns it for the caller to decrement on completion.
+func StartLongRunning(req *http.Request, requestInfo *request.RequestInfo, component string) compbasemetrics.GaugeMetric {
 	if requestInfo == nil {
 		requestInfo = &request.RequestInfo{Verb: req.Method, Path: req.URL.Path}
 	}
@@ -555,6 +554,13 @@ func RecordLongRunning(req *http.Request, requestInfo *request.RequestInfo, comp
 		g = longRunningRequestsGauge.WithContext(req.Context()).WithLabelValues(reportedVerb, "", "", "", requestInfo.Path, scope, component)
 	}
 	g.Inc()
+	return g
+}
+
+// RecordLongRunning tracks the execution of a long running request against the API server. It provides an accurate count
+// of the total number of open long running requests. requestInfo may be nil if the caller is not in the normal request flow.
+func RecordLongRunning(req *http.Request, requestInfo *request.RequestInfo, component string, fn func()) {
+	g := StartLongRunning(req, requestInfo, component)
 	defer g.Dec()
 	fn()
 }

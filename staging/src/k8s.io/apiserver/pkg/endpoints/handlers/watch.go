@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -360,6 +361,43 @@ func (w *watchResponseWriter) Close() error {
 // HandleHTTP serves a series of encoded events via HTTP with Transfer-Encoding: chunked.
 // or over a websocket connection.
 func (s *WatchServer) HandleHTTP(w http.ResponseWriter, req *http.Request) {
+	ctx, rw, recorder, watchEncoder, span, ok := s.prepareHTTP(w, req)
+	if !ok {
+		s.releaseAllocator()
+		return
+	}
+
+	var timeoutCh <-chan time.Time
+	var cleanup func() bool
+	if rtf, isReal := s.TimeoutFactory.(*realTimeoutFactory); isReal {
+		if rtf.timeout > 0 {
+			if deadline, hasDeadline := ctx.Deadline(); !hasDeadline || time.Until(deadline) > rtf.timeout+time.Second {
+				timer := time.AfterFunc(rtf.timeout, s.Watching.Stop)
+				cleanup = timer.Stop
+			}
+		}
+	} else if s.TimeoutFactory != nil {
+		timeoutCh, cleanup = s.TimeoutFactory.TimeoutCh()
+	}
+
+	s.serveHTTP(ctx, req.URL.Path, rw, recorder, watchEncoder, span, timeoutCh)
+
+	if cleanup != nil {
+		cleanup()
+	}
+	if err := rw.Close(); err != nil {
+		utilruntime.HandleErrorWithContext(ctx, err, "Failed to close watch response writer")
+	}
+	s.releaseAllocator()
+}
+
+func (s *WatchServer) releaseAllocator() {
+	if s.MemoryAllocator != nil {
+		runtime.AllocatorPool.Put(s.MemoryAllocator)
+	}
+}
+
+func (s *WatchServer) prepareHTTP(w http.ResponseWriter, req *http.Request) (context.Context, *watchResponseWriter, *watchEventMetricsRecorder, *watchEncoder, *tracing.Span, bool) {
 	ctx := req.Context()
 	ctx, span := tracing.Start(ctx, "WatchServer.HandleHTTP",
 		attribute.String("audit-id", audit.GetAuditIDTruncated(ctx)),
@@ -368,41 +406,29 @@ func (s *WatchServer) HandleHTTP(w http.ResponseWriter, req *http.Request) {
 		attribute.String("protocol", req.Proto),
 		attribute.String("mediaType", s.MediaType),
 		attribute.String("encoder", string(s.Encoder.Identifier())))
-	req = req.WithContext(ctx)
-	defer func() {
-		if s.MemoryAllocator != nil {
-			runtime.AllocatorPool.Put(s.MemoryAllocator)
-		}
-	}()
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		err := fmt.Errorf("unable to start watch - can't get http.Flusher: %#v", w)
-		utilruntime.HandleErrorWithContext(req.Context(), err, "Unable to start watch")
-		s.Scope.err(errors.NewInternalError(err), w, req)
-		return
+		utilruntime.HandleErrorWithContext(ctx, err, "Unable to start watch")
+		s.Scope.err(errors.NewInternalError(err), w, req.WithContext(ctx))
+		return ctx, nil, nil, nil, nil, false
 	}
 
 	contentEncoding := responsewriters.ContentEncodingSupported(req, features.WatchListCompression)
 	rw := newWatchResponseWriter(w, flusher, contentEncoding, s.isWatchListRequest)
-	defer func() {
-		if err := rw.Close(); err != nil {
-			utilruntime.HandleErrorWithContext(req.Context(), err, "Failed to close watch response writer")
-		}
-	}()
 
 	framer := s.Framer.NewFrameWriter(rw)
 	if framer == nil {
 		// programmer error
+		if err := rw.Close(); err != nil {
+			utilruntime.HandleErrorWithContext(ctx, err, "Failed to close watch response writer")
+		}
 		err := fmt.Errorf("no stream framing support is available for media type %q", s.MediaType)
-		utilruntime.HandleErrorWithContext(req.Context(), err, "No stream framing support available")
-		s.Scope.err(errors.NewBadRequest(err.Error()), w, req)
-		return
+		utilruntime.HandleErrorWithContext(ctx, err, "No stream framing support available")
+		s.Scope.err(errors.NewBadRequest(err.Error()), w, req.WithContext(ctx))
+		return ctx, nil, nil, nil, nil, false
 	}
-
-	// ensure the connection times out
-	timeoutCh, cleanup := s.TimeoutFactory.TimeoutCh()
-	defer cleanup()
 
 	// begin the stream
 	rw.BeginStream(s.MediaType)
@@ -411,15 +437,130 @@ func (s *WatchServer) HandleHTTP(w http.ResponseWriter, req *http.Request) {
 
 	recorder := &watchEventMetricsRecorder{
 		writer:      framer,
-		countMetric: metrics.WatchEvents.WithContext(req.Context()).WithLabelValues(gvr.Group, gvr.Version, gvr.Resource),
-		sizeMetric:  metrics.WatchEventsSizes.WithContext(req.Context()).WithLabelValues(gvr.Group, gvr.Version, gvr.Resource),
+		countMetric: metrics.WatchEvents.WithContext(ctx).WithLabelValues(gvr.Group, gvr.Version, gvr.Resource),
+		sizeMetric:  metrics.WatchEventsSizes.WithContext(ctx).WithLabelValues(gvr.Group, gvr.Version, gvr.Resource),
 	}
 
-	watchEncoder := newWatchEncoder(req.Context(), gvr, s.EmbeddedEncoder, s.Encoder, recorder)
-	ch := s.Watching.ResultChan()
-	done := req.Context().Done()
-
+	watchEncoder := newWatchEncoder(ctx, gvr, s.EmbeddedEncoder, s.Encoder, recorder)
 	span.AddEvent("About to start writing response")
+	return ctx, rw, recorder, watchEncoder, span, true
+}
+
+var shutdownNotifiers sync.Map // map[<-chan struct{}]*shutdownNotifier
+
+type shutdownShard struct {
+	mu       sync.Mutex
+	closed   bool
+	watchers map[uint64]watch.Interface
+}
+
+type shutdownNotifier struct {
+	ch     <-chan struct{}
+	nextID atomic.Uint64
+	shards [64]shutdownShard
+}
+
+func registerShutdownWatcher(ch <-chan struct{}, w watch.Interface) (*shutdownNotifier, uint64) {
+	select {
+	case <-ch:
+		w.Stop()
+		return nil, 0
+	default:
+	}
+	val, ok := shutdownNotifiers.Load(ch)
+	if !ok {
+		n := &shutdownNotifier{ch: ch}
+		var loaded bool
+		val, loaded = shutdownNotifiers.LoadOrStore(ch, n)
+		if !loaded {
+			go n.wait()
+		}
+	}
+	n := val.(*shutdownNotifier)
+	id := n.nextID.Add(1)
+	shard := &n.shards[id%64]
+	shard.mu.Lock()
+	if shard.closed {
+		shard.mu.Unlock()
+		w.Stop()
+		return nil, 0
+	}
+	if shard.watchers == nil {
+		shard.watchers = make(map[uint64]watch.Interface)
+	}
+	shard.watchers[id] = w
+	shard.mu.Unlock()
+	return n, id
+}
+
+func (n *shutdownNotifier) wait() {
+	<-n.ch
+	shutdownNotifiers.Delete(n.ch)
+	for i := range n.shards {
+		shard := &n.shards[i]
+		shard.mu.Lock()
+		shard.closed = true
+		watchers := shard.watchers
+		shard.watchers = nil
+		shard.mu.Unlock()
+		for _, w := range watchers {
+			w.Stop()
+		}
+	}
+}
+
+func (n *shutdownNotifier) unregister(id uint64) {
+	shard := &n.shards[id%64]
+	shard.mu.Lock()
+	delete(shard.watchers, id)
+	shard.mu.Unlock()
+}
+
+func (s *WatchServer) serveHTTP(ctx context.Context, urlPath string, rw *watchResponseWriter, recorder *watchEventMetricsRecorder, watchEncoder *watchEncoder, span *tracing.Span, timeoutCh <-chan time.Time) {
+	if timeoutCh == nil {
+		stopDone := context.AfterFunc(ctx, s.Watching.Stop)
+		var sdNotifier *shutdownNotifier
+		var sdID uint64
+		if s.ServerShuttingDownCh != nil {
+			sdNotifier, sdID = registerShutdownWatcher(s.ServerShuttingDownCh, s.Watching)
+		}
+		s.serveHTTPChannel(ctx, urlPath, rw, recorder, watchEncoder, span)
+		if sdNotifier != nil {
+			sdNotifier.unregister(sdID)
+		}
+		stopDone()
+		return
+	}
+	s.serveHTTPSelect(ctx, urlPath, rw, recorder, watchEncoder, span, timeoutCh)
+}
+
+func (s *WatchServer) serveHTTPChannel(ctx context.Context, urlPath string, rw *watchResponseWriter, recorder *watchEventMetricsRecorder, watchEncoder *watchEncoder, span *tracing.Span) {
+	if s.ServerShuttingDownCh != nil {
+		select {
+		case <-s.ServerShuttingDownCh:
+			return
+		default:
+		}
+	}
+	ch := s.Watching.ResultChan()
+	for event := range ch {
+		if s.ServerShuttingDownCh != nil {
+			select {
+			case <-s.ServerShuttingDownCh:
+				return
+			default:
+			}
+		}
+		if !s.processHTTPEvent(ctx, urlPath, rw, recorder, watchEncoder, span, ch, event) {
+			return
+		}
+	}
+}
+
+func (s *WatchServer) serveHTTPSelect(ctx context.Context, urlPath string, rw *watchResponseWriter, recorder *watchEventMetricsRecorder, watchEncoder *watchEncoder, span *tracing.Span, timeoutCh <-chan time.Time) {
+	ch := s.Watching.ResultChan()
+	done := ctx.Done()
+
 	for {
 		select {
 		case <-s.ServerShuttingDownCh:
@@ -440,44 +581,58 @@ func (s *WatchServer) HandleHTTP(w http.ResponseWriter, req *http.Request) {
 				// End of results.
 				return
 			}
-			isWatchListLatencyRecordingRequired := shouldRecordWatchListLatency(req.Context(), event)
-
-			if err := watchEncoder.Encode(event); err != nil {
-				utilruntime.HandleErrorWithContext(req.Context(), err, "Failed to encode watch event")
-				// client disconnect.
+			if !s.processHTTPEvent(ctx, urlPath, rw, recorder, watchEncoder, span, ch, event) {
 				return
-			}
-			recorder.RecordEvent()
-
-			if len(ch) == 0 {
-				if err := rw.Flush(); err != nil {
-					utilruntime.HandleErrorWithContext(req.Context(), err, "Failed to flush watch response")
-					return
-				}
-			}
-			if isWatchListLatencyRecordingRequired {
-				// Record completion of initial listing phase for WatchList
-				receivedTimestamp, ok := apirequest.ReceivedTimestampFrom(req.Context())
-				if !ok {
-					utilruntime.HandleErrorWithContext(req.Context(), nil, "Unable to measure watchlist latency, no received timestamp found in the context", "gvr", s.Scope.Resource)
-				} else {
-					initLatency := time.Since(receivedTimestamp)
-					metrics.RecordWatchListLatency(req.Context(), s.Scope.Resource, s.metricsScope, initLatency)
-					auditID := audit.GetAuditIDTruncated(req.Context())
-					klog.V(3).InfoS("WatchList initial events sent", "path", req.URL.Path, "auditID", auditID, "initLatency", initLatency)
-					httplog.AddKeyValue(req.Context(), "watchlist_init_latency", initLatency)
-					span.AddEvent("Writing initial events done")
-					span.End(5 * time.Second)
-					s.watchListCompleteHook()
-				}
-				// release the gzip writer back to the pool so idle watches don't hold gzip state.
-				if err := rw.Flush(); err != nil {
-					utilruntime.HandleErrorWithContext(req.Context(), err, "Failed to flush watch response after initial events")
-					return
-				}
 			}
 		}
 	}
+}
+
+func (s *WatchServer) processHTTPEvent(ctx context.Context, urlPath string, rw *watchResponseWriter, recorder *watchEventMetricsRecorder, watchEncoder *watchEncoder, span *tracing.Span, ch <-chan watch.Event, event watch.Event) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	isWatchListLatencyRecordingRequired := shouldRecordWatchListLatency(ctx, event)
+
+	if err := watchEncoder.Encode(event); err != nil {
+		utilruntime.HandleErrorWithContext(ctx, err, "Failed to encode watch event")
+		// client disconnect.
+		return false
+	}
+	recorder.RecordEvent()
+
+	if len(ch) == 0 {
+		if err := rw.Flush(); err != nil {
+			utilruntime.HandleErrorWithContext(ctx, err, "Failed to flush watch response")
+			return false
+		}
+	}
+	if isWatchListLatencyRecordingRequired {
+		s.recordWatchListLatency(ctx, urlPath, span)
+		// release the gzip writer back to the pool so idle watches don't hold gzip state.
+		if err := rw.Flush(); err != nil {
+			utilruntime.HandleErrorWithContext(ctx, err, "Failed to flush watch response after initial events")
+			return false
+		}
+	}
+	return true
+}
+
+func (s *WatchServer) recordWatchListLatency(ctx context.Context, urlPath string, span *tracing.Span) {
+	// Record completion of initial listing phase for WatchList
+	receivedTimestamp, ok := apirequest.ReceivedTimestampFrom(ctx)
+	if !ok {
+		utilruntime.HandleErrorWithContext(ctx, nil, "Unable to measure watchlist latency, no received timestamp found in the context", "gvr", s.Scope.Resource)
+		return
+	}
+	initLatency := time.Since(receivedTimestamp)
+	metrics.RecordWatchListLatency(ctx, s.Scope.Resource, s.metricsScope, initLatency)
+	auditID := audit.GetAuditIDTruncated(ctx)
+	klog.V(3).InfoS("WatchList initial events sent", "path", urlPath, "auditID", auditID, "initLatency", initLatency)
+	httplog.AddKeyValue(ctx, "watchlist_init_latency", initLatency)
+	span.AddEvent("Writing initial events done")
+	span.End(5 * time.Second)
+	s.watchListCompleteHook()
 }
 
 // HandleWS serves a series of encoded events over a websocket connection.
