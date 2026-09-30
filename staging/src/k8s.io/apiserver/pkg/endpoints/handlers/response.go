@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -42,6 +43,8 @@ import (
 	"k8s.io/apiserver/pkg/util/apihelpers"
 	"k8s.io/klog/v2"
 )
+
+var _ runtime.EncoderWithAllocator = &watchEmbeddedEncoder{}
 
 // watchEmbeddedEncoder performs encoding of the embedded object.
 //
@@ -62,10 +65,13 @@ type watchEmbeddedEncoder struct {
 
 	// identifier of the encoder, computed lazily
 	identifier runtime.Identifier
+
+	memAlloc     runtime.MemoryAllocator
+	doEncodeFunc func(runtime.Object, io.Writer) error
 }
 
 func newWatchEmbeddedEncoder(ctx context.Context, encoder runtime.Encoder, target *schema.GroupVersionKind, tableOptions *metav1.TableOptions, drop []string, scope *RequestScope) *watchEmbeddedEncoder {
-	return &watchEmbeddedEncoder{
+	e := &watchEmbeddedEncoder{
 		encoder:      encoder,
 		ctx:          ctx,
 		target:       target,
@@ -73,12 +79,25 @@ func newWatchEmbeddedEncoder(ctx context.Context, encoder runtime.Encoder, targe
 		scope:        scope,
 		drop:         drop,
 	}
+	e.doEncodeFunc = e.doEncode
+	return e
 }
 
 // Encode implements runtime.Encoder interface.
 func (e *watchEmbeddedEncoder) Encode(obj runtime.Object, w io.Writer) error {
+	return e.encode(obj, w, nil)
+}
+
+// EncodeWithAllocator implements runtime.EncoderWithAllocator interface.
+func (e *watchEmbeddedEncoder) EncodeWithAllocator(obj runtime.Object, w io.Writer, memAlloc runtime.MemoryAllocator) error {
+	return e.encode(obj, w, memAlloc)
+}
+
+func (e *watchEmbeddedEncoder) encode(obj runtime.Object, w io.Writer, memAlloc runtime.MemoryAllocator) error {
+	e.memAlloc = memAlloc
+	defer func() { e.memAlloc = nil }()
 	if co, ok := obj.(runtime.CacheableObject); ok {
-		return co.CacheEncode(e.Identifier(), e.doEncode, w)
+		return co.CacheEncode(e.Identifier(), e.doEncodeFunc, w)
 	}
 	return e.doEncode(obj, w)
 }
@@ -100,6 +119,11 @@ func (e *watchEmbeddedEncoder) doEncode(obj runtime.Object, w io.Writer) error {
 		e.identifier = ""
 	}
 
+	if e.memAlloc != nil {
+		if encoderWithAllocator, supportsAllocator := e.encoder.(runtime.EncoderWithAllocator); supportsAllocator {
+			return encoderWithAllocator.EncodeWithAllocator(result, w, e.memAlloc)
+		}
+	}
 	return e.encoder.Encode(result, w)
 }
 
@@ -146,6 +170,12 @@ func (e *watchEmbeddedEncoder) embeddedIdentifier() runtime.Identifier {
 	return runtime.Identifier(result)
 }
 
+var spliceBufferPool = sync.Pool{
+	New: func() any {
+		return runtime.NewSpliceBuffer()
+	},
+}
+
 // watchEncoder performs encoding of the watch events.
 //
 // NOTE: watchEncoder is NOT thread-safe.
@@ -156,23 +186,23 @@ type watchEncoder struct {
 	encoder              runtime.Encoder
 	framer               io.Writer
 
-	buffer      runtime.Splice
-	eventBuffer runtime.Splice
+	currentEventType watch.EventType
+	encodeFunc       func(runtime.Object, io.Writer) error
 
 	currentEmbeddedIdentifier runtime.Identifier
 	identifiers               map[watch.EventType]runtime.Identifier
 }
 
 func newWatchEncoder(ctx context.Context, gvr schema.GroupVersionResource, embeddedEncoder runtime.Encoder, encoder runtime.Encoder, framer io.Writer) *watchEncoder {
-	return &watchEncoder{
+	e := &watchEncoder{
 		ctx:                  ctx,
 		groupVersionResource: gvr,
 		embeddedEncoder:      embeddedEncoder,
 		encoder:              encoder,
 		framer:               framer,
-		buffer:               runtime.NewSpliceBuffer(),
-		eventBuffer:          runtime.NewSpliceBuffer(),
 	}
+	e.encodeFunc = e.doEncodeCurrent
+	return e
 }
 
 // Encode encodes a given watch event.
@@ -180,34 +210,63 @@ func newWatchEncoder(ctx context.Context, gvr schema.GroupVersionResource, embed
 //
 //	the serialized version is cached in that object [not the event itself].
 func (e *watchEncoder) Encode(event watch.Event) error {
-	encodeFunc := func(obj runtime.Object, w io.Writer) error {
-		return e.doEncode(obj, event, w)
-	}
 	if co, ok := event.Object.(runtime.CacheableObject); ok {
-		return co.CacheEncode(e.identifier(event.Type), encodeFunc, e.framer)
+		e.currentEventType = event.Type
+		return co.CacheEncode(e.identifier(event.Type), e.encodeFunc, e.framer)
 	}
-	return encodeFunc(event.Object, e.framer)
+	return e.doEncode(event.Object, event.Type, e.framer)
 }
 
-func (e *watchEncoder) doEncode(obj runtime.Object, event watch.Event, w io.Writer) error {
-	defer e.buffer.Reset()
+func (e *watchEncoder) doEncodeCurrent(obj runtime.Object, w io.Writer) error {
+	return e.doEncode(obj, e.currentEventType, w)
+}
 
-	if err := e.embeddedEncoder.Encode(obj, e.buffer); err != nil {
+func (e *watchEncoder) doEncode(obj runtime.Object, eventType watch.EventType, w io.Writer) error {
+	buffer := spliceBufferPool.Get().(runtime.Splice)
+	defer func() {
+		buffer.Reset()
+		spliceBufferPool.Put(buffer)
+	}()
+
+	var memAlloc *runtime.Allocator
+	embeddedWithAlloc, embeddedSupportsAlloc := e.embeddedEncoder.(runtime.EncoderWithAllocator)
+	encoderWithAlloc, encoderSupportsAlloc := e.encoder.(runtime.EncoderWithAllocator)
+	if embeddedSupportsAlloc || encoderSupportsAlloc {
+		memAlloc = runtime.AllocatorPool.Get().(*runtime.Allocator)
+		defer runtime.AllocatorPool.Put(memAlloc)
+	}
+
+	var err error
+	if embeddedSupportsAlloc {
+		err = embeddedWithAlloc.EncodeWithAllocator(obj, buffer, memAlloc)
+	} else {
+		err = e.embeddedEncoder.Encode(obj, buffer)
+	}
+	if err != nil {
 		return fmt.Errorf("unable to encode watch object %T: %v", obj, err)
 	}
 
 	// ContentType is not required here because we are defaulting to the serializer type.
 	outEvent := &metav1.WatchEvent{
-		Type:   string(event.Type),
-		Object: runtime.RawExtension{Raw: e.buffer.Bytes()},
+		Type:   string(eventType),
+		Object: runtime.RawExtension{Raw: buffer.Bytes()},
 	}
 
-	defer e.eventBuffer.Reset()
-	if err := e.encoder.Encode(outEvent, e.eventBuffer); err != nil {
+	eventBuffer := spliceBufferPool.Get().(runtime.Splice)
+	defer func() {
+		eventBuffer.Reset()
+		spliceBufferPool.Put(eventBuffer)
+	}()
+	if encoderSupportsAlloc {
+		err = encoderWithAlloc.EncodeWithAllocator(outEvent, eventBuffer, memAlloc)
+	} else {
+		err = e.encoder.Encode(outEvent, eventBuffer)
+	}
+	if err != nil {
 		return fmt.Errorf("unable to encode watch object %T: %v (%#v)", outEvent, err, e)
 	}
 
-	_, err := w.Write(e.eventBuffer.Bytes())
+	_, err = w.Write(eventBuffer.Bytes())
 	return err
 }
 
