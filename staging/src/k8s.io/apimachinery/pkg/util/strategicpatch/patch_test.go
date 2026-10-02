@@ -17,6 +17,7 @@ limitations under the License.
 package strategicpatch
 
 import (
+	_ "embed"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -34,11 +35,21 @@ import (
 )
 
 var (
-	fakeMergeItemSchema     = sptest.Fake{Path: filepath.Join("testdata", "swagger-merge-item.json")}
-	fakePrecisionItemSchema = sptest.Fake{Path: filepath.Join("testdata", "swagger-precision-item.json")}
+	//go:embed testdata/swagger-merge-item.json
+	swaggerMergeItemJSON []byte
+	//go:embed testdata/swagger-precision-item.json
+	swaggerPrecisionItemJSON []byte
 
-	fakeMergeItemV3Schema     = sptest.OpenAPIV3Getter{Path: filepath.Join("testdata", "swagger-merge-item-v3.json")}
-	fakePrecisionItemV3Schema = sptest.OpenAPIV3Getter{Path: filepath.Join("testdata", "swagger-precision-item-v3.json")}
+	//go:embed testdata/swagger-merge-item-v3.json
+	swaggerMergeItemV3JSON []byte
+	//go:embed testdata/swagger-precision-item-v3.json
+	swaggerPrecisionItemV3JSON []byte
+
+	fakeMergeItemSchema     = sptest.Fake{Path: filepath.Join("testdata", "swagger-merge-item.json"), Bytes: swaggerMergeItemJSON}
+	fakePrecisionItemSchema = sptest.Fake{Path: filepath.Join("testdata", "swagger-precision-item.json"), Bytes: swaggerPrecisionItemJSON}
+
+	fakeMergeItemV3Schema     = sptest.OpenAPIV3Getter{Path: filepath.Join("testdata", "swagger-merge-item-v3.json"), Bytes: swaggerMergeItemV3JSON}
+	fakePrecisionItemV3Schema = sptest.OpenAPIV3Getter{Path: filepath.Join("testdata", "swagger-precision-item-v3.json"), Bytes: swaggerPrecisionItemV3JSON}
 )
 
 type SortMergeListTestCases struct {

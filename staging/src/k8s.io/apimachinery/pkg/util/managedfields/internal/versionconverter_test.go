@@ -17,10 +17,9 @@ limitations under the License.
 package internal
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -33,13 +32,12 @@ import (
 	"k8s.io/kube-openapi/pkg/validation/spec"
 )
 
+//go:embed testdata/swagger.json
+var testdataSwagger []byte
+
 var testTypeConverter = func() TypeConverter {
-	data, err := os.ReadFile(filepath.Join("testdata", "swagger.json"))
-	if err != nil {
-		panic(err)
-	}
 	swag := spec.Swagger{}
-	if err := json.Unmarshal(data, &swag); err != nil {
+	if err := json.Unmarshal(testdataSwagger, &swag); err != nil {
 		panic(err)
 	}
 

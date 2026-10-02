@@ -25,6 +25,7 @@ import (
 
 type OpenAPIV3Getter struct {
 	Path      string
+	Bytes     []byte
 	once      sync.Once
 	bytes     []byte
 	openapiv3 spec3.OpenAPI
@@ -32,6 +33,10 @@ type OpenAPIV3Getter struct {
 
 func (f *OpenAPIV3Getter) SchemaBytesOrDie() []byte {
 	f.once.Do(func() {
+		if len(f.Bytes) > 0 {
+			f.bytes = f.Bytes
+			return
+		}
 		_, err := os.Stat(f.Path)
 		if err != nil {
 			panic(err)
@@ -47,16 +52,21 @@ func (f *OpenAPIV3Getter) SchemaBytesOrDie() []byte {
 
 func (f *OpenAPIV3Getter) SchemaOrDie() *spec3.OpenAPI {
 	f.once.Do(func() {
-		_, err := os.Stat(f.Path)
-		if err != nil {
-			panic(err)
-		}
-		spec, err := os.ReadFile(f.Path)
-		if err != nil {
-			panic(err)
+		var spec []byte
+		if len(f.Bytes) > 0 {
+			spec = f.Bytes
+		} else {
+			_, err := os.Stat(f.Path)
+			if err != nil {
+				panic(err)
+			}
+			spec, err = os.ReadFile(f.Path)
+			if err != nil {
+				panic(err)
+			}
 		}
 
-		err = f.openapiv3.UnmarshalJSON(spec)
+		err := f.openapiv3.UnmarshalJSON(spec)
 		if err != nil {
 			panic(err)
 		}

@@ -19,6 +19,7 @@ package dynamic_test
 import (
 	"bufio"
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -41,6 +42,9 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
+
+//go:embed testdata
+var testData embed.FS
 
 func TestGoldenRequest(t *testing.T) {
 	for _, tc := range []struct {
@@ -197,14 +201,16 @@ func TestGoldenRequest(t *testing.T) {
 
 				path := filepath.Join("testdata", filepath.FromSlash(t.Name()))
 
+				var want []byte
 				if os.Getenv("UPDATE_DYNAMIC_CLIENT_FIXTURES") == "true" {
-					err := os.WriteFile(path, got, os.FileMode(0755))
+					err = os.WriteFile(path, got, os.FileMode(0755))
 					if err != nil {
 						t.Fatalf("failed to update fixture: %v", err)
 					}
+					want, err = os.ReadFile(path)
+				} else {
+					want, err = testData.ReadFile(filepath.ToSlash(path))
 				}
-
-				want, err := os.ReadFile(path)
 				if err != nil {
 					t.Fatalf("failed to load fixture: %v", err)
 				}
@@ -358,7 +364,8 @@ func TestGoldenResponse(t *testing.T) {
 			client, err := dynamic.NewForConfig(&rest.Config{
 
 				Transport: RoundTripperFunc(func(request *http.Request) (*http.Response, error) {
-					fd, err := os.Open(filepath.Join("testdata", filepath.FromSlash(parentTestName), "responses", tc.response))
+					path := filepath.ToSlash(filepath.Join("testdata", filepath.FromSlash(parentTestName), "responses", tc.response))
+					fd, err := testData.Open(path)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -382,16 +389,19 @@ func TestGoldenResponse(t *testing.T) {
 			got := tc.do(t, client.Resource(schema.GroupVersionResource{}))
 
 			path := filepath.Join("testdata", filepath.FromSlash(t.Name()))
+			var fixture []byte
 			if os.Getenv("UPDATE_DYNAMIC_CLIENT_FIXTURES") == "true" {
-				fixture, err := json.Marshal(got)
+				fixture, err = json.Marshal(got)
 				if err != nil {
 					t.Fatal(err)
 				}
 				if err := os.WriteFile(path, fixture, os.FileMode(0644)); err != nil {
 					t.Fatalf("failed to update fixture: %v", err)
 				}
+				fixture, err = os.ReadFile(path)
+			} else {
+				fixture, err = testData.ReadFile(filepath.ToSlash(path))
 			}
-			fixture, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
 			}

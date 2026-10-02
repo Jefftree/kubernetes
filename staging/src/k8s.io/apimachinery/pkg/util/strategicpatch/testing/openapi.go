@@ -27,7 +27,8 @@ import (
 // Fake opens and returns a openapi swagger from a file Path. It will
 // parse only once and then return the same copy everytime.
 type Fake struct {
-	Path string
+	Path  string
+	Bytes []byte
 
 	once     sync.Once
 	document *openapi_v2.Document
@@ -37,15 +38,20 @@ type Fake struct {
 // OpenAPISchema returns the openapi document and a potential error.
 func (f *Fake) OpenAPISchema() (*openapi_v2.Document, error) {
 	f.once.Do(func() {
-		_, err := os.Stat(f.Path)
-		if err != nil {
-			f.err = err
-			return
-		}
-		spec, err := os.ReadFile(f.Path)
-		if err != nil {
-			f.err = err
-			return
+		var spec []byte
+		if len(f.Bytes) > 0 {
+			spec = f.Bytes
+		} else {
+			_, err := os.Stat(f.Path)
+			if err != nil {
+				f.err = err
+				return
+			}
+			spec, err = os.ReadFile(f.Path)
+			if err != nil {
+				f.err = err
+				return
+			}
 		}
 		f.document, f.err = openapi_v2.ParseDocument(spec)
 	})

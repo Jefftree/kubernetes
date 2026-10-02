@@ -17,6 +17,7 @@ limitations under the License.
 package managedfields_test
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -264,13 +265,14 @@ func TestApplyDoesNotStripLabels(t *testing.T) {
 	}
 }
 
-func getObjectBytes(file string) []byte {
-	s, err := os.ReadFile(file)
-	if err != nil {
-		panic(err)
-	}
-	return s
-}
+var (
+	//go:embed pod.yaml
+	podYAML []byte
+	//go:embed node.yaml
+	nodeYAML []byte
+	//go:embed endpoints.yaml
+	endpointsYAML []byte
+)
 
 func TestApplyNewObject(t *testing.T) {
 	tests := []struct {
@@ -279,15 +281,15 @@ func TestApplyNewObject(t *testing.T) {
 	}{
 		{
 			gvk: schema.FromAPIVersionAndKind("v1", "Pod"),
-			obj: getObjectBytes("pod.yaml"),
+			obj: podYAML,
 		},
 		{
 			gvk: schema.FromAPIVersionAndKind("v1", "Node"),
-			obj: getObjectBytes("node.yaml"),
+			obj: nodeYAML,
 		},
 		{
 			gvk: schema.FromAPIVersionAndKind("v1", "Endpoints"),
-			obj: getObjectBytes("endpoints.yaml"),
+			obj: endpointsYAML,
 		},
 	}
 
