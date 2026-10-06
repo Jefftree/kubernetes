@@ -24,8 +24,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strconv"
 	"testing"
+	"time"
+
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -34,12 +39,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/managedfields"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/pkg/endpoints/handlers"
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
+	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
+	"k8s.io/apiserver/pkg/storage/cacher"
 	"k8s.io/client-go/applyconfigurations"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	api "k8s.io/kubernetes/pkg/apis/core"
@@ -59,6 +67,8 @@ type podBenchmark struct {
 	admit       admission.Interface
 	codec       runtime.Codec
 	pod         *api.Pod
+	etcdPrefix  string
+	etcdServers []string
 }
 
 type podRequest struct {
@@ -177,6 +187,43 @@ func BenchmarkDeletePod(b *testing.B) {
 		b.StopTimer()
 		seedPod(b, bench)
 		b.StartTimer()
+	}
+}
+
+func BenchmarkWatchPod(b *testing.B) {
+	benchmarkWatchPod(b, 1)
+}
+
+func benchmarkWatchPod(b *testing.B, watchers int) {
+	bench := setupPodWatchBenchmark(b)
+	waitForWatchEvents := startWatchers(b, bench, watchers)
+
+	client, err := clientv3.New(clientv3.Config{Endpoints: bench.etcdServers})
+	if err != nil {
+		b.Fatalf("failed to create etcd client: %v", err)
+	}
+	b.Cleanup(func() { _ = client.Close() })
+
+	// Pre-encoding PutRequest and calling KVClient directly avoids charging
+	// write-handler or string-to-[]byte allocations to the watch benchmark.
+	kvClient := etcdserverpb.NewKVClient(client.ActiveConnection())
+	putReq := &etcdserverpb.PutRequest{
+		Key:   []byte(path.Join("/", bench.etcdPrefix, "pods", bench.pod.Namespace, bench.pod.Name)),
+		Value: encodePod(b, bench.codec, bench.pod),
+	}
+	ctx := b.Context()
+	if _, err := kvClient.Put(ctx, putReq); err != nil {
+		b.Fatalf("unexpected error putting pod: %v", err)
+	}
+	waitForWatchEvents()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := kvClient.Put(ctx, putReq); err != nil {
+			b.Fatalf("unexpected error putting pod: %v", err)
+		}
+		waitForWatchEvents()
 	}
 }
 
@@ -332,6 +379,14 @@ func newRequestScope(b *testing.B, gvk schema.GroupVersionKind, subresource stri
 }
 
 func setupPodBenchmark(b *testing.B) *podBenchmark {
+	return setupPodBenchmarkWithCacher(b, false)
+}
+
+func setupPodWatchBenchmark(b *testing.B) *podBenchmark {
+	return setupPodBenchmarkWithCacher(b, true)
+}
+
+func setupPodBenchmarkWithCacher(b *testing.B, withCacher bool) *podBenchmark {
 	b.Helper()
 	protobufInfo, ok := runtime.SerializerInfoForMediaType(legacyscheme.Codecs.SupportedMediaTypes(), runtime.ContentTypeProtobuf)
 	if !ok {
@@ -345,9 +400,15 @@ func setupPodBenchmark(b *testing.B) *podBenchmark {
 	)
 	etcdConfig := framework.SharedEtcd()
 	etcdConfig.Codec = storageCodec
+	storageConfig := etcdConfig.ForResource(schema.GroupResource{Resource: "pods"})
+	decorator := generic.UndecoratedStorage
+	if withCacher {
+		storageConfig.EventsHistoryWindow = cacher.DefaultEventFreshDuration
+		decorator = genericregistry.StorageWithCacher()
+	}
 	restOptions := generic.RESTOptions{
-		StorageConfig:           etcdConfig.ForResource(schema.GroupResource{Resource: "pods"}),
-		Decorator:               generic.UndecoratedStorage,
+		StorageConfig:           storageConfig,
+		Decorator:               decorator,
 		DeleteCollectionWorkers: 1,
 		ResourcePrefix:          "pods",
 	}
@@ -356,6 +417,13 @@ func setupPodBenchmark(b *testing.B) *podBenchmark {
 		b.Fatalf("unexpected error from REST storage: %v", err)
 	}
 	b.Cleanup(podStorage.Pod.Destroy)
+	if withCacher {
+		if err := wait.PollUntilContextTimeout(b.Context(), 5*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+			return podStorage.Pod.ReadinessCheck() == nil, nil
+		}); err != nil {
+			b.Fatalf("storage failed to become ready: %v", err)
+		}
+	}
 
 	gvk := v1.SchemeGroupVersion.WithKind("Pod")
 	scope := newRequestScope(b, gvk, "", podStorage.Pod.GetResetFields())
@@ -368,7 +436,57 @@ func setupPodBenchmark(b *testing.B) *podBenchmark {
 		statusScope: statusScope,
 		admit:       admission.NewChainHandler(admission.NewHandler(admission.Create, admission.Update, admission.Delete)),
 		codec:       storageCodec,
+		etcdPrefix:  etcdConfig.Prefix,
+		etcdServers: etcdConfig.Transport.ServerList,
 	}
 	bench.pod = seedPod(b, bench)
 	return bench
+}
+
+// watchResponseRecorder is a server-side http.ResponseWriter + http.Flusher that
+// discards encoded wire bytes without client-side buffering or decoding allocations.
+type watchResponseRecorder struct {
+	header  http.Header
+	flushed chan struct{}
+}
+
+func (w *watchResponseRecorder) Header() http.Header         { return w.header }
+func (w *watchResponseRecorder) WriteHeader(int)             {}
+func (w *watchResponseRecorder) Write(p []byte) (int, error) { return len(p), nil }
+func (w *watchResponseRecorder) Flush()                      { w.flushed <- struct{}{} }
+
+func startWatchers(b *testing.B, bench *podBenchmark, count int) func() {
+	b.Helper()
+	handler := handlers.ListResource(bench.rest, bench.rest, bench.scope, true, time.Hour)
+	target := fmt.Sprintf("/api/v1/namespaces/%s/pods?watch=true&resourceVersion=%s", bench.pod.Namespace, bench.pod.ResourceVersion)
+	ctx, cancel := context.WithCancel(podRequestContext(&api.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: bench.pod.Namespace}}, "watch", ""))
+
+	flushed := make(chan struct{}, count)
+	done := make(chan struct{}, count)
+	for range count {
+		w := &watchResponseRecorder{
+			header:  make(http.Header),
+			flushed: flushed,
+		}
+		req := httptest.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		req.Header.Set("Accept", runtime.ContentTypeProtobuf)
+		go func() {
+			defer func() { done <- struct{}{} }()
+			handler(w, req)
+		}()
+	}
+	waitForWatchEvents := func() {
+		for range count {
+			<-flushed
+		}
+	}
+	// Wait for the initial BeginStream header flushes so all watchers are registered in cacher.
+	waitForWatchEvents()
+	b.Cleanup(func() {
+		cancel()
+		for range count {
+			<-done
+		}
+	})
+	return waitForWatchEvents
 }
