@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -34,12 +35,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/managedfields"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/pkg/endpoints/handlers"
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
+	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
+	"k8s.io/apiserver/pkg/storage/cacher"
 	"k8s.io/client-go/applyconfigurations"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	api "k8s.io/kubernetes/pkg/apis/core"
@@ -52,13 +56,15 @@ import (
 var exemplarPodYAML []byte
 
 type podBenchmark struct {
-	rest        *podstore.REST
-	statusREST  *podstore.StatusREST
-	scope       *handlers.RequestScope
-	statusScope *handlers.RequestScope
-	admit       admission.Interface
-	codec       runtime.Codec
-	pod         *api.Pod
+	rest         *podstore.REST
+	statusREST   *podstore.StatusREST
+	scope        *handlers.RequestScope
+	statusScope  *handlers.RequestScope
+	admit        admission.Interface
+	codec        runtime.Codec
+	pod          *api.Pod
+	watchers     int
+	watchFlushed chan struct{}
 }
 
 type podRequest struct {
@@ -70,7 +76,15 @@ type podRequest struct {
 }
 
 func BenchmarkPatchPod(b *testing.B) {
-	bench := setupPodBenchmark(b)
+	benchmarkPatchPod(b, 0)
+}
+
+func BenchmarkPatchPodWithWatch(b *testing.B) {
+	benchmarkPatchPod(b, 1)
+}
+
+func benchmarkPatchPod(b *testing.B, watchers int) {
+	bench := setupPodBenchmark(b, watchers)
 	pod := bench.pod
 	req := podRequest{
 		ctx:    podRequestContext(pod, "patch", ""),
@@ -80,16 +94,26 @@ func BenchmarkPatchPod(b *testing.B) {
 		},
 	}
 	doRequest(b, req, http.MethodPatch, string(types.StrategicMergePatchType), labelPatch(0), http.StatusOK)
+	bench.waitForWatchEvents()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		doRequest(b, req, http.MethodPatch, string(types.StrategicMergePatchType), labelPatch(i+1), http.StatusOK)
+		bench.waitForWatchEvents()
 	}
 }
 
 func BenchmarkPatchPodStatus(b *testing.B) {
-	bench := setupPodBenchmark(b)
+	benchmarkPatchPodStatus(b, 0)
+}
+
+func BenchmarkPatchPodStatusWithWatch(b *testing.B) {
+	benchmarkPatchPodStatus(b, 1)
+}
+
+func benchmarkPatchPodStatus(b *testing.B, watchers int) {
+	bench := setupPodBenchmark(b, watchers)
 	pod := bench.pod
 	req := podRequest{
 		ctx:    podRequestContext(pod, "patch", "status"),
@@ -99,16 +123,18 @@ func BenchmarkPatchPodStatus(b *testing.B) {
 		},
 	}
 	doRequest(b, req, http.MethodPatch, string(types.StrategicMergePatchType), conditionsPatch(0), http.StatusOK)
+	bench.waitForWatchEvents()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		doRequest(b, req, http.MethodPatch, string(types.StrategicMergePatchType), conditionsPatch(i+1), http.StatusOK)
+		bench.waitForWatchEvents()
 	}
 }
 
 func BenchmarkUpdatePod(b *testing.B) {
-	bench := setupPodBenchmark(b)
+	bench := setupPodBenchmark(b, 0)
 	pod := bench.pod
 	req := podRequest{
 		ctx:     podRequestContext(pod, "update", ""),
@@ -139,7 +165,7 @@ func BenchmarkUpdatePod(b *testing.B) {
 }
 
 func BenchmarkCreatePod(b *testing.B) {
-	bench := setupPodBenchmark(b)
+	bench := setupPodBenchmark(b, 0)
 	pod := bench.pod
 	req := podRequest{
 		ctx:     podRequestContext(pod, "create", ""),
@@ -160,7 +186,7 @@ func BenchmarkCreatePod(b *testing.B) {
 }
 
 func BenchmarkDeletePod(b *testing.B) {
-	bench := setupPodBenchmark(b)
+	bench := setupPodBenchmark(b, 0)
 	pod := bench.pod
 	// gracePeriodSeconds=0 keeps this a real delete rather than a graceful
 	// deletion, which would only stamp deletionTimestamp and leave the key.
@@ -331,7 +357,7 @@ func newRequestScope(b *testing.B, gvk schema.GroupVersionKind, subresource stri
 	}
 }
 
-func setupPodBenchmark(b *testing.B) *podBenchmark {
+func setupPodBenchmark(b *testing.B, watchers int) *podBenchmark {
 	b.Helper()
 	protobufInfo, ok := runtime.SerializerInfoForMediaType(legacyscheme.Codecs.SupportedMediaTypes(), runtime.ContentTypeProtobuf)
 	if !ok {
@@ -345,9 +371,15 @@ func setupPodBenchmark(b *testing.B) *podBenchmark {
 	)
 	etcdConfig := framework.SharedEtcd()
 	etcdConfig.Codec = storageCodec
+	storageConfig := etcdConfig.ForResource(schema.GroupResource{Resource: "pods"})
+	decorator := generic.UndecoratedStorage
+	if watchers > 0 {
+		storageConfig.EventsHistoryWindow = cacher.DefaultEventFreshDuration
+		decorator = genericregistry.StorageWithCacher()
+	}
 	restOptions := generic.RESTOptions{
-		StorageConfig:           etcdConfig.ForResource(schema.GroupResource{Resource: "pods"}),
-		Decorator:               generic.UndecoratedStorage,
+		StorageConfig:           storageConfig,
+		Decorator:               decorator,
 		DeleteCollectionWorkers: 1,
 		ResourcePrefix:          "pods",
 	}
@@ -356,6 +388,13 @@ func setupPodBenchmark(b *testing.B) *podBenchmark {
 		b.Fatalf("unexpected error from REST storage: %v", err)
 	}
 	b.Cleanup(podStorage.Pod.Destroy)
+	if watchers > 0 {
+		if err := wait.PollUntilContextTimeout(b.Context(), 5*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+			return podStorage.Pod.ReadinessCheck() == nil, nil
+		}); err != nil {
+			b.Fatalf("storage failed to become ready: %v", err)
+		}
+	}
 
 	gvk := v1.SchemeGroupVersion.WithKind("Pod")
 	scope := newRequestScope(b, gvk, "", podStorage.Pod.GetResetFields())
@@ -370,5 +409,60 @@ func setupPodBenchmark(b *testing.B) *podBenchmark {
 		codec:       storageCodec,
 	}
 	bench.pod = seedPod(b, bench)
+	if watchers > 0 {
+		bench.startWatchers(b, watchers)
+	}
 	return bench
 }
+
+// watchResponseRecorder is a server-side http.ResponseWriter + http.Flusher that
+// discards encoded wire bytes without client-side buffering or decoding allocations.
+type watchResponseRecorder struct {
+	header  http.Header
+	flushed chan struct{}
+}
+
+func (w *watchResponseRecorder) Header() http.Header         { return w.header }
+func (w *watchResponseRecorder) WriteHeader(int)             {}
+func (w *watchResponseRecorder) Write(p []byte) (int, error) { return len(p), nil }
+func (w *watchResponseRecorder) Flush()                      { w.flushed <- struct{}{} }
+
+func (bench *podBenchmark) startWatchers(b *testing.B, count int) {
+	b.Helper()
+	handler := handlers.ListResource(bench.rest, bench.rest, bench.scope, true, time.Hour)
+	target := fmt.Sprintf("/api/v1/namespaces/%s/pods?watch=true&resourceVersion=%s", bench.pod.Namespace, bench.pod.ResourceVersion)
+	ctx, cancel := context.WithCancel(podRequestContext(&api.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: bench.pod.Namespace}}, "watch", ""))
+
+	bench.watchers = count
+	bench.watchFlushed = make(chan struct{}, count)
+	done := make(chan struct{}, count)
+	for range count {
+		w := &watchResponseRecorder{
+			header:  make(http.Header),
+			flushed: bench.watchFlushed,
+		}
+		req := httptest.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		req.Header.Set("Accept", runtime.ContentTypeProtobuf)
+		go func() {
+			defer func() { done <- struct{}{} }()
+			handler(w, req)
+		}()
+	}
+	// Wait for BeginStream header flushes so all watchers are registered in cacher.
+	bench.waitForWatchEvents()
+	b.Cleanup(func() {
+		cancel()
+		for range count {
+			<-done
+		}
+	})
+}
+
+func (bench *podBenchmark) waitForWatchEvents() {
+	for range bench.watchers {
+		<-bench.watchFlushed
+	}
+}
+
+
+
