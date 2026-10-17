@@ -81,6 +81,9 @@ type cachingObject struct {
 	// The value stored in atomic.Value is of type serializationsCache.
 	// The atomic.Value type is used to allow fast-path.
 	serializations atomic.Value
+
+	decorateOnce sync.Once
+	decorator    func(runtime.Object)
 }
 
 // newCachingObject performs a deep copy of the given object and wraps it
@@ -161,8 +164,20 @@ func (o *cachingObject) CacheEncode(id runtime.Identifier, encode func(runtime.O
 // to the called according to the contract of the interface.
 func (o *cachingObject) GetObject() runtime.Object {
 	o.lock.RLock()
-	defer o.lock.RUnlock()
-	return o.object.DeepCopyObject().(metaRuntimeInterface)
+	obj := o.object.DeepCopyObject().(metaRuntimeInterface)
+	o.lock.RUnlock()
+	if o.decorator != nil {
+		o.decorator(obj)
+	}
+	return obj
+}
+
+// Decorate registers decorator on the cachingObject at most once so GetObject()
+// decorates the deep-copied object without mutating the shared watchCache object.
+func (o *cachingObject) Decorate(decorator func(runtime.Object)) {
+	o.decorateOnce.Do(func() {
+		o.decorator = decorator
+	})
 }
 
 // GetObjectKind implements runtime.Object interface.

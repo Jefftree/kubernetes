@@ -18,15 +18,50 @@ package registry
 
 import (
 	"context"
+	"io"
+	"sync"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/apis/example"
 )
+
+type fakeCacheableObject struct {
+	obj          runtime.Object
+	decorateOnce sync.Once
+	decorator    func(runtime.Object)
+}
+
+func (f *fakeCacheableObject) GetObjectKind() schema.ObjectKind {
+	return f.obj.GetObjectKind()
+}
+
+func (f *fakeCacheableObject) DeepCopyObject() runtime.Object {
+	return &fakeCacheableObject{obj: f.obj.DeepCopyObject(), decorator: f.decorator}
+}
+
+func (f *fakeCacheableObject) CacheEncode(id runtime.Identifier, encode func(runtime.Object, io.Writer) error, w io.Writer) error {
+	return encode(f.GetObject(), w)
+}
+
+func (f *fakeCacheableObject) GetObject() runtime.Object {
+	obj := f.obj.DeepCopyObject()
+	if f.decorator != nil {
+		f.decorator(obj)
+	}
+	return obj
+}
+
+func (f *fakeCacheableObject) Decorate(decorator func(runtime.Object)) {
+	f.decorateOnce.Do(func() {
+		f.decorator = decorator
+	})
+}
 
 func TestDecoratedWatcher(t *testing.T) {
 	w := watch.NewFake()
@@ -39,6 +74,8 @@ func TestDecoratedWatcher(t *testing.T) {
 	dw := newDecoratedWatcher(ctx, w, decorator)
 	defer dw.Stop()
 
+	cachedPod := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "cached"}}
+
 	go func() {
 		w.Error(&metav1.Status{Status: "Failure"})
 		w.Add(&example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}})
@@ -46,14 +83,26 @@ func TestDecoratedWatcher(t *testing.T) {
 		w.Modify(&example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}})
 		w.Error(&metav1.Status{Status: "Failure"})
 		w.Delete(&example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}})
+		w.Action(watch.Bookmark, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}})
+		w.Add(&fakeCacheableObject{obj: cachedPod})
+		w.Modify(&fakeCacheableObject{obj: cachedPod})
+		w.Delete(&fakeCacheableObject{obj: cachedPod})
 	}()
 
 	expectErrorEvent(t, dw) // expect error is plumbed and doesn't force close the watcher
-	expectPodEvent(t, dw, watch.Added)
+	expectPodEvent(t, dw, watch.Added, true)
 	expectErrorEvent(t, dw) // expect error is plumbed and doesn't force close the watcher
-	expectPodEvent(t, dw, watch.Modified)
+	expectPodEvent(t, dw, watch.Modified, true)
 	expectErrorEvent(t, dw) // expect error is plumbed and doesn't force close the watcher
-	expectPodEvent(t, dw, watch.Deleted)
+	expectPodEvent(t, dw, watch.Deleted, true)
+	expectPodEvent(t, dw, watch.Bookmark, false)
+	expectPodEvent(t, dw, watch.Added, true)
+	expectPodEvent(t, dw, watch.Modified, true)
+	expectPodEvent(t, dw, watch.Deleted, true)
+
+	if cachedPod.Annotations["decorated"] != "" {
+		t.Errorf("expected underlying cached object not to be mutated, got annotations: %v", cachedPod.Annotations)
+	}
 
 	// cancel the passed-in context to simulate request timeout
 	cancel()
@@ -74,15 +123,19 @@ func TestDecoratedWatcher(t *testing.T) {
 	}
 }
 
-func expectPodEvent(t *testing.T, dw *decoratedWatcher, watchType watch.EventType) {
+func expectPodEvent(t *testing.T, dw *decoratedWatcher, watchType watch.EventType, decorated bool) {
 	select {
 	case e := <-dw.ResultChan():
-		pod, ok := e.Object.(*example.Pod)
-		if !ok {
-			t.Fatalf("Should received object of type *api.Pod, get type (%T)", e.Object)
+		obj := e.Object
+		if co, ok := obj.(runtime.CacheableObject); ok {
+			obj = co.GetObject()
 		}
-		if pod.Annotations["decorated"] != "true" {
-			t.Fatalf("pod.Annotations[\"decorated\"], want=%s, get=%s", "true", pod.Labels["decorated"])
+		pod, ok := obj.(*example.Pod)
+		if !ok {
+			t.Fatalf("Should received object of type *api.Pod, get type (%T)", obj)
+		}
+		if (pod.Annotations["decorated"] == "true") != decorated {
+			t.Fatalf("pod.Annotations[\"decorated\"]==\"true\", want=%v, get=%v", decorated, pod.Annotations["decorated"] == "true")
 		}
 		if e.Type != watchType {
 			t.Fatalf("expected type %s, got %s", watchType, e.Type)

@@ -68,6 +68,7 @@ func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 
 	rest := &REST{store}
 	store.Decorator = rest.defaultOnRead
+	statusStore.Decorator = rest.defaultOnRead
 
 	return rest, &StatusREST{store: &statusStore}, nil
 }
