@@ -19,14 +19,19 @@ package apiserver
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	"k8s.io/ktesting"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
@@ -226,5 +231,90 @@ func BenchmarkListFromWatchCache(b *testing.B) {
 			b.Errorf("failed to list secrets: %v", err)
 		}
 		b.Logf("Number of secrets: %d", len(secrets.Items))
+	}
+}
+
+func BenchmarkWatchFromWatchCache(b *testing.B) {
+	tCtx := ktesting.Init(b)
+	c, clientConfig, tearDownFn := framework.StartTestServer(tCtx, b, framework.TestServerSetup{
+		ModifyServerConfig: func(config *controlplane.Config) {
+			// Switch off endpoints reconciler to avoid unnecessary operations.
+			config.Extra.EndpointReconcilerType = reconcilers.NoneEndpointReconcilerType
+		},
+	})
+	defer tearDownFn()
+
+	svc, err := c.CoreV1().Services("default").Create(tCtx, &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "bench-svc",
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Name:       "http",
+					Port:       80,
+					TargetPort: intstr.FromInt32(8080),
+					Protocol:   v1.ProtocolTCP,
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		b.Fatalf("failed to create service: %v", err)
+	}
+
+	var seq int
+	for _, tc := range []struct {
+		name        string
+		contentType string
+	}{
+		{name: "Protobuf", contentType: runtime.ContentTypeProtobuf},
+		{name: "JSON", contentType: runtime.ContentTypeJSON},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			cfg := rest.CopyConfig(clientConfig)
+			cfg.ContentConfig.AcceptContentTypes = tc.contentType
+			cfg.ContentConfig.ContentType = tc.contentType
+			cfg.QPS = -1
+			watchClient, err := clientset.NewForConfig(cfg)
+			if err != nil {
+				b.Fatalf("failed to create client: %v", err)
+			}
+
+			const numWatchers = 200
+			watchers := make([]watch.Interface, numWatchers)
+			for i := range numWatchers {
+				w, err := watchClient.CoreV1().Services("default").Watch(tCtx, metav1.ListOptions{
+					FieldSelector:   "metadata.name=bench-svc",
+					ResourceVersion: svc.ResourceVersion,
+				})
+				if err != nil {
+					b.Fatalf("failed to start watch: %v", err)
+				}
+				watchers[i] = w
+			}
+			defer func() {
+				for _, w := range watchers {
+					w.Stop()
+				}
+			}()
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				seq++
+				svc.Annotations = map[string]string{"seq": strconv.Itoa(seq)}
+				svc, err = c.CoreV1().Services("default").Update(tCtx, svc, metav1.UpdateOptions{})
+				if err != nil {
+					b.Fatalf("failed to update service: %v", err)
+				}
+				for _, w := range watchers {
+					ev, ok := <-w.ResultChan()
+					if !ok || ev.Type != watch.Modified {
+						b.Fatalf("unexpected watch event: ok=%v type=%v", ok, ev.Type)
+					}
+				}
+			}
+		})
 	}
 }
