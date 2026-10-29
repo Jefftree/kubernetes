@@ -234,14 +234,30 @@ type revisionEqualityKey struct {
 	revisionResourceVersion string
 }
 
+// canCacheRevisionEquality requires populated UID, Generation, and ResourceVersion so unit tests that mutate Spec in-place at Generation 0 do not hit stale cache entries.
+func canCacheRevisionEquality(set *apps.StatefulSet, revision *apps.ControllerRevision, cache *lru.Cache) (revisionEqualityKey, bool) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetSemanticRevisionComparison) ||
+		cache == nil || set == nil || revision == nil ||
+		len(set.UID) == 0 || set.Generation <= 0 || len(revision.ResourceVersion) == 0 {
+		return revisionEqualityKey{}, false
+	}
+	return revisionEqualityKey{
+		setUID:                  set.UID,
+		setGeneration:           set.Generation,
+		revisionResourceVersion: revision.ResourceVersion,
+	}, true
+}
+
 // setMatchesLatestExistingRevision returns true if the set/proposedRevision already matches what would be produced from restoring latestExistingRevision.
 func setMatchesLatestExistingRevision(set *apps.StatefulSet, proposedRevision *apps.ControllerRevision, latestExistingRevision *apps.ControllerRevision, memory *lru.Cache) bool {
 	if !utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetSemanticRevisionComparison) {
 		return false
 	}
-	equalityCacheKey := revisionEqualityKey{setUID: set.UID, setGeneration: set.Generation, revisionResourceVersion: latestExistingRevision.ResourceVersion}
-	if _, ok := memory.Get(equalityCacheKey); ok {
-		return true
+	equalityCacheKey, canCache := canCacheRevisionEquality(set, latestExistingRevision, memory)
+	if canCache {
+		if _, ok := memory.Get(equalityCacheKey); ok {
+			return true
+		}
 	}
 	// see if reverting to the latest existing revision would produce the same thing as proposedRevision
 	latestSet, err := ApplyRevision(set, latestExistingRevision)
@@ -255,7 +271,9 @@ func setMatchesLatestExistingRevision(set *apps.StatefulSet, proposedRevision *a
 	}
 	// if they match, cache this combination of set(uid,generation)+revision(resourceVersion) to minimize expensive comparisons in steady state
 	if history.EqualRevision(proposedRevision, reconstructedLatestRevision) {
-		memory.Add(equalityCacheKey, struct{}{})
+		if canCache {
+			memory.Add(equalityCacheKey, struct{}{})
+		}
 		return true
 	}
 	return false
@@ -282,36 +300,53 @@ func (ssc *defaultStatefulSetControl) getStatefulSetRevisions(
 		collisionCount = *set.Status.CollisionCount
 	}
 
-	// create a new revision from the current set
-	updateRevision, err := newRevision(set, nextRevision(revisions), &collisionCount)
-	if err != nil {
-		return nil, nil, collisionCount, err
+	if revisionCount > 0 {
+		if equalityCacheKey, ok := canCacheRevisionEquality(set, revisions[revisionCount-1], ssc.revisionEqualityCache); ok {
+			if _, hit := ssc.revisionEqualityCache.Get(equalityCacheKey); hit {
+				updateRevision = revisions[revisionCount-1]
+			}
+		}
 	}
 
-	// find any equivalent revisions
-	equalRevisions := history.FindEqualRevisions(revisions, updateRevision)
-	equalCount := len(equalRevisions)
-
-	if equalCount > 0 && history.EqualRevision(revisions[revisionCount-1], equalRevisions[equalCount-1]) {
-		// if the equivalent revision is immediately prior the update revision has not changed
-		updateRevision = revisions[revisionCount-1]
-	} else if equalCount > 0 {
-		// if the equivalent revision is not immediately prior we will roll back by incrementing the
-		// Revision of the equivalent revision
-		updateRevision, err = ssc.controllerHistory.UpdateControllerRevision(
-			equalRevisions[equalCount-1],
-			updateRevision.Revision)
+	if updateRevision == nil {
+		// create a new revision from the current set
+		var err error
+		updateRevision, err = newRevision(set, nextRevision(revisions), &collisionCount)
 		if err != nil {
 			return nil, nil, collisionCount, err
 		}
-	} else if revisionCount > 0 && setMatchesLatestExistingRevision(set, updateRevision, revisions[revisionCount-1], ssc.revisionEqualityCache) {
-		// the update revision has not changed
-		updateRevision = revisions[revisionCount-1]
-	} else {
-		//if there is no equivalent revision we create a new one
-		updateRevision, err = ssc.controllerHistory.CreateControllerRevision(set, updateRevision, &collisionCount)
-		if err != nil {
-			return nil, nil, collisionCount, err
+
+		// find any equivalent revisions
+		equalRevisions := history.FindEqualRevisions(revisions, updateRevision)
+		equalCount := len(equalRevisions)
+
+		if equalCount > 0 && history.EqualRevision(revisions[revisionCount-1], equalRevisions[equalCount-1]) {
+			// if the equivalent revision is immediately prior the update revision has not changed
+			updateRevision = revisions[revisionCount-1]
+			if equalityCacheKey, ok := canCacheRevisionEquality(set, updateRevision, ssc.revisionEqualityCache); ok {
+				ssc.revisionEqualityCache.Add(equalityCacheKey, struct{}{})
+			}
+		} else if equalCount > 0 {
+			// if the equivalent revision is not immediately prior we will roll back by incrementing the
+			// Revision of the equivalent revision
+			updateRevision, err = ssc.controllerHistory.UpdateControllerRevision(
+				equalRevisions[equalCount-1],
+				updateRevision.Revision)
+			if err != nil {
+				return nil, nil, collisionCount, err
+			}
+		} else if revisionCount > 0 && setMatchesLatestExistingRevision(set, updateRevision, revisions[revisionCount-1], ssc.revisionEqualityCache) {
+			// the update revision has not changed
+			updateRevision = revisions[revisionCount-1]
+		} else {
+			//if there is no equivalent revision we create a new one
+			updateRevision, err = ssc.controllerHistory.CreateControllerRevision(set, updateRevision, &collisionCount)
+			if err != nil {
+				return nil, nil, collisionCount, err
+			}
+			if equalityCacheKey, ok := canCacheRevisionEquality(set, updateRevision, ssc.revisionEqualityCache); ok {
+				ssc.revisionEqualityCache.Add(equalityCacheKey, struct{}{})
+			}
 		}
 	}
 
@@ -608,14 +643,12 @@ func runForAll(pods []*v1.Pod, fn func(i int) (bool, error), monotonic bool) (bo
 // update must be recorded. If the error is not nil, the method should be retried until successful.
 func (ssc *defaultStatefulSetControl) updateStatefulSet(ctx context.Context, set *apps.StatefulSet, currentRevision *apps.ControllerRevision, updateRevision *apps.ControllerRevision, collisionCount int32, pods []*v1.Pod, now time.Time) (*apps.StatefulSetStatus, error) {
 	logger := klog.FromContext(ctx)
-	// get the current and update revisions of the set.
-	currentSet, err := ApplyRevision(set, currentRevision)
-	if err != nil {
-		return nil, err
-	}
-	updateSet, err := ApplyRevision(set, updateRevision)
-	if err != nil {
-		return nil, err
+	// updateRevision always represents set's current pod template, and currentSet is only needed when creating pods at currentRevision.
+	updateSet := set
+	var currentSet *apps.StatefulSet
+	var err error
+	if currentRevision == updateRevision || history.EqualRevision(currentRevision, updateRevision) {
+		currentSet = updateSet
 	}
 
 	// emit a warning and return if Recreate strategy is used and the feature gate is off
@@ -663,6 +696,12 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(ctx context.Context, set
 	for ord := start; ord <= end; ord++ {
 		replicaIdx := ord - start
 		if replicas[replicaIdx] == nil {
+			if currentSet == nil {
+				currentSet, err = ApplyRevision(set, currentRevision)
+				if err != nil {
+					return nil, err
+				}
+			}
 			replicas[replicaIdx] = newVersionedStatefulSetPod(
 				currentSet,
 				updateSet,

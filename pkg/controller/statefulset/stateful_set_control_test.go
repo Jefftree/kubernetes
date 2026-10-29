@@ -4859,3 +4859,360 @@ func TestStatefulSetMetrics(t *testing.T) {
 		})
 	}
 }
+
+func TestStatefulSetControlRevisionEqualityCacheAndLazyApply(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, time.March, 12, 12, 0, 0, 0, time.UTC)
+
+	set := newStatefulSet(3)
+	set.UID = types.UID("00000000-0000-0000-0000-000000000001")
+	set.Generation = 1
+	set.ResourceVersion = "100"
+	set.Status.CollisionCount = new(int32)
+
+	client := fake.NewClientset(set)
+	om, _, ssc := setupController(client)
+	defaultSSC := ssc.(*defaultStatefulSetControl)
+
+	rev1, err := newRevision(set, 1, set.Status.CollisionCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev1, err = defaultSSC.controllerHistory.CreateControllerRevision(set, rev1, set.Status.CollisionCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev1.UID = types.UID("00000000-0000-0000-0000-000000000101")
+	rev1.ResourceVersion = "201"
+	if err := om.revisionsIndexer.Update(rev1); err != nil {
+		t.Fatal(err)
+	}
+
+	revisions, err := ssc.ListRevisions(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentRev, updateRev, _, err := defaultSSC.getStatefulSetRevisions(set, revisions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentRev.Name != rev1.Name || updateRev.Name != rev1.Name {
+		t.Fatalf("expected current and update revision %s, got current=%s update=%s", rev1.Name, currentRev.Name, updateRev.Name)
+	}
+
+	key1 := revisionEqualityKey{
+		setUID:                  set.UID,
+		setGeneration:           set.Generation,
+		revisionResourceVersion: rev1.ResourceVersion,
+	}
+	if _, ok := defaultSSC.revisionEqualityCache.Get(key1); !ok {
+		t.Fatalf("expected revisionEqualityCache to contain key %+v after steady-state match", key1)
+	}
+
+	// Subsequent steady-state call hits the cache and returns the same revision.
+	currentRev, updateRev, _, err = defaultSSC.getStatefulSetRevisions(set, revisions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentRev.Name != rev1.Name || updateRev.Name != rev1.Name {
+		t.Fatalf("expected cached revision %s, got current=%s update=%s", rev1.Name, currentRev.Name, updateRev.Name)
+	}
+
+	// Mutating template and incrementing Generation creates a new revision and does not hit the stale Generation=1 cache key.
+	set.Status.CurrentRevision = rev1.Name
+	set.Generation = 2
+	set.ResourceVersion = "101"
+	set.Spec.Template.Spec.Containers[0].Image = "nginx:v2"
+	set.Spec.UpdateStrategy = apps.StatefulSetUpdateStrategy{
+		Type: apps.RollingUpdateStatefulSetStrategyType,
+		RollingUpdate: &apps.RollingUpdateStatefulSetStrategy{
+			Partition: ptr.To[int32](1),
+		},
+	}
+
+	revisions, err = ssc.ListRevisions(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentRev, updateRev, _, err = defaultSSC.getStatefulSetRevisions(set, revisions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentRev.Name != rev1.Name {
+		t.Fatalf("expected currentRevision %s, got %s", rev1.Name, currentRev.Name)
+	}
+	if updateRev.Name == rev1.Name {
+		t.Fatalf("expected new updateRevision on Generation=2 template change, still got %s", updateRev.Name)
+	}
+	updateRev.UID = types.UID("00000000-0000-0000-0000-000000000102")
+	updateRev.ResourceVersion = "202"
+	if err := om.revisionsIndexer.Update(updateRev); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify partitioned RollingUpdate with missing pods below and above Partition lazily applies currentRevision
+	// for ordinal 0 (< Partition=1) and uses set's updateRevision template for ordinal 1 (>= Partition=1).
+	status, err := defaultSSC.updateStatefulSet(ctx, set, currentRev, updateRev, 0, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.CurrentRevision != currentRev.Name || status.UpdateRevision != updateRev.Name {
+		t.Fatalf("unexpected status revisions: current=%s update=%s", status.CurrentRevision, status.UpdateRevision)
+	}
+	createdPod0, err := om.podsLister.Pods(set.Namespace).Get(getPodName(set, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := createdPod0.Spec.Containers[0].Image; got != "nginx" {
+		t.Fatalf("expected ordinal 0 (< Partition) to have currentRevision image %q, got %q", "nginx", got)
+	}
+	if got := getPodRevision(createdPod0); got != currentRev.Name {
+		t.Fatalf("expected ordinal 0 revision %q, got %q", currentRev.Name, got)
+	}
+
+	// Mark ordinal 0 Running & Ready, then run updateStatefulSet to create ordinal 1 (>= Partition).
+	if _, err := om.setPodRunning(set, 0); err != nil {
+		t.Fatal(err)
+	}
+	pods, err := om.setPodReadyCondition(set, 0, true, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := defaultSSC.updateStatefulSet(ctx, set, currentRev, updateRev, 0, pods, now); err != nil {
+		t.Fatal(err)
+	}
+	createdPod1, err := om.podsLister.Pods(set.Namespace).Get(getPodName(set, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := createdPod1.Spec.Containers[0].Image; got != "nginx:v2" {
+		t.Fatalf("expected ordinal 1 (>= Partition) to have updateRevision image %q, got %q", "nginx:v2", got)
+	}
+	if got := getPodRevision(createdPod1); got != updateRev.Name {
+		t.Fatalf("expected ordinal 1 revision %q, got %q", updateRev.Name, got)
+	}
+
+	// Rollback template to rev1 at Generation=3 and verify getStatefulSetRevisions rolls back to rev1 with Revision=3.
+	set, err = ApplyRevision(set, rev1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.Generation = 3
+	set.ResourceVersion = "102"
+	revisions, err = ssc.ListRevisions(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rollbackUpdateRev, _, err := defaultSSC.getStatefulSetRevisions(set, revisions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rollbackUpdateRev.Name != rev1.Name || rollbackUpdateRev.Revision != 3 {
+		t.Fatalf("expected rollback to reuse %s at revision 3, got name=%s rev=%d", rev1.Name, rollbackUpdateRev.Name, rollbackUpdateRev.Revision)
+	}
+}
+
+func newBenchmarkStatefulSet(replicas int32) *apps.StatefulSet {
+	set := newStatefulSet(replicas)
+	set.UID = types.UID("00000000-0000-0000-0000-000000000001")
+	set.Generation = 1
+	set.ResourceVersion = "100"
+
+	set.Annotations = make(map[string]string, 32)
+	for i := 0; i < 32; i++ {
+		set.Annotations[fmt.Sprintf("apps.example.com/config-checksum-%02d", i)] = strings.Repeat("a", 750)
+	}
+
+	set.Spec.Template.Annotations = make(map[string]string, 24)
+	for i := 0; i < 24; i++ {
+		set.Spec.Template.Annotations[fmt.Sprintf("pod.example.com/metadata-blob-%02d", i)] = strings.Repeat("b", 800)
+	}
+
+	container := &set.Spec.Template.Spec.Containers[0]
+	container.Args = make([]string, 32)
+	for i := 0; i < 32; i++ {
+		container.Args[i] = fmt.Sprintf("--feature-flag-%02d=%s", i, strings.Repeat("c", 200))
+	}
+	container.Env = make([]v1.EnvVar, 64)
+	for i := 0; i < 64; i++ {
+		container.Env[i] = v1.EnvVar{
+			Name:  fmt.Sprintf("APP_CONFIG_PARAM_%03d", i),
+			Value: strings.Repeat("d", 700),
+		}
+	}
+	for i := 0; i < 16; i++ {
+		volName := fmt.Sprintf("extra-config-%02d", i)
+		container.VolumeMounts = append(container.VolumeMounts, v1.VolumeMount{
+			Name:      volName,
+			MountPath: fmt.Sprintf("/etc/config/%02d", i),
+			ReadOnly:  true,
+		})
+		set.Spec.Template.Spec.Volumes = append(set.Spec.Template.Spec.Volumes, v1.Volume{
+			Name: volName,
+			VolumeSource: v1.VolumeSource{
+				ConfigMap: &v1.ConfigMapVolumeSource{
+					LocalObjectReference: v1.LocalObjectReference{Name: volName},
+				},
+			},
+		})
+	}
+
+	return set
+}
+
+func BenchmarkStatefulSetControl(b *testing.B) {
+	ctx := context.Background()
+	now := time.Date(2026, time.March, 12, 12, 0, 0, 0, time.UTC)
+
+	b.Run("SteadyStateSync", func(b *testing.B) {
+		set := newBenchmarkStatefulSet(3)
+		client := fake.NewClientset(set)
+		om, _, ssc := setupController(client)
+
+		if err := scaleUpStatefulSetControl(set, ssc, om, assertMonotonicInvariants, nil); err != nil {
+			b.Fatal(err)
+		}
+		for i, obj := range om.revisionsIndexer.List() {
+			rev := obj.(*apps.ControllerRevision)
+			rev.UID = types.UID(fmt.Sprintf("00000000-0000-0000-0000-0000000001%02d", i+1))
+			rev.ResourceVersion = strconv.Itoa(200 + i)
+			if err := om.revisionsIndexer.Update(rev); err != nil {
+				b.Fatal(err)
+			}
+		}
+		selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
+		if err != nil {
+			b.Fatal(err)
+		}
+		pods, err := om.podsLister.Pods(set.Namespace).List(selector)
+		if err != nil {
+			b.Fatal(err)
+		}
+		set, err = om.setsLister.StatefulSets(set.Namespace).Get(set.Name)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := ssc.UpdateStatefulSet(ctx, set, pods, now); err != nil {
+			b.Fatal(err)
+		}
+		set, err = om.setsLister.StatefulSets(set.Namespace).Get(set.Name)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := ssc.UpdateStatefulSet(ctx, set, pods, now); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("RollingUpdateSync", func(b *testing.B) {
+		set := newBenchmarkStatefulSet(3)
+		client := fake.NewClientset(set)
+		om, _, ssc := setupController(client)
+
+		if err := scaleUpStatefulSetControl(set, ssc, om, assertMonotonicInvariants, nil); err != nil {
+			b.Fatal(err)
+		}
+		set, err := om.setsLister.StatefulSets(set.Namespace).Get(set.Name)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		// Mutate template with Partition=2 so pods 0..1 stay on currentRevision and pod 2 updates to updateRevision.
+		set.Generation = 2
+		set.ResourceVersion = "101"
+		set.Spec.Template.Spec.Containers[0].Image = "nginx:v2"
+		set.Spec.UpdateStrategy = apps.StatefulSetUpdateStrategy{
+			Type: apps.RollingUpdateStatefulSetStrategyType,
+			RollingUpdate: &apps.RollingUpdateStatefulSetStrategy{
+				Partition: ptr.To[int32](2),
+			},
+		}
+		if err := om.setsIndexer.Update(set); err != nil {
+			b.Fatal(err)
+		}
+
+		selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
+		if err != nil {
+			b.Fatal(err)
+		}
+		pods, err := om.podsLister.Pods(set.Namespace).List(selector)
+		if err != nil {
+			b.Fatal(err)
+		}
+		// Step rolling update until pod-2 is recreated on updateRevision and Running & Ready.
+		if _, err := ssc.UpdateStatefulSet(ctx, set, pods, now); err != nil {
+			b.Fatal(err)
+		}
+		pods, err = om.podsLister.Pods(set.Namespace).List(selector)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := ssc.UpdateStatefulSet(ctx, set, pods, now); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := om.setPodRunning(set, 2); err != nil {
+			b.Fatal(err)
+		}
+		pods, err = om.setPodReadyCondition(set, 2, true, now)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for i, obj := range om.revisionsIndexer.List() {
+			rev := obj.(*apps.ControllerRevision)
+			rev.UID = types.UID(fmt.Sprintf("00000000-0000-0000-0000-0000000002%02d", i+1))
+			rev.ResourceVersion = strconv.Itoa(300 + i)
+			if err := om.revisionsIndexer.Update(rev); err != nil {
+				b.Fatal(err)
+			}
+		}
+		set, err = om.setsLister.StatefulSets(set.Namespace).Get(set.Name)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := ssc.UpdateStatefulSet(ctx, set, pods, now); err != nil {
+			b.Fatal(err)
+		}
+		set, err = om.setsLister.StatefulSets(set.Namespace).Get(set.Name)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if set.Status.CurrentRevision == set.Status.UpdateRevision {
+			b.Fatalf("expected currentRevision != updateRevision, got %s", set.Status.CurrentRevision)
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := ssc.UpdateStatefulSet(ctx, set, pods, now); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("GetStatefulSetRevisions", func(b *testing.B) {
+		set := newBenchmarkStatefulSet(3)
+		client := fake.NewClientset(set)
+		_, _, ssc := setupController(client)
+		rev, err := newRevision(set, 1, ptr.To[int32](0))
+		if err != nil {
+			b.Fatal(err)
+		}
+		rev.UID = types.UID("00000000-0000-0000-0000-000000000301")
+		rev.ResourceVersion = "400"
+		revisions := []*apps.ControllerRevision{rev}
+		defaultSSC := ssc.(*defaultStatefulSetControl)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, _, _, err := defaultSSC.getStatefulSetRevisions(set, revisions); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
