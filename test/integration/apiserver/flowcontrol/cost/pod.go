@@ -20,6 +20,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"math/rand"
 	"runtime"
 	"strings"
 
@@ -173,6 +174,8 @@ func seedPods(tCtx ktesting.TContext, informer *informerWaiter, ns string, count
 	informer.resetEvents()
 	client := tCtx.Client()
 	pods := make([]*v1.Pod, count)
+	// Permute per-pod size offsets so listed pods are not ordered by ascending size.
+	perm := rand.New(rand.NewSource(0)).Perm(count)
 	seedAt := func(ctx context.Context, i int) error {
 		var nodeName string
 		// Leave the final pod unbound when seeding multiple pods so dry-run
@@ -183,7 +186,7 @@ func seedPods(tCtx ktesting.TContext, informer *informerWaiter, ns string, count
 		deploymentLabel := fmt.Sprintf("small-deployment-%02d", i%10)
 		extra := extraBytes
 		if extra > 0 {
-			extra += i
+			extra += perm[i]
 		}
 		p, err := seedExemplarPod(ctx, client, ns, fmt.Sprintf("pod-%03d", i), nodeName, deploymentLabel, extra)
 		pods[i] = p
