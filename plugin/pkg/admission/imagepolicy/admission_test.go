@@ -1012,17 +1012,14 @@ func TestDefaultAllow(t *testing.T) {
 				return
 			}
 			podAnnotations := tt.pod.GetAnnotations()
+			if podAnnotations != nil && podAnnotations[api.ImagePolicyFailedOpenKey] == "true" {
+				t.Errorf("found unexpected fail open pod annotation")
+			}
 			if tt.wantFailOpen {
-				if podAnnotations == nil || podAnnotations[api.ImagePolicyFailedOpenKey] != "true" {
-					t.Errorf("missing expected fail open pod annotation")
-				}
 				if annotations[AuditKeyPrefix+ImagePolicyFailedOpenKeySuffix] != "true" {
 					t.Errorf("missing expected fail open attributes annotation")
 				}
 			} else {
-				if podAnnotations != nil && podAnnotations[api.ImagePolicyFailedOpenKey] == "true" {
-					t.Errorf("found unexpected fail open pod annotation")
-				}
 				if annotations[AuditKeyPrefix+ImagePolicyFailedOpenKeySuffix] == "true" {
 					t.Errorf("found unexpected fail open attributes annotation")
 				}

@@ -109,19 +109,11 @@ func (a *Plugin) filterAnnotations(allAnnotations map[string]string) map[string]
 }
 
 // Function to call on webhook failure; behavior determined by defaultAllow flag
-func (a *Plugin) webhookError(pod *api.Pod, attributes admission.Attributes, err error) error {
+func (a *Plugin) webhookError(_ *api.Pod, attributes admission.Attributes, err error) error {
 	if err != nil {
 		klog.V(2).Infof("error contacting webhook backend: %s", err)
 		if a.defaultAllow {
 			attributes.AddAnnotation(AuditKeyPrefix+ImagePolicyFailedOpenKeySuffix, "true")
-			// TODO(wteiken): Remove the annotation code for the 1.13 release
-			annotations := pod.GetAnnotations()
-			if annotations == nil {
-				annotations = make(map[string]string)
-			}
-			annotations[api.ImagePolicyFailedOpenKey] = "true"
-			pod.ObjectMeta.SetAnnotations(annotations)
-
 			klog.V(2).Infof("resource allowed in spite of webhook backend failure")
 			return nil
 		}
