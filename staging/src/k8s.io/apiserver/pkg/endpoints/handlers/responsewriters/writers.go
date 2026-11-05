@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -91,6 +92,12 @@ func StreamObject(statusCode int, gv schema.GroupVersion, s runtime.NegotiatedSe
 	io.Copy(writer, out)
 }
 
+var deferredResponseWriterPool = sync.Pool{
+	New: func() any {
+		return &deferredResponseWriter{}
+	},
+}
+
 // SerializeObject renders an object in the content type negotiated by the client using the provided encoder.
 // The context is optional and can be nil. This method will perform optional content compression if requested by
 // a client and the feature gate for APIResponseCompression is enabled.
@@ -106,24 +113,38 @@ func SerializeObject(mediaType string, encoder runtime.Encoder, hw http.Response
 	req = req.WithContext(ctx)
 	defer span.End(5 * time.Second)
 
-	w := &deferredResponseWriter{
-		mediaType:       mediaType,
-		statusCode:      statusCode,
-		contentEncoding: responseContentEncodingSupported(req),
-		hw:              hw,
-		ctx:             ctx,
+	w := deferredResponseWriterPool.Get().(*deferredResponseWriter)
+	w.mediaType = mediaType
+	w.statusCode = statusCode
+	w.contentEncoding = responseContentEncodingSupported(req)
+	w.hw = hw
+	w.ctx = ctx
+	w.hasWritten = false
+	w.hasBuffered = false
+	w.totalBytes = 0
+	w.lastWriteErr = nil
+	if w.buffer != nil {
+		w.buffer = w.buffer[:0]
 	}
+	defer func() {
+		w.hw = nil
+		w.w = nil
+		w.ctx = nil
+		w.lastWriteErr = nil
+		if cap(w.buffer) > defaultGzipThresholdBytes {
+			w.buffer = nil
+		}
+		deferredResponseWriterPool.Put(w)
+	}()
 
-	var memoryAllocator runtime.MemoryAllocator
+	var err error
 	if encoderWithAllocator, supportsAllocator := encoder.(runtime.EncoderWithAllocator); supportsAllocator {
-		memoryAllocator = runtime.AllocatorPool.Get().(*runtime.Allocator)
-		encoder = runtime.NewEncoderWithAllocator(encoderWithAllocator, memoryAllocator)
-	}
-	if memoryAllocator != nil {
+		memoryAllocator := runtime.AllocatorPool.Get().(*runtime.Allocator)
 		defer runtime.PutAllocator(memoryAllocator)
+		err = encoderWithAllocator.EncodeWithAllocator(object, w, memoryAllocator)
+	} else {
+		err = encoder.Encode(object, w)
 	}
-
-	err := encoder.Encode(object, w)
 	if err == nil {
 		err = w.Close()
 		if err != nil {
@@ -334,13 +355,17 @@ func WriteObjectNegotiated(s runtime.NegotiatedSerializer, restrictions negotiat
 	} else {
 		encoder = s.EncoderForVersion(serializer.Serializer, gv)
 	}
-	request.TrackSerializeResponseObjectLatency(req.Context(), func() {
-		if listGVKInContentType {
-			SerializeObject(generateMediaTypeWithGVK(serializer.MediaType, mediaType.Convert), encoder, w, req, statusCode, object)
-		} else {
-			SerializeObject(serializer.MediaType, encoder, w, req, statusCode, object)
-		}
-	})
+	outMediaType := serializer.MediaType
+	if listGVKInContentType {
+		outMediaType = generateMediaTypeWithGVK(serializer.MediaType, mediaType.Convert)
+	}
+	if tracker, ok := request.LatencyTrackersFrom(req.Context()); ok {
+		start := time.Now()
+		SerializeObject(outMediaType, encoder, w, req, statusCode, object)
+		tracker.SerializationTracker.TrackDuration(time.Since(start))
+	} else {
+		SerializeObject(outMediaType, encoder, w, req, statusCode, object)
+	}
 }
 
 func generateMediaTypeWithGVK(mediaType string, gvk *schema.GroupVersionKind) string {

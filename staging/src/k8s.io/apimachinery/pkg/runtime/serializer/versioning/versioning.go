@@ -215,21 +215,21 @@ func (c *codec) encode(obj runtime.Object, w io.Writer, memAlloc runtime.MemoryA
 	return c.doEncode(obj, w, memAlloc)
 }
 
-func (c *codec) doEncode(obj runtime.Object, w io.Writer, memAlloc runtime.MemoryAllocator) error {
-	encodeFn := c.encoder.Encode
+func (c *codec) encodeToWriter(obj runtime.Object, w io.Writer, memAlloc runtime.MemoryAllocator) error {
 	if memAlloc != nil {
 		if encoder, supportsAllocator := c.encoder.(runtime.EncoderWithAllocator); supportsAllocator {
-			encodeFn = func(obj runtime.Object, w io.Writer) error {
-				return encoder.EncodeWithAllocator(obj, w, memAlloc)
-			}
-		} else {
-			//nolint:logcheck // Extending the API is not worth it for contextual, structured logging of this.
-			klog.V(6).Infof("a memory allocator was provided but the encoder %s doesn't implement the runtime.EncoderWithAllocator, using regular encoder.Encode method", c.encoder.Identifier())
+			return encoder.EncodeWithAllocator(obj, w, memAlloc)
 		}
+		//nolint:logcheck // Extending the API is not worth it for contextual, structured logging of this.
+		klog.V(6).Infof("a memory allocator was provided but the encoder %s doesn't implement the runtime.EncoderWithAllocator, using regular encoder.Encode method", c.encoder.Identifier())
 	}
+	return c.encoder.Encode(obj, w)
+}
+
+func (c *codec) doEncode(obj runtime.Object, w io.Writer, memAlloc runtime.MemoryAllocator) error {
 	switch obj := obj.(type) {
 	case *runtime.Unknown:
-		return encodeFn(obj, w)
+		return c.encodeToWriter(obj, w, memAlloc)
 	case runtime.Unstructured:
 		// An unstructured list can contain objects of multiple group version kinds. don't short-circuit just
 		// because the top-level type matches our desired destination type. actually send the object to the converter
@@ -238,14 +238,14 @@ func (c *codec) doEncode(obj runtime.Object, w io.Writer, memAlloc runtime.Memor
 			// avoid conversion roundtrip if GVK is the right one already or is empty (yes, this is a hack, but the old behaviour we rely on in kubectl)
 			objGVK := obj.GetObjectKind().GroupVersionKind()
 			if len(objGVK.Version) == 0 {
-				return encodeFn(obj, w)
+				return c.encodeToWriter(obj, w, memAlloc)
 			}
 			targetGVK, ok := c.encodeVersion.KindForGroupVersionKinds([]schema.GroupVersionKind{objGVK})
 			if !ok {
 				return runtime.NewNotRegisteredGVKErrForTarget(c.originalSchemeName, objGVK, c.encodeVersion)
 			}
 			if targetGVK == objGVK {
-				return encodeFn(obj, w)
+				return c.encodeToWriter(obj, w, memAlloc)
 			}
 		}
 	}
@@ -267,7 +267,7 @@ func (c *codec) doEncode(obj runtime.Object, w io.Writer, memAlloc runtime.Memor
 			}
 		}
 		objectKind.SetGroupVersionKind(gvks[0])
-		return encodeFn(obj, w)
+		return c.encodeToWriter(obj, w, memAlloc)
 	}
 
 	// Perform a conversion if necessary
@@ -283,7 +283,7 @@ func (c *codec) doEncode(obj runtime.Object, w io.Writer, memAlloc runtime.Memor
 	}
 
 	// Conversion is responsible for setting the proper group, version, and kind onto the outgoing object
-	return encodeFn(out, w)
+	return c.encodeToWriter(out, w, memAlloc)
 }
 
 // Identifier implements runtime.Encoder interface.

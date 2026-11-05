@@ -32,6 +32,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/kubernetes"
 	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
@@ -352,7 +353,9 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 		return fmt.Errorf("PrepareObjectForStorage failed: %v", err)
 	}
 	span.AddEvent("About to Encode")
-	data, err := runtime.Encode(s.codec, obj)
+	encodeBuf := getEncodeBuffer(out)
+	defer putEncodeBuffer(encodeBuf)
+	data, err := s.encodeWithBuffer(obj, encodeBuf)
 	if err != nil {
 		span.AddEvent("Encode failed", attribute.Int("len", len(data)), attribute.String("err", err.Error()))
 		return err
@@ -432,7 +435,9 @@ func (s *store) conditionalDelete(
 	var origState *objState
 	var err error
 	if cachedExistingObject != nil {
-		origState, err = s.getStateFromObject(cachedExistingObject, false)
+		origEncodeBuf := getEncodeBuffer(out)
+		defer putEncodeBuffer(origEncodeBuf)
+		origState, err = s.getStateFromObject(cachedExistingObject, false, origEncodeBuf)
 	} else {
 		origState, err = getCurrentState(false)
 	}
@@ -522,7 +527,9 @@ func (s *store) GuaranteedUpdate(
 
 	var origState *objState
 	if cachedExistingObject != nil {
-		origState, err = s.getStateFromObject(cachedExistingObject, false)
+		origEncodeBuf := getEncodeBuffer(destination)
+		defer putEncodeBuffer(origEncodeBuf)
+		origState, err = s.getStateFromObject(cachedExistingObject, false, origEncodeBuf)
 	} else {
 		origState, err = getCurrentState(ignoreNotFound)
 	}
@@ -567,7 +574,9 @@ func (s *store) updateOnce(ctx context.Context, preparedKey string, destination 
 
 	span := tracing.SpanFromContext(ctx)
 	span.AddEvent("About to Encode")
-	data, err := runtime.Encode(s.codec, ret)
+	encodeBuf := getEncodeBuffer(destination)
+	defer putEncodeBuffer(encodeBuf)
+	data, err := s.encodeWithBuffer(ret, encodeBuf)
 	if err != nil {
 		span.AddEvent("Encode failed", attribute.Int("len", len(data)), attribute.String("err", err.Error()))
 		return origState, false, err
@@ -1247,7 +1256,104 @@ func (s *store) stateFromEtcdResponse(ctx context.Context, kv *mvccpb.KeyValue, 
 	return state, nil
 }
 
-func (s *store) getStateFromObject(obj runtime.Object, current bool) (*objState, error) {
+const maxPooledEncodeScratchCap = 64 * 1024
+
+type encodeBuffer struct {
+	alloc     runtime.Allocator
+	lastAlloc []byte
+	scratch   []byte
+	out       []byte
+}
+
+func (b *encodeBuffer) Allocate(n uint64) []byte {
+	slice := b.alloc.Allocate(n)
+	b.lastAlloc = slice
+	return slice
+}
+
+func (b *encodeBuffer) Write(p []byte) (int, error) {
+	if b.out == nil && len(p) > 0 && len(b.lastAlloc) >= len(p) && &p[0] == &b.lastAlloc[0] {
+		b.out = p[:len(p):len(p)]
+		return len(p), nil
+	}
+	if b.out != nil && len(b.scratch) == 0 {
+		b.scratch = append(b.scratch, b.out...)
+	}
+	b.scratch = append(b.scratch, p...)
+	b.out = b.scratch
+	return len(p), nil
+}
+
+func (b *encodeBuffer) Splice(p []byte) {
+	if b.out == nil {
+		b.out = p
+		return
+	}
+	if len(b.scratch) == 0 {
+		b.scratch = append(b.scratch, b.out...)
+	}
+	b.scratch = append(b.scratch, p...)
+	b.out = b.scratch
+}
+
+func (b *encodeBuffer) Reset() {
+	if cap(b.lastAlloc) > maxPooledEncodeScratchCap {
+		b.alloc = runtime.Allocator{}
+	}
+	b.lastAlloc = nil
+	if cap(b.scratch) > maxPooledEncodeScratchCap {
+		b.scratch = nil
+	} else {
+		b.scratch = b.scratch[:0]
+	}
+	b.out = nil
+}
+
+func (b *encodeBuffer) Bytes() []byte {
+	return b.out
+}
+
+var encodeBufferPool = sync.Pool{
+	New: func() any {
+		return &encodeBuffer{}
+	},
+}
+
+func getEncodeBuffer(dst runtime.Object) *encodeBuffer {
+	if grpc.EnableTracing {
+		return nil
+	}
+	if _, isUnknown := dst.(*runtime.Unknown); isUnknown {
+		return nil
+	}
+	return encodeBufferPool.Get().(*encodeBuffer)
+}
+
+func putEncodeBuffer(buf *encodeBuffer) {
+	if buf == nil {
+		return
+	}
+	buf.Reset()
+	encodeBufferPool.Put(buf)
+}
+
+func (s *store) encodeWithBuffer(obj runtime.Object, buf *encodeBuffer) ([]byte, error) {
+	if buf != nil {
+		if co, isCacheable := obj.(runtime.CacheableObject); isCacheable {
+			obj = co.GetObject()
+		}
+		if ewa, ok := s.codec.(runtime.EncoderWithAllocator); ok {
+			buf.Reset()
+			if err := ewa.EncodeWithAllocator(obj, buf, buf); err != nil {
+				return nil, err
+			}
+			return buf.Bytes(), nil
+		}
+	}
+	return runtime.Encode(s.codec, obj)
+}
+
+func (s *store) getStateFromObject(obj runtime.Object, current bool, encodeBuf *encodeBuffer) (*objState, error) {
 	state := &objState{
 		obj:     obj,
 		meta:    &storage.ResponseMeta{},
@@ -1266,7 +1372,7 @@ func (s *store) getStateFromObject(obj runtime.Object, current bool) (*objState,
 	if err := s.versioner.PrepareObjectForStorage(obj); err != nil {
 		return nil, fmt.Errorf("PrepareObjectForStorage failed: %v", err)
 	}
-	state.data, err = runtime.Encode(s.codec, obj)
+	state.data, err = s.encodeWithBuffer(obj, encodeBuf)
 	if err != nil {
 		return nil, err
 	}

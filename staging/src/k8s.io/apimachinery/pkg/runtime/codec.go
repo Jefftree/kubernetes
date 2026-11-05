@@ -43,6 +43,16 @@ func NewCodec(e Encoder, d Decoder) Codec {
 	return codec{e, d}
 }
 
+var _ EncoderWithAllocator = codec{}
+
+// EncodeWithAllocator forwards the MemoryAllocator to the underlying Encoder when supported.
+func (c codec) EncodeWithAllocator(obj Object, w io.Writer, memAlloc MemoryAllocator) error {
+	if ewa, ok := c.Encoder.(EncoderWithAllocator); ok {
+		return ewa.EncodeWithAllocator(obj, w, memAlloc)
+	}
+	return c.Encoder.Encode(obj, w)
+}
+
 // Encode is a convenience wrapper for encoding to a []byte from an Encoder
 func Encode(e Encoder, obj Object) ([]byte, error) {
 	buf := &bytes.Buffer{}

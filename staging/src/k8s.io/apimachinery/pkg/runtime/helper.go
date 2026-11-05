@@ -218,11 +218,27 @@ type WithVersionEncoder struct {
 	ObjectTyper
 }
 
+var _ EncoderWithAllocator = WithVersionEncoder{}
+
 // Encode does not do conversion. It sets the gvk during serialization.
 func (e WithVersionEncoder) Encode(obj Object, stream io.Writer) error {
+	return e.encode(obj, stream, nil)
+}
+
+// EncodeWithAllocator does not do conversion. It sets the gvk during serialization.
+func (e WithVersionEncoder) EncodeWithAllocator(obj Object, stream io.Writer, memAlloc MemoryAllocator) error {
+	return e.encode(obj, stream, memAlloc)
+}
+
+func (e WithVersionEncoder) encode(obj Object, stream io.Writer, memAlloc MemoryAllocator) error {
 	gvks, _, err := e.ObjectTyper.ObjectKinds(obj)
 	if err != nil {
 		if IsNotRegisteredError(err) {
+			if memAlloc != nil {
+				if ewa, ok := e.Encoder.(EncoderWithAllocator); ok {
+					return ewa.EncodeWithAllocator(obj, stream, memAlloc)
+				}
+			}
 			return e.Encoder.Encode(obj, stream)
 		}
 		return err
@@ -243,6 +259,11 @@ func (e WithVersionEncoder) Encode(obj Object, stream io.Writer) error {
 		defer kind.SetGroupVersionKind(oldGVK)
 	}
 
+	if memAlloc != nil {
+		if ewa, ok := e.Encoder.(EncoderWithAllocator); ok {
+			return ewa.EncodeWithAllocator(obj, stream, memAlloc)
+		}
+	}
 	return e.Encoder.Encode(obj, stream)
 }
 
