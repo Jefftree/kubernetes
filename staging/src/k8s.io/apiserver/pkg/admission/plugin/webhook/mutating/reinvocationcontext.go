@@ -37,11 +37,14 @@ func (rc *webhookReinvokeContext) ShouldReinvokeWebhook(webhook string) bool {
 }
 
 func (rc *webhookReinvokeContext) IsOutputChangedSinceLastWebhookInvocation(object runtime.Object) bool {
+	if len(rc.previouslyInvokedReinvocableWebhooks) == 0 {
+		return false
+	}
 	return !apiequality.Semantic.DeepEqual(rc.lastWebhookOutput, object)
 }
 
 func (rc *webhookReinvokeContext) SetLastWebhookInvocationOutput(object runtime.Object) {
-	if object == nil {
+	if object == nil || len(rc.previouslyInvokedReinvocableWebhooks) == 0 {
 		rc.lastWebhookOutput = nil
 		return
 	}

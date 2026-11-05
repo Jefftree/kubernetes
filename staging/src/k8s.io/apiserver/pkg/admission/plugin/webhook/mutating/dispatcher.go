@@ -118,7 +118,9 @@ func (a *mutatingDispatcher) Dispatch(ctx context.Context, attr admission.Attrib
 		webhookReinvokeCtx.RequireReinvokingPreviouslyInvokedPlugins()
 	}
 	defer func() {
-		webhookReinvokeCtx.SetLastWebhookInvocationOutput(attr.GetObject())
+		if len(webhookReinvokeCtx.previouslyInvokedReinvocableWebhooks) > 0 {
+			webhookReinvokeCtx.SetLastWebhookInvocationOutput(attr.GetObject())
+		}
 	}()
 	v := &versionedAttributeAccessor{
 		attr:             attr,

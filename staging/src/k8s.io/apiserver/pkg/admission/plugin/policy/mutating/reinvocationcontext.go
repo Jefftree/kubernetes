@@ -45,11 +45,14 @@ func (rc *policyReinvokeContext) ShouldReinvoke(policy key) bool {
 }
 
 func (rc *policyReinvokeContext) IsOutputChangedSinceLastPolicyInvocation(object runtime.Object) bool {
+	if len(rc.previouslyInvokedReinvocablePolicies) == 0 {
+		return false
+	}
 	return !apiequality.Semantic.DeepEqual(rc.lastPolicyOutput, object)
 }
 
 func (rc *policyReinvokeContext) SetLastPolicyInvocationOutput(object runtime.Object) {
-	if object == nil {
+	if object == nil || len(rc.previouslyInvokedReinvocablePolicies) == 0 {
 		rc.lastPolicyOutput = nil
 		return
 	}

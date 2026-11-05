@@ -94,7 +94,9 @@ func (d *dispatcher) dispatchInvocations(
 		policyReinvokeCtx.RequireReinvokingPreviouslyInvokedPlugins()
 	}
 	defer func() {
-		policyReinvokeCtx.SetLastPolicyInvocationOutput(a.GetObject())
+		if len(policyReinvokeCtx.previouslyInvokedReinvocablePolicies) > 0 {
+			policyReinvokeCtx.SetLastPolicyInvocationOutput(a.GetObject())
+		}
 	}()
 
 	var policyErrors []generic.PolicyError

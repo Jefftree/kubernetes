@@ -17,12 +17,16 @@ limitations under the License.
 package mutating
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	jsonpatch "gopkg.in/evanphx/json-patch.v4"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/admission"
 )
 
 func TestMutationAnnotationValue(t *testing.T) {
@@ -130,4 +134,50 @@ func TestJSONPatchAnnotationValue(t *testing.T) {
 			}
 		})
 	}
+}
+
+type trackingDeepCopyObject struct {
+	runtime.Object
+	deepCopyCalls int
+}
+
+func (o *trackingDeepCopyObject) GetObjectKind() schema.ObjectKind {
+	return schema.EmptyObjectKind
+}
+
+func (o *trackingDeepCopyObject) DeepCopyObject() runtime.Object {
+	o.deepCopyCalls++
+	return &trackingDeepCopyObject{}
+}
+
+func TestDispatchNoDeepCopyWhenNoReinvocableWebhooks(t *testing.T) {
+	d := &mutatingDispatcher{
+		plugin: &Plugin{},
+	}
+	obj := &trackingDeepCopyObject{}
+	attr := admission.NewAttributesRecord(
+		obj,
+		nil,
+		schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"},
+		"default",
+		"pod-1",
+		schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"},
+		"",
+		admission.Update,
+		nil,
+		false,
+		nil,
+	)
+
+	err := d.Dispatch(context.Background(), attr, nil, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, obj.deepCopyCalls, "Dispatch should not DeepCopyObject when no reinvocable webhooks were invoked")
+
+	rc := &webhookReinvokeContext{}
+	rc.SetLastWebhookInvocationOutput(obj)
+	assert.Equal(t, 0, obj.deepCopyCalls, "SetLastWebhookInvocationOutput should not DeepCopyObject when no reinvocable webhooks were invoked")
+
+	rc.AddReinvocableWebhookToPreviouslyInvoked("webhook-1")
+	rc.SetLastWebhookInvocationOutput(obj)
+	assert.Equal(t, 1, obj.deepCopyCalls, "SetLastWebhookInvocationOutput should DeepCopyObject once a reinvocable webhook was invoked")
 }
