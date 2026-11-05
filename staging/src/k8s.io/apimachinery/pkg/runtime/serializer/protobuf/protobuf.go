@@ -106,6 +106,164 @@ var _ recognizer.RecognizingDecoder = &Serializer{}
 
 const serializerIdentifier runtime.Identifier = "protobuf"
 
+func internProtoMetaString(b []byte) string {
+	switch string(b) {
+	case "":
+		return ""
+	case "v1":
+		return "v1"
+	case "Pod":
+		return "Pod"
+	case "Node":
+		return "Node"
+	case "ConfigMap":
+		return "ConfigMap"
+	case "Secret":
+		return "Secret"
+	case "Service":
+		return "Service"
+	case "Events":
+		return "Events"
+	case "Event":
+		return "Event"
+	case "Endpoints":
+		return "Endpoints"
+	case "Namespace":
+		return "Namespace"
+	case "apps/v1":
+		return "apps/v1"
+	case "discovery.k8s.io/v1":
+		return "discovery.k8s.io/v1"
+	case "coordination.k8s.io/v1":
+		return "coordination.k8s.io/v1"
+	default:
+		return string(b)
+	}
+}
+
+func unmarshalTypeMetaShallow(dAtA []byte, m *runtime.TypeMeta) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 || iNdEx >= l {
+				*m = runtime.TypeMeta{}
+				return m.Unmarshal(dAtA)
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType != 2 || (fieldNum != 1 && fieldNum != 2) {
+			*m = runtime.TypeMeta{}
+			return m.Unmarshal(dAtA)
+		}
+		var stringLen int
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 || iNdEx >= l {
+				*m = runtime.TypeMeta{}
+				return m.Unmarshal(dAtA)
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			stringLen |= int(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		if stringLen < 0 {
+			*m = runtime.TypeMeta{}
+			return m.Unmarshal(dAtA)
+		}
+		postIndex := iNdEx + stringLen
+		if postIndex < 0 || postIndex > l {
+			*m = runtime.TypeMeta{}
+			return m.Unmarshal(dAtA)
+		}
+		if fieldNum == 1 {
+			m.APIVersion = internProtoMetaString(dAtA[iNdEx:postIndex])
+		} else {
+			m.Kind = internProtoMetaString(dAtA[iNdEx:postIndex])
+		}
+		iNdEx = postIndex
+	}
+	return nil
+}
+
+// unmarshalUnknownShallow parses runtime.Unknown without copying Field 2 (Raw),
+// slicing unk.Raw directly into dAtA.
+func unmarshalUnknownShallow(dAtA []byte, m *runtime.Unknown) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 || iNdEx >= l {
+				*m = runtime.Unknown{}
+				return m.Unmarshal(dAtA)
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType != 2 || fieldNum < 1 || fieldNum > 4 {
+			*m = runtime.Unknown{}
+			return m.Unmarshal(dAtA)
+		}
+		var byteLen int
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 || iNdEx >= l {
+				*m = runtime.Unknown{}
+				return m.Unmarshal(dAtA)
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			byteLen |= int(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		if byteLen < 0 {
+			*m = runtime.Unknown{}
+			return m.Unmarshal(dAtA)
+		}
+		postIndex := iNdEx + byteLen
+		if postIndex < 0 || postIndex > l {
+			*m = runtime.Unknown{}
+			return m.Unmarshal(dAtA)
+		}
+		switch fieldNum {
+		case 1:
+			if err := unmarshalTypeMetaShallow(dAtA[iNdEx:postIndex], &m.TypeMeta); err != nil {
+				return err
+			}
+		case 2:
+			if byteLen == 0 {
+				m.Raw = []byte{}
+			} else {
+				m.Raw = dAtA[iNdEx:postIndex]
+			}
+		case 3:
+			m.ContentEncoding = internProtoMetaString(dAtA[iNdEx:postIndex])
+		case 4:
+			m.ContentType = internProtoMetaString(dAtA[iNdEx:postIndex])
+		}
+		iNdEx = postIndex
+	}
+	return nil
+}
+
 // Decode attempts to convert the provided data into a protobuf message, extract the stored schema kind, apply the provided default
 // gvk, and then load that data into an object matching the desired schema kind or the provided into. If into is *runtime.Unknown,
 // the raw data will be extracted and no decoding will be performed. If into is not registered with the typer, then the object will
@@ -127,7 +285,7 @@ func (s *Serializer) Decode(originalData []byte, gvk *schema.GroupVersionKind, i
 
 	data := originalData[prefixLen:]
 	unk := runtime.Unknown{}
-	if err := unk.Unmarshal(data); err != nil {
+	if err := unmarshalUnknownShallow(data, &unk); err != nil {
 		return nil, nil, err
 	}
 
@@ -135,6 +293,9 @@ func (s *Serializer) Decode(originalData []byte, gvk *schema.GroupVersionKind, i
 	copyKindDefaults(&actual, gvk)
 
 	if intoUnknown, ok := into.(*runtime.Unknown); ok && intoUnknown != nil {
+		if len(unk.Raw) > 0 {
+			unk.Raw = bytes.Clone(unk.Raw)
+		}
 		*intoUnknown = unk
 		if ok, _, _ := s.RecognizesData(unk.Raw); ok {
 			intoUnknown.ContentType = runtime.ContentTypeProtobuf
