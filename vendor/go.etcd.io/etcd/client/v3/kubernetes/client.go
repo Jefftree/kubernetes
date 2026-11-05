@@ -81,10 +81,17 @@ func (k Client) Count(ctx context.Context, prefix string, _ CountOptions) (int64
 }
 
 func (k Client) OptimisticPut(ctx context.Context, key string, value []byte, expectedRevision int64, opts PutOptions) (resp PutResponse, err error) {
+	var putOp clientv3.Op
+	if opts.LeaseID != 0 {
+		putOp = clientv3.OpPut(key, "", clientv3.WithLease(opts.LeaseID))
+	} else {
+		putOp = clientv3.OpPut(key, "")
+	}
+	putOp.WithValueBytes(value)
 	txn := k.KV.Txn(ctx).If(
 		clientv3.Compare(clientv3.ModRevision(key), "=", expectedRevision),
 	).Then(
-		clientv3.OpPut(key, string(value), clientv3.WithLease(opts.LeaseID)),
+		putOp,
 	)
 
 	if opts.GetOnFailure {

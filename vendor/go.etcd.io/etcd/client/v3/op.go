@@ -256,7 +256,7 @@ func NewOp() *Op {
 // OpGet returns "get" operation based on given key and operation options.
 func OpGet(key string, opts ...OpOption) Op {
 	// WithPrefix and WithFromKey are not supported together
-	if IsOptsWithPrefix(opts) && IsOptsWithFromKey(opts) {
+	if len(opts) > 0 && IsOptsWithPrefix(opts) && IsOptsWithFromKey(opts) {
 		panic("`WithPrefix` and `WithFromKey` cannot be set at the same time, choose one")
 	}
 	ret := Op{t: tRange, key: []byte(key)}
@@ -267,7 +267,7 @@ func OpGet(key string, opts ...OpOption) Op {
 // OpDelete returns "delete" operation based on given key and operation options.
 func OpDelete(key string, opts ...OpOption) Op {
 	// WithPrefix and WithFromKey are not supported together
-	if IsOptsWithPrefix(opts) && IsOptsWithFromKey(opts) {
+	if len(opts) > 0 && IsOptsWithPrefix(opts) && IsOptsWithFromKey(opts) {
 		panic("`WithPrefix` and `WithFromKey` cannot be set at the same time, choose one")
 	}
 	ret := Op{t: tDeleteRange, key: []byte(key)}
