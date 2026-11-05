@@ -18,64 +18,62 @@ package store
 
 import (
 	"fmt"
+	"sort"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/cacher/consistency"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/third_party/forked/golang/btree"
 )
 
-// newStoreSnapshotter returns a storeSnapshotter that stores snapshots for
-// serving read requests with exact resource versions (RV) and pagination.
-//
-// Snapshots are created by calling Clone method on orderedLister, which is
-// expected to be fast and efficient thanks to usage of B-trees.
-// B-trees can create a lazy copy of the tree structure, minimizing overhead.
-//
-// Assuming the watch cache observes all events and snapshots cache after each of them,
-// requests for a specific resource version can be served by retrieving
-// the snapshot with the greatest RV less than or equal to the requested RV.
-// To make snapshot retrivial efficient we need an ordered data structure, such as tree.
-//
-// The initial implementation uses a B-tree to achieve the following performance characteristics (n - number of snapshots stored):
-//   - `Add`: Adds a new snapshot.
-//     Complexity: O(log n).
-//     Executed for each watch event observed by the cache.
-//   - `OldestResourceVersion`: Returns the RV of the oldest stored snapshot.
-//     Complexity: O(log n).
-//     Executed before watch cache synchronization for each LIST request with match=Exact or continuation.
-//   - `GetSnapshot`: Retrieves the snapshot with the greatest RV less than or equal to the requested RV.
-//     Complexity: O(log n).
-//     Executed after watch cache synchronization for each LIST request with match=Exact or continuation.
-//   - `RemoveLess`: Cleans up snapshots outside the watch history window.
-//     Complexity: O(k log n), k - number of snapshots to remove, usually only one if watch capacity was not reduced.
-//     Executed per watch event observed when the cache is full.
-//   - `Reset`: Cleans up all snapshots.
-//     Complexity: O(1).
-//     Executed when the watch cache is reinitialized.
-//
-// Further optimization is possible by leveraging the property that adds always
-// increase the maximum RV and deletes only increase the minimum RV.
-// For example, a binary search on a cyclic buffer of (RV, snapshot)
-// should reduce number of allocations and improve removal complexity.
-// However, this solution is more complex and is deferred for future implementation.
-//
-// TODO: Rewrite to use a cyclic buffer
+const initialSnapshotterCapacity = 64
+
+// newSnapshotter returns a snapshotter that stores snapshots in a sorted cyclic
+// buffer for serving read requests with exact resource versions (RV) and pagination.
 func newSnapshotter(enabled bool) snapshotter {
 	return snapshotter{
-		snapshots: btree.New(btreeDegree, func(a, b *btreeStore) bool {
-			return a.resourceVersion < b.resourceVersion
-		}),
 		enabled: enabled,
 	}
 }
 
 type snapshotter struct {
-	snapshots       *btree.BTree[*btreeStore]
+	buf             []*btreeStore
+	head            int
+	count           int
 	resourceVersion uint64
 	compactRevision uint64
 	enabled         bool
+}
+
+func (s *snapshotter) at(i int) *btreeStore {
+	return s.buf[(s.head+i)%len(s.buf)]
+}
+
+func (s *snapshotter) pushBack(snap *btreeStore) {
+	if s.count == len(s.buf) {
+		newCap := initialSnapshotterCapacity
+		if len(s.buf) > 0 {
+			newCap = len(s.buf) * 2
+		}
+		newBuf := make([]*btreeStore, newCap)
+		if s.count > 0 {
+			first := min(s.count, len(s.buf)-s.head)
+			copy(newBuf, s.buf[s.head:s.head+first])
+			if first < s.count {
+				copy(newBuf[first:], s.buf[:s.count-first])
+			}
+		}
+		s.buf = newBuf
+		s.head = 0
+	}
+	s.buf[(s.head+s.count)%len(s.buf)] = snap
+	s.count++
+}
+
+func (s *snapshotter) popFront() {
+	s.buf[s.head] = nil
+	s.head = (s.head + 1) % len(s.buf)
+	s.count--
 }
 
 func (s *snapshotter) Enabled() bool {
@@ -91,7 +89,13 @@ func (s *snapshotter) SetEnabled(enabled bool) {
 }
 
 func (s *snapshotter) reset() {
-	s.snapshots.Clear(false)
+	if len(s.buf) > initialSnapshotterCapacity {
+		s.buf = make([]*btreeStore, initialSnapshotterCapacity)
+	} else {
+		clear(s.buf)
+	}
+	s.head = 0
+	s.count = 0
 	s.resourceVersion = 0
 	s.compactRevision = 0
 }
@@ -102,14 +106,10 @@ func (s *snapshotter) HasSnapshot(rv uint64) bool {
 }
 
 func (s *snapshotter) OldestResourceVersion() (uint64, bool) {
-	if !s.enabled {
+	if !s.enabled || s.count == 0 {
 		return 0, false
 	}
-	oldest, ok := s.snapshots.Min()
-	if !ok {
-		return 0, false
-	}
-	return max(oldest.resourceVersion, s.compactRevision), true
+	return max(s.at(0).resourceVersion, s.compactRevision), true
 }
 
 func (s *snapshotter) GetSnapshot(rv uint64) (*btreeStore, error) {
@@ -151,7 +151,23 @@ func (s *snapshotter) Add(snapshot *btreeStore) {
 		}
 		klog.ErrorS(nil, "Snapshot resourceVersion must be greater than current resourceVersion", "snapshotResourceVersion", snapshot.resourceVersion, "currentResourceVersion", s.resourceVersion)
 	}
-	s.snapshots.ReplaceOrInsert(snapshot)
+	if s.count == 0 || snapshot.resourceVersion > s.at(s.count-1).resourceVersion {
+		s.pushBack(snapshot)
+	} else {
+		idx := sort.Search(s.count, func(i int) bool {
+			return s.at(i).resourceVersion >= snapshot.resourceVersion
+		})
+		if idx < s.count && s.at(idx).resourceVersion == snapshot.resourceVersion {
+			s.buf[(s.head+idx)%len(s.buf)] = snapshot
+		} else {
+			s.pushBack(snapshot)
+			for i := s.count - 1; i > idx; i-- {
+				a := (s.head + i - 1) % len(s.buf)
+				b := (s.head + i) % len(s.buf)
+				s.buf[a], s.buf[b] = s.buf[b], s.buf[a]
+			}
+		}
+	}
 	s.resourceVersion = max(s.resourceVersion, snapshot.resourceVersion)
 	if snapshot.resourceVersion <= s.compactRevision {
 		s.compact()
@@ -182,28 +198,38 @@ func (s *snapshotter) Compact(rv uint64) {
 func (s *snapshotter) compact() {
 	// Keep the last snapshot at or before compactRevision so requests for
 	// RVs in [compactRevision, nextSnapshotRV) can still be served.
-	lastSnapshotBeforeCompaction := s.getSnapshot(s.compactRevision)
-	if lastSnapshotBeforeCompaction == nil {
-		return
+	for s.count > 1 && s.at(1).resourceVersion <= s.compactRevision {
+		s.popFront()
 	}
-	for s.snapshots.Len() > 0 {
-		oldest, ok := s.snapshots.Min()
-		if !ok || oldest.resourceVersion >= lastSnapshotBeforeCompaction.resourceVersion {
-			break
+	if len(s.buf) > initialSnapshotterCapacity && s.count <= len(s.buf)/4 {
+		newCap := max(initialSnapshotterCapacity, len(s.buf)/2)
+		newBuf := make([]*btreeStore, newCap)
+		if s.count > 0 {
+			first := min(s.count, len(s.buf)-s.head)
+			copy(newBuf, s.buf[s.head:s.head+first])
+			if first < s.count {
+				copy(newBuf[first:], s.buf[:s.count-first])
+			}
 		}
-		s.snapshots.DeleteMin()
+		s.buf = newBuf
+		s.head = 0
 	}
 }
 
 func (s *snapshotter) getSnapshot(rv uint64) *btreeStore {
-	var firstSnapBeforeRV *btreeStore
-	s.snapshots.DescendLessOrEqual(&btreeStore{resourceVersion: rv}, func(snap *btreeStore) bool {
-		firstSnapBeforeRV = snap
-		return false
+	if s.count == 0 || s.at(0).resourceVersion > rv {
+		return nil
+	}
+	if s.at(s.count-1).resourceVersion <= rv {
+		return s.at(s.count - 1)
+	}
+	// Find the first index with resourceVersion > rv; the predecessor is <= rv.
+	idx := sort.Search(s.count, func(i int) bool {
+		return s.at(i).resourceVersion > rv
 	})
-	return firstSnapBeforeRV
+	return s.at(idx - 1)
 }
 
 func (s *snapshotter) Len() int {
-	return s.snapshots.Len()
+	return s.count
 }

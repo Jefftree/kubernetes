@@ -53,6 +53,11 @@ type serializationResult struct {
 	err error
 }
 
+type primarySerialization struct {
+	id     runtime.Identifier
+	result *serializationResult
+}
+
 // serializationsCache is a type for caching serialization results.
 type serializationsCache map[runtime.Identifier]*serializationResult
 
@@ -67,6 +72,9 @@ type cachingObject struct {
 	// Object for which serializations are cached.
 	object metaRuntimeInterface
 
+	primary     atomic.Pointer[primarySerialization]
+	primarySlot serializationResult
+
 	// serializations is a cache containing object`s serializations.
 	// The value stored in atomic.Value is of type serializationsCache.
 	// The atomic.Value type is used to allow fast-path.
@@ -78,34 +86,49 @@ type cachingObject struct {
 // metav1.Object type.
 func newCachingObject(object runtime.Object) (*cachingObject, error) {
 	if obj, ok := object.(metaRuntimeInterface); ok {
-		result := &cachingObject{
+		return &cachingObject{
 			object: obj,
-		}
-		result.serializations.Store(make(serializationsCache))
-		return result, nil
+		}, nil
 	}
 	return nil, fmt.Errorf("can't cast object to metav1.Object: %#v", object)
 }
 
 func (o *cachingObject) getSerializationResult(id runtime.Identifier) *serializationResult {
+	if p := o.primary.Load(); p != nil && p.id == id {
+		return p.result
+	}
 	// Fast-path for getting from cache.
-	serializations := o.serializations.Load().(serializationsCache)
-	if result, exists := serializations[id]; exists {
-		return result
+	if v := o.serializations.Load(); v != nil {
+		if result, exists := v.(serializationsCache)[id]; exists {
+			return result
+		}
 	}
 
 	// Slow-path (that may require insert).
 	o.lock.Lock()
 	defer o.lock.Unlock()
 
-	serializations = o.serializations.Load().(serializationsCache)
-	// Check if in the meantime it wasn't inserted.
-	if result, exists := serializations[id]; exists {
-		return result
+	if p := o.primary.Load(); p == nil {
+		o.primary.Store(&primarySerialization{
+			id:     id,
+			result: &o.primarySlot,
+		})
+		return &o.primarySlot
+	} else if p.id == id {
+		return p.result
+	}
+
+	var serializations serializationsCache
+	if v := o.serializations.Load(); v != nil {
+		serializations = v.(serializationsCache)
+		// Check if in the meantime it wasn't inserted.
+		if result, exists := serializations[id]; exists {
+			return result
+		}
 	}
 
 	// Insert an entry for <id>. This requires copy of existing map.
-	newSerializations := make(serializationsCache)
+	newSerializations := make(serializationsCache, len(serializations)+1)
 	for k, v := range serializations {
 		newSerializations[k] = v
 	}
@@ -113,6 +136,19 @@ func (o *cachingObject) getSerializationResult(id runtime.Identifier) *serializa
 	newSerializations[id] = result
 	o.serializations.Store(newSerializations)
 	return result
+}
+
+type rawCaptureWriter struct {
+	raw []byte
+}
+
+func (w *rawCaptureWriter) Write(p []byte) (int, error) {
+	if w.raw == nil {
+		w.raw = bytes.Clone(p)
+		return len(p), nil
+	}
+	w.raw = append(w.raw, p...)
+	return len(p), nil
 }
 
 // CacheEncode implements runtime.CacheableObject interface.
@@ -124,9 +160,9 @@ func (o *cachingObject) getSerializationResult(id runtime.Identifier) *serializa
 func (o *cachingObject) CacheEncode(id runtime.Identifier, encode func(runtime.Object, io.Writer) error, w io.Writer) error {
 	result := o.getSerializationResult(id)
 	result.once.Do(func() {
-		buffer := bytes.NewBuffer(nil)
-		result.err = encode(o.getObjectForEncode(), buffer)
-		result.raw = buffer.Bytes()
+		var capture rawCaptureWriter
+		result.err = encode(o.getObjectForEncode(), &capture)
+		result.raw = capture.raw
 	})
 	// Once invoked, fields of serialization will not change.
 	if result.err != nil {
@@ -206,7 +242,6 @@ func (o *cachingObject) DeepCopyObject() runtime.Object {
 	// However, to be on the safe-side, we implement it, though given the
 	// cache is only an optimization we ignore copying it.
 	result := &cachingObject{}
-	result.serializations.Store(make(serializationsCache))
 
 	o.lock.RLock()
 	defer o.lock.RUnlock()
@@ -232,7 +267,9 @@ func shouldLogCacheInvalidation(now time.Time) bool {
 }
 
 func (o *cachingObject) invalidateCacheLocked() {
-	if cache, ok := o.serializations.Load().(serializationsCache); ok && len(cache) == 0 {
+	hasPrimary := o.primary.Load() != nil
+	cache, hasMap := o.serializations.Load().(serializationsCache)
+	if !hasPrimary && (!hasMap || len(cache) == 0) {
 		return
 	}
 	// We don't expect cache invalidation to happen - so we want
@@ -242,7 +279,11 @@ func (o *cachingObject) invalidateCacheLocked() {
 	if shouldLogCacheInvalidation(time.Now()) {
 		klog.Warningf("Unexpected cache invalidation for %#v\n%s", o.object, string(debug.Stack()))
 	}
-	o.serializations.Store(make(serializationsCache))
+	o.primary.Store(nil)
+	o.primarySlot = serializationResult{}
+	if hasMap && len(cache) > 0 {
+		o.serializations.Store(make(serializationsCache))
+	}
 }
 
 // The following functions implement metav1.Object interface:

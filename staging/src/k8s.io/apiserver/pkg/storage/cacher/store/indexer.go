@@ -18,6 +18,7 @@ package store
 
 import (
 	"fmt"
+	"strings"
 
 	"k8s.io/client-go/tools/cache"
 )
@@ -69,10 +70,39 @@ func (i *indexer) Replace(objs []*Element, resourceVersion uint64) error {
 	return nil
 }
 
+func fieldIndexValue(elem *Element, indexName string) (string, bool) {
+	if elem == nil || elem.Fields == nil || !strings.HasPrefix(indexName, "f:") {
+		return "", false
+	}
+	v, ok := elem.Fields[indexName[2:]]
+	return v, ok
+}
+
 func (i *indexer) updateElem(key string, oldObj, newObj *Element, resourceVersion uint64) (err error) {
 	i.resourceVersion = resourceVersion
 	var oldIndexValues, indexValues []string
 	for name, indexFunc := range i.indexers {
+		oldVal, hasOldField := fieldIndexValue(oldObj, name)
+		newVal, hasNewField := fieldIndexValue(newObj, name)
+		if (oldObj == nil || hasOldField) && (newObj == nil || hasNewField) {
+			index := i.indices[name]
+			if index == nil {
+				index = map[string]map[string]*Element{}
+				i.indices[name] = index
+			}
+			if hasOldField && hasNewField && oldVal == newVal {
+				i.add(key, newVal, newObj, index)
+				continue
+			}
+			if hasOldField {
+				i.delete(key, oldVal, index)
+			}
+			if hasNewField {
+				i.add(key, newVal, newObj, index)
+			}
+			continue
+		}
+
 		if oldObj != nil {
 			oldIndexValues, err = indexFunc(oldObj)
 		} else {
