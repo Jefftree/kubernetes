@@ -1045,6 +1045,75 @@ func TestCustomToUnstructuredTopLevel(t *testing.T) {
 		assert.Equal(t, map[string]string{"a": "1"}, dst.Spec)
 		assert.Equal(t, map[string]string{"phase": "Running"}, dst.Status)
 	})
+
+	t.Run("NestedStructSubfields", func(t *testing.T) {
+		t.Parallel()
+		type Meta struct {
+			UID         string            `json:"uid,omitempty"`
+			Labels      map[string]string `json:"labels,omitempty"`
+			Annotations map[string]string `json:"annotations,omitempty"`
+		}
+		type NestedObj struct {
+			Metadata Meta              `json:"metadata,omitempty"`
+			Status   map[string]string `json:"status,omitempty"`
+		}
+		orig := &NestedObj{
+			Metadata: Meta{
+				UID:         "u-123",
+				Labels:      map[string]string{"app": "web"},
+				Annotations: map[string]string{"ann": "keep"},
+			},
+			Status: map[string]string{"phase": "Pending"},
+		}
+		patchKeys := map[string]interface{}{
+			"metadata": map[string]interface{}{"uid": "u-123"},
+			"status":   map[string]interface{}{"phase": "Running"},
+		}
+		u, err := runtime.DefaultUnstructuredConverter.ToUnstructuredTopLevel(orig, patchKeys)
+		require.NoError(t, err)
+		// Only metadata.uid and status are converted to unstructured; labels and annotations are pruned.
+		assert.Equal(t, map[string]interface{}{
+			"metadata": map[string]interface{}{"uid": "u-123"},
+			"status":   map[string]interface{}{"phase": "Pending"},
+		}, u)
+
+		dst := &NestedObj{
+			Metadata: Meta{
+				UID:         "u-123",
+				Labels:      map[string]string{"app": "web"},
+				Annotations: map[string]string{"ann": "keep"},
+			},
+			Status: map[string]string{"phase": "Pending"},
+		}
+		u["status"] = map[string]interface{}{"phase": "Running"}
+		require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructuredWithValidationTopLevel(u, dst, true, patchKeys))
+		assert.Equal(t, "u-123", dst.Metadata.UID)
+		assert.Equal(t, map[string]string{"app": "web"}, dst.Metadata.Labels)
+		assert.Equal(t, map[string]string{"ann": "keep"}, dst.Metadata.Annotations)
+		assert.Equal(t, map[string]string{"phase": "Running"}, dst.Status)
+	})
+}
+
+func TestStringMapConversion(t *testing.T) {
+	type MapHolder struct {
+		Labels map[string]string `json:"labels,omitempty"`
+	}
+	orig := &MapHolder{Labels: map[string]string{"k1": "v1", "k2": "v2"}}
+	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(orig)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]interface{}{
+		"labels": map[string]interface{}{"k1": "v1", "k2": "v2"},
+	}, u)
+
+	var dst MapHolder
+	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(u, &dst))
+	assert.Equal(t, orig.Labels, dst.Labels)
+
+	// Type mismatch in map value must return error
+	bad := map[string]interface{}{
+		"labels": map[string]interface{}{"k1": int64(123)},
+	}
+	require.Error(t, runtime.DefaultUnstructuredConverter.FromUnstructured(bad, &dst))
 }
 
 type OmitemptyNameField struct {
@@ -1244,5 +1313,24 @@ func TestInline(t *testing.T) {
 				t.Fatal(cmp.Diff(tc.expect, unstr))
 			}
 		})
+	}
+}
+
+func TestMapFromUnstructuredRawExtensionReset(t *testing.T) {
+	type rawHolder struct {
+		Items map[string]runtime.RawExtension `json:"items"`
+	}
+	u := map[string]interface{}{
+		"items": map[string]interface{}{
+			"a": map[string]interface{}{"foo": "bar"},
+			"b": map[string]interface{}{"baz": "qux"},
+		},
+	}
+	var out rawHolder
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u, &out); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(out.Items["a"].Raw) == string(out.Items["b"].Raw) {
+		t.Fatalf("expected distinct RawExtension values, got a=%s b=%s", string(out.Items["a"].Raw), string(out.Items["b"].Raw))
 	}
 }

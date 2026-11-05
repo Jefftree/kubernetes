@@ -378,17 +378,24 @@ func updatePatchIfMissing(original, modified, patch map[string]interface{}, diff
 	}
 }
 
-// validateMergeKeyInLists checks if each map in the list has the mentryerge key.
+func validateMergeKeyInList(mergeKey string, list []interface{}) error {
+	for _, item := range list {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			return mergepatch.ErrBadArgType(m, item)
+		}
+		if _, ok = m[mergeKey]; !ok {
+			return mergepatch.ErrNoMergeKey(m, mergeKey)
+		}
+	}
+	return nil
+}
+
+// validateMergeKeyInLists checks if each map in the list has the merge key.
 func validateMergeKeyInLists(mergeKey string, lists ...[]interface{}) error {
 	for _, list := range lists {
-		for _, item := range list {
-			m, ok := item.(map[string]interface{})
-			if !ok {
-				return mergepatch.ErrBadArgType(m, item)
-			}
-			if _, ok = m[mergeKey]; !ok {
-				return mergepatch.ErrNoMergeKey(m, mergeKey)
-			}
+		if err := validateMergeKeyInList(mergeKey, list); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -425,22 +432,18 @@ func normalizeElementOrder(patch, serverOnly, patchOrder, serverOrder []interfac
 // example usage: using server-only items as left and patch items as right. We insert server-only items
 // to patch list. We use the order of live object as record for comparison.
 func mergeSortedSlice(left, right, serverOrder []interface{}, mergeKey string, kind reflect.Kind) []interface{} {
-	// Returns if l is less than r, and if both have been found.
-	// If l and r both present and l is in front of r, l is less than r.
-	less := func(l, r interface{}) (bool, bool) {
-		li := index(serverOrder, l, mergeKey, kind)
-		ri := index(serverOrder, r, mergeKey, kind)
-		if li >= 0 && ri >= 0 {
-			return li < ri, true
-		} else {
-			return false, false
-		}
-	}
-
 	// left and right should be non-overlapping.
 	size := len(left) + len(right)
 	i, j := 0, 0
-	s := make([]interface{}, size, size)
+	var s []interface{}
+	var orderBuf [16]interface{}
+	orderRef := serverOrder
+	if len(serverOrder) == size && len(serverOrder) <= len(orderBuf) {
+		orderRef = append(orderBuf[:0], serverOrder...)
+		s = serverOrder[:size]
+	} else {
+		s = make([]interface{}, size)
+	}
 
 	for k := 0; k < size; k++ {
 		if i >= len(left) && j < len(right) {
@@ -453,8 +456,9 @@ func mergeSortedSlice(left, right, serverOrder []interface{}, mergeKey string, k
 			i++
 		} else {
 			// compare them if i and j are both in bound
-			less, foundBoth := less(left[i], right[j])
-			if foundBoth && less {
+			li := index(orderRef, left[i], mergeKey, kind)
+			ri := index(orderRef, right[j], mergeKey, kind)
+			if li >= 0 && ri >= 0 && li < ri {
 				s[k] = left[i]
 				i++
 			} else {
@@ -469,28 +473,25 @@ func mergeSortedSlice(left, right, serverOrder []interface{}, mergeKey string, k
 // index returns the index of the item in the given items, or -1 if it doesn't exist
 // l must NOT be a slice of slices, this should be checked before calling.
 func index(l []interface{}, valToLookUp interface{}, mergeKey string, kind reflect.Kind) int {
-	var getValFn func(interface{}) interface{}
-	// Get the correct `getValFn` based on item `kind`.
-	// It should return the value of merge key for maps and
-	// return the item for other kinds.
-	switch kind {
-	case reflect.Map:
-		getValFn = func(item interface{}) interface{} {
-			typedItem, ok := item.(map[string]interface{})
-			if !ok {
-				return nil
+	if kind == reflect.Map {
+		var targetVal interface{}
+		if typedTarget, ok := valToLookUp.(map[string]interface{}); ok {
+			targetVal = typedTarget[mergeKey]
+		}
+		for i, v := range l {
+			var vVal interface{}
+			if typedV, ok := v.(map[string]interface{}); ok {
+				vVal = typedV[mergeKey]
 			}
-			val := typedItem[mergeKey]
-			return val
+			if targetVal == vVal {
+				return i
+			}
 		}
-	default:
-		getValFn = func(item interface{}) interface{} {
-			return item
-		}
+		return -1
 	}
 
 	for i, v := range l {
-		if getValFn(valToLookUp) == getValFn(v) {
+		if valToLookUp == v {
 			return i
 		}
 	}
@@ -500,13 +501,22 @@ func index(l []interface{}, valToLookUp interface{}, mergeKey string, kind refle
 // extractToDeleteItems takes a list and
 // returns 2 lists: one contains items that should be kept and the other contains items to be deleted.
 func extractToDeleteItems(l []interface{}) ([]interface{}, []interface{}, error) {
-	var nonDelete, toDelete []interface{}
+	hasDelete := false
 	for _, v := range l {
 		m, ok := v.(map[string]interface{})
 		if !ok {
 			return nil, nil, mergepatch.ErrBadArgType(m, v)
 		}
-
+		if directive, foundDirective := m[directiveMarker]; foundDirective && directive == deleteDirective {
+			hasDelete = true
+		}
+	}
+	if !hasDelete {
+		return l, nil, nil
+	}
+	var nonDelete, toDelete []interface{}
+	for _, v := range l {
+		m := v.(map[string]interface{})
 		directive, foundDirective := m[directiveMarker]
 		if foundDirective && directive == deleteDirective {
 			toDelete = append(toDelete, v)
@@ -522,25 +532,44 @@ func normalizeSliceOrder(toSort, order []interface{}, mergeKey string, kind refl
 	var toDelete []interface{}
 	if kind == reflect.Map {
 		// make sure each item in toSort, order has merge key
-		err := validateMergeKeyInLists(mergeKey, toSort, order)
-		if err != nil {
+		if err := validateMergeKeyInList(mergeKey, toSort); err != nil {
 			return nil, err
 		}
+		if err := validateMergeKeyInList(mergeKey, order); err != nil {
+			return nil, err
+		}
+		var err error
 		toSort, toDelete, err = extractToDeleteItems(toSort)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	sort.SliceStable(toSort, func(i, j int) bool {
-		if ii := index(order, toSort[i], mergeKey, kind); ii >= 0 {
-			if ij := index(order, toSort[j], mergeKey, kind); ij >= 0 {
-				return ii < ij
+	if len(toSort) > 1 {
+		alreadySorted := true
+		prevIdx := -1
+		for i := 0; i < len(toSort); i++ {
+			idx := index(order, toSort[i], mergeKey, kind)
+			if idx < 0 || idx < prevIdx {
+				alreadySorted = false
+				break
 			}
+			prevIdx = idx
 		}
-		return true
-	})
-	toSort = append(toSort, toDelete...)
+		if !alreadySorted {
+			sort.SliceStable(toSort, func(i, j int) bool {
+				if ii := index(order, toSort[i], mergeKey, kind); ii >= 0 {
+					if ij := index(order, toSort[j], mergeKey, kind); ij >= 0 {
+						return ii < ij
+					}
+				}
+				return true
+			})
+		}
+	}
+	if len(toDelete) > 0 {
+		toSort = append(toSort, toDelete...)
+	}
 	return toSort, nil
 }
 
@@ -1252,8 +1281,10 @@ func partitionPrimitivesByPresentInList(original, partitionBy []interface{}) ([]
 
 // partitionMapsByPresentInList partitions elements into 2 slices, the first containing items present in partitionBy, the other not.
 func partitionMapsByPresentInList(original, partitionBy []interface{}, mergeKey string) ([]interface{}, []interface{}, error) {
-	patch := make([]interface{}, 0, len(original))
-	serverOnly := make([]interface{}, 0, len(original))
+	return partitionMapsByPresentInListInto(original, partitionBy, mergeKey, make([]interface{}, 0, len(original)), make([]interface{}, 0, len(original)))
+}
+
+func partitionMapsByPresentInListInto(original, partitionBy []interface{}, mergeKey string, patch, serverOnly []interface{}) ([]interface{}, []interface{}, error) {
 	for _, v := range original {
 		typedV, ok := v.(map[string]interface{})
 		if !ok {
@@ -1491,6 +1522,38 @@ func mergeSliceHandler(original, patch interface{}, schema LookupPatchMeta,
 
 // Merge two slices together. Note: This may modify both the original slice and
 // the patch because getting a deep copy of a slice in golang is highly
+func sliceElementType2(s1, s2 []interface{}) (reflect.Type, error) {
+	var prevType reflect.Type
+	for _, v := range s1 {
+		currentType := reflect.TypeOf(v)
+		if prevType == nil {
+			prevType = currentType
+			if prevType.Kind() == reflect.Slice {
+				return nil, mergepatch.ErrNoListOfLists
+			}
+		} else if prevType != currentType {
+			return nil, fmt.Errorf("list element types are not identical: %v", fmt.Sprint([][]interface{}{s1, s2}))
+		}
+	}
+	for _, v := range s2 {
+		currentType := reflect.TypeOf(v)
+		if prevType == nil {
+			prevType = currentType
+			if prevType.Kind() == reflect.Slice {
+				return nil, mergepatch.ErrNoListOfLists
+			}
+		} else if prevType != currentType {
+			return nil, fmt.Errorf("list element types are not identical: %v", fmt.Sprint([][]interface{}{s1, s2}))
+		}
+	}
+	if prevType == nil {
+		return nil, fmt.Errorf("no elements in any of the given slices")
+	}
+	return prevType, nil
+}
+
+// Merge two slices together. Note: This may modify both the original slice and
+// the patch because getting a deep copy of a slice in golang is highly
 // non-trivial.
 func mergeSlice(original, patch []interface{}, schema LookupPatchMeta, mergeKey string, mergeOptions MergeOptions, isDeleteList bool) ([]interface{}, error) {
 	if len(original) == 0 && len(patch) == 0 {
@@ -1498,7 +1561,7 @@ func mergeSlice(original, patch []interface{}, schema LookupPatchMeta, mergeKey 
 	}
 
 	// All the values must be of the same type, but not a list.
-	t, err := sliceElementType(original, patch)
+	t, err := sliceElementType2(original, patch)
 	if err != nil {
 		return nil, err
 	}
@@ -1536,7 +1599,12 @@ func mergeSlice(original, patch []interface{}, schema LookupPatchMeta, mergeKey 
 	if len(mergeKey) == 0 {
 		patchItems, serverOnlyItems = partitionPrimitivesByPresentInList(merged, patch)
 	} else {
-		patchItems, serverOnlyItems, err = partitionMapsByPresentInList(merged, patch, mergeKey)
+		var patchBuf, serverBuf [16]interface{}
+		if len(merged) <= len(patchBuf) {
+			patchItems, serverOnlyItems, err = partitionMapsByPresentInListInto(merged, patch, mergeKey, patchBuf[:0], serverBuf[:0])
+		} else {
+			patchItems, serverOnlyItems, err = partitionMapsByPresentInList(merged, patch, mergeKey)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1548,6 +1616,17 @@ func mergeSlice(original, patch []interface{}, schema LookupPatchMeta, mergeKey 
 // before merging the slices. It returns a updated `original` and a patch without special elements.
 // original and patch must be slices of maps, they should be checked before calling this function.
 func mergeSliceWithSpecialElements(original, patch []interface{}, mergeKey string) ([]interface{}, []interface{}, error) {
+	hasSpecial := false
+	for _, v := range patch {
+		typedV := v.(map[string]interface{})
+		if _, ok := typedV[directiveMarker]; ok {
+			hasSpecial = true
+			break
+		}
+	}
+	if !hasSpecial {
+		return original, patch, nil
+	}
 	patchWithoutSpecialElements := []interface{}{}
 	replace := false
 	for _, v := range patch {

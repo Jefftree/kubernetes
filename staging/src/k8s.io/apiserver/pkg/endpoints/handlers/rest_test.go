@@ -661,7 +661,7 @@ func TestNumberConversion(t *testing.T) {
 	activeDeadlineSeconds := int64(42)
 	currentVersionedObject := &examplev1.Pod{
 		TypeMeta:   metav1.TypeMeta{Kind: "Example", APIVersion: examplev1.SchemeGroupVersion.String()},
-		ObjectMeta: metav1.ObjectMeta{Name: "test-example", Labels: map[string]string{"a": "b"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "test-example", Labels: map[string]string{"a": "b"}, Annotations: map[string]string{"ann": "val"}},
 		Spec: examplev1.PodSpec{
 			TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
 			ActiveDeadlineSeconds:         &activeDeadlineSeconds,
@@ -690,6 +690,20 @@ func TestNumberConversion(t *testing.T) {
 	*versionedObjToUpdate.Spec.ActiveDeadlineSeconds = 999
 	if currentVersionedObject.Labels["a"] != "b" || *currentVersionedObject.Spec.ActiveDeadlineSeconds != 42 {
 		t.Fatal("patched object aliases original object")
+	}
+
+	// Verify subfield pruning inside metadata: patching metadata.labels preserves unpatched metadata.annotations without aliasing.
+	versionedSubfieldUpdate := &examplev1.Pod{}
+	err = strategicPatchObject(context.TODO(), defaulter, currentVersionedObject, []byte(`{"metadata":{"labels":{"a":"c"}}}`), versionedSubfieldUpdate, schemaReferenceObj, metav1.FieldValidationStrict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if versionedSubfieldUpdate.Labels["a"] != "c" || versionedSubfieldUpdate.Annotations["ann"] != "val" {
+		t.Fatalf("expected patched label and preserved annotation, got labels=%v annotations=%v", versionedSubfieldUpdate.Labels, versionedSubfieldUpdate.Annotations)
+	}
+	versionedSubfieldUpdate.Annotations["ann"] = "mutated"
+	if currentVersionedObject.Annotations["ann"] != "val" {
+		t.Fatal("subfield patched object aliases original annotations")
 	}
 }
 
@@ -1441,5 +1455,41 @@ spec:
 				}
 			}
 		})
+	}
+}
+
+func TestStrategicPatchObjectNestedDirectives(t *testing.T) {
+	defaulter := runtime.NewScheme()
+	orig := &examplev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-1",
+			Namespace: "default",
+		},
+		Status: examplev1.PodStatus{
+			HostIP: "10.0.0.1",
+			PodIP:  "10.0.0.2",
+			Conditions: []examplev1.PodCondition{
+				{Type: "Ready", Status: "True"},
+				{Type: "Initialized", Status: "True"},
+			},
+		},
+	}
+
+	var updatedOrder examplev1.Pod
+	orderPatch := []byte(`{"status":{"$setElementOrder/conditions":[{"type":"Initialized"},{"type":"Ready"}]}}`)
+	if err := strategicPatchObject(context.Background(), defaulter, orig, orderPatch, &updatedOrder, &examplev1.Pod{}, metav1.FieldValidationStrict); err != nil {
+		t.Fatalf("unexpected error on $setElementOrder patch: %v", err)
+	}
+	if len(updatedOrder.Status.Conditions) != 2 || updatedOrder.Status.Conditions[0].Type != "Initialized" || updatedOrder.Status.Conditions[1].Type != "Ready" {
+		t.Fatalf("expected conditions reordered to [Initialized, Ready], got %+v", updatedOrder.Status.Conditions)
+	}
+
+	var updatedRetain examplev1.Pod
+	retainPatch := []byte(`{"status":{"$retainKeys":["hostIP","conditions"]}}`)
+	if err := strategicPatchObject(context.Background(), defaulter, orig, retainPatch, &updatedRetain, &examplev1.Pod{}, metav1.FieldValidationStrict); err != nil {
+		t.Fatalf("unexpected error on $retainKeys patch: %v", err)
+	}
+	if updatedRetain.Status.HostIP != "10.0.0.1" || updatedRetain.Status.PodIP != "" {
+		t.Fatalf("expected hostIP retained and podIP cleared, got hostIP=%q podIP=%q", updatedRetain.Status.HostIP, updatedRetain.Status.PodIP)
 	}
 }

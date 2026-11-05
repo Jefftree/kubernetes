@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -448,6 +449,8 @@ func (p *jsonPatcher) applyJSPatch(versionedJS []byte) (patchedJS []byte, strict
 	}
 }
 
+var schemaReferenceObjCache sync.Map
+
 type smpPatcher struct {
 	*patcher
 
@@ -589,8 +592,11 @@ func strategicPatchObject(
 		if err != nil {
 			return err
 		}
-		reflect.ValueOf(objToUpdate).Elem().Set(reflect.ValueOf(originalObject.DeepCopyObject()).Elem())
-		topLevelKeys = patchMap
+		updateElem := reflect.ValueOf(objToUpdate).Elem()
+		updateElem.Set(reflect.ValueOf(originalObject).Elem())
+		runtime.ClearPatchedFields(updateElem, patchMap)
+		updateElem.Set(reflect.ValueOf(objToUpdate.DeepCopyObject()).Elem())
+		topLevelKeys = clonePatchKeyTree(patchMap)
 	} else {
 		originalObjMap, err = runtime.DefaultUnstructuredConverter.ToUnstructured(originalObject)
 		if err != nil {
@@ -599,6 +605,18 @@ func strategicPatchObject(
 	}
 
 	return applyPatchToObject(requestContext, defaulter, originalObjMap, patchMap, objToUpdate, schemaReferenceObj, strictErrs, validationDirective, topLevelKeys)
+}
+
+func clonePatchKeyTree(m map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		if sub, ok := v.(map[string]interface{}); ok {
+			out[k] = clonePatchKeyTree(sub)
+		} else {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 func canPruneTopLevelPatch(originalObject, objToUpdate runtime.Object, patchMap map[string]interface{}) bool {
@@ -705,9 +723,16 @@ func (p *patcher) patchResource(ctx context.Context, scope *RequestScope) (runti
 			fieldManager: scope.FieldManager,
 		}
 	case types.StrategicMergePatchType:
-		schemaReferenceObj, err := p.unsafeConvertor.ConvertToVersion(p.restPatcher.New(), p.kind.GroupVersion())
-		if err != nil {
-			return nil, false, err
+		var schemaReferenceObj runtime.Object
+		if cached, ok := schemaReferenceObjCache.Load(p.kind); ok {
+			schemaReferenceObj = cached.(runtime.Object)
+		} else {
+			var err error
+			schemaReferenceObj, err = p.unsafeConvertor.ConvertToVersion(p.restPatcher.New(), p.kind.GroupVersion())
+			if err != nil {
+				return nil, false, err
+			}
+			schemaReferenceObjCache.Store(p.kind, schemaReferenceObj)
 		}
 		p.mechanism = &smpPatcher{
 			patcher:            p,

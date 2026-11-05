@@ -22,6 +22,7 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,10 +52,11 @@ type structField struct {
 }
 
 type fieldInfo struct {
-	name      string
-	nameValue reflect.Value
-	omitempty bool
-	omitzero  func(dv reflect.Value) bool
+	name             string
+	nameValue        reflect.Value
+	omitempty        bool
+	omitzero         func(dv reflect.Value) bool
+	hasPatchStrategy bool
 }
 
 type fieldsCacheMap map[structField]*fieldInfo
@@ -70,10 +72,30 @@ func newFieldsCache() *fieldsCache {
 	return cache
 }
 
+type structTypeInfo struct {
+	fields            []*fieldInfo
+	canPruneSubfields bool
+}
+
+type structInfoCacheMap map[reflect.Type]*structTypeInfo
+
+type structInfoCache struct {
+	sync.Mutex
+	value atomic.Value
+}
+
+func newStructInfoCache() *structInfoCache {
+	cache := &structInfoCache{}
+	cache.value.Store(make(structInfoCacheMap))
+	return cache
+}
+
 var (
 	mapStringInterfaceType = reflect.TypeOf(map[string]interface{}{})
+	mapStringStringType    = reflect.TypeOf(map[string]string{})
 	stringType             = reflect.TypeOf(string(""))
 	fieldCache             = newFieldsCache()
+	typeInfoCache          = newStructInfoCache()
 
 	// DefaultUnstructuredConverter performs unstructured to Go typed object conversions.
 	DefaultUnstructuredConverter = &unstructuredConverter{
@@ -85,6 +107,51 @@ var (
 		),
 	}
 )
+
+func structInfoFromType(st reflect.Type) *structTypeInfo {
+	cacheMap := typeInfoCache.value.Load().(structInfoCacheMap)
+	if info, ok := cacheMap[st]; ok {
+		return info
+	}
+
+	numField := st.NumField()
+	fields := make([]*fieldInfo, numField)
+	canPrune := !value.TypeReflectEntryOf(st).CanConvertToUnstructured() &&
+		!value.TypeReflectEntryOf(st).CanConvertFromUnstructured()
+	seenNames := make(map[string]struct{}, numField)
+	for i := 0; i < numField; i++ {
+		fi := computeFieldInfo(st, i)
+		fields[i] = fi
+		tf := st.Field(i)
+		if !tf.IsExported() || fi.name == "-" || len(fi.name) == 0 {
+			canPrune = false
+		} else {
+			if _, dup := seenNames[fi.name]; dup {
+				canPrune = false
+			}
+			seenNames[fi.name] = struct{}{}
+		}
+	}
+
+	info := &structTypeInfo{
+		fields:            fields,
+		canPruneSubfields: canPrune,
+	}
+
+	typeInfoCache.Lock()
+	defer typeInfoCache.Unlock()
+	cacheMap = typeInfoCache.value.Load().(structInfoCacheMap)
+	if existing, ok := cacheMap[st]; ok {
+		return existing
+	}
+	newCacheMap := make(structInfoCacheMap, len(cacheMap)+1)
+	for k, v := range cacheMap {
+		newCacheMap[k] = v
+	}
+	newCacheMap[st] = info
+	typeInfoCache.value.Store(newCacheMap)
+	return info
+}
 
 func parseBool(key string) bool {
 	if len(key) == 0 {
@@ -133,10 +200,13 @@ type fromUnstructuredContext struct {
 	// This should only be set from `structFromUnstructured`
 	isInlined bool
 	// matchedKeys is a stack of the set of all fields that exist in the
-	// concrete go type of the object being converted into.
+	// concrete go type of the object being converted into. The keys of every
+	// level are kept in one slice, with each level starting at the index
+	// recorded in matchedKeysStarts.
 	// This should only be manipulated via `pushMatchedKeyTracker`,
 	// `recordMatchedKey`, or `popAndVerifyMatchedKeys`
-	matchedKeys []map[string]struct{}
+	matchedKeys       []string
+	matchedKeysStarts []int
 	// parentPath collects the path that the conversion
 	// takes as it traverses the unstructured json map.
 	// It is used to report the full path to any unknown
@@ -149,8 +219,11 @@ type fromUnstructuredContext struct {
 	// unknownFieldErrors are the collection of
 	// the full path to each unknown field in the
 	// object.
-	unknownFieldErrors []error
-	topLevelKeys       map[string]interface{}
+	unknownFieldErrors   []error
+	topLevelKeys         map[string]interface{}
+	matchedKeysBuf       [64]string
+	matchedKeysStartsBuf [8]int
+	parentPathBuf        [16]string
 }
 
 // pushMatchedKeyTracker adds a placeholder set for tracking
@@ -161,7 +234,7 @@ func (c *fromUnstructuredContext) pushMatchedKeyTracker() {
 		return
 	}
 
-	c.matchedKeys = append(c.matchedKeys, nil)
+	c.matchedKeysStarts = append(c.matchedKeysStarts, len(c.matchedKeys))
 }
 
 // recordMatchedKey initializes the last element of matchedKeys
@@ -172,11 +245,7 @@ func (c *fromUnstructuredContext) recordMatchedKey(key string) {
 		return
 	}
 
-	last := len(c.matchedKeys) - 1
-	if c.matchedKeys[last] == nil {
-		c.matchedKeys[last] = map[string]struct{}{}
-	}
-	c.matchedKeys[last][key] = struct{}{}
+	c.matchedKeys = append(c.matchedKeys, key)
 }
 
 // popAndVerifyMatchedKeys pops the last element of matchedKeys,
@@ -191,15 +260,29 @@ func (c *fromUnstructuredContext) popAndVerifyMatchedKeys(mapValue reflect.Value
 		return
 	}
 
-	last := len(c.matchedKeys) - 1
-	curMatchedKeys := c.matchedKeys[last]
-	c.matchedKeys[last] = nil
-	c.matchedKeys = c.matchedKeys[:last]
-	for _, key := range mapValue.MapKeys() {
-		if _, ok := curMatchedKeys[key.String()]; !ok {
-			c.recordUnknownField(key.String())
+	last := len(c.matchedKeysStarts) - 1
+	start := c.matchedKeysStarts[last]
+	c.matchedKeysStarts = c.matchedKeysStarts[:last]
+	curMatchedKeys := c.matchedKeys[start:]
+	// A struct has few enough fields that a linear search beats building a set.
+	if mapValue.CanInterface() {
+		if m, ok := mapValue.Interface().(map[string]interface{}); ok {
+			for key := range m {
+				if !slices.Contains(curMatchedKeys, key) {
+					c.recordUnknownField(key)
+				}
+			}
+			c.matchedKeys = c.matchedKeys[:start]
+			return
 		}
 	}
+	iter := mapValue.MapRange()
+	for iter.Next() {
+		if key := iter.Key().String(); !slices.Contains(curMatchedKeys, key) {
+			c.recordUnknownField(key)
+		}
+	}
+	c.matchedKeys = c.matchedKeys[:start]
 }
 
 func (c *fromUnstructuredContext) recordUnknownField(field string) {
@@ -231,7 +314,6 @@ func (c *fromUnstructuredContext) pushKey(key string) {
 		c.parentPath = append(c.parentPath, ".")
 	}
 	c.parentPath = append(c.parentPath, key)
-
 }
 
 // FromUnstructuredWithValidation converts an object from map[string]interface{} representation into a concrete type.
@@ -242,7 +324,7 @@ func (c *unstructuredConverter) FromUnstructuredWithValidation(u map[string]inte
 }
 
 // FromUnstructuredWithValidationTopLevel converts an object from map[string]interface{} representation into obj,
-// updating only the top-level struct fields whose JSON names appear in topLevelKeys when topLevelKeys is non-nil.
+// updating only the struct fields (and nested struct subfields) whose JSON names appear in topLevelKeys when topLevelKeys is non-nil.
 func (c *unstructuredConverter) FromUnstructuredWithValidationTopLevel(u map[string]interface{}, obj interface{}, returnUnknownFields bool, topLevelKeys map[string]interface{}) error {
 	t := reflect.TypeOf(obj)
 	value := reflect.ValueOf(obj)
@@ -254,6 +336,9 @@ func (c *unstructuredConverter) FromUnstructuredWithValidationTopLevel(u map[str
 		returnUnknownFields: returnUnknownFields,
 		topLevelKeys:        topLevelKeys,
 	}
+	fromUnstructuredContext.matchedKeys = fromUnstructuredContext.matchedKeysBuf[:0]
+	fromUnstructuredContext.matchedKeysStarts = fromUnstructuredContext.matchedKeysStartsBuf[:0]
+	fromUnstructuredContext.parentPath = fromUnstructuredContext.parentPathBuf[:0]
 	err := fromUnstructured(reflect.ValueOf(u), value.Elem(), fromUnstructuredContext)
 	if c.mismatchDetection && topLevelKeys == nil {
 		newObj := reflect.New(t.Elem()).Interface()
@@ -297,7 +382,9 @@ func fromUnstructuredViaJSON(u map[string]interface{}, obj interface{}) error {
 func fromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) error {
 	sv = unwrapInterface(sv)
 	if !sv.IsValid() {
-		dv.Set(reflect.Zero(dv.Type()))
+		if !dv.IsZero() {
+			dv.SetZero()
+		}
 		return nil
 	}
 	st, dt := sv.Type(), dv.Type()
@@ -311,7 +398,7 @@ func fromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) error 
 			dv.Set(sv)
 			return nil
 		}
-		// We cannot simply use "ConvertibleTo", as JSON doesn't support conversions
+		// We cannot simply use "ConvertibleTo" as JSON doesn't support conversions
 		// between those four groups: bools, integers, floats and string. We need to
 		// do the same.
 		if st.ConvertibleTo(dt) {
@@ -319,30 +406,43 @@ func fromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) error 
 			case reflect.String:
 				switch dt.Kind() {
 				case reflect.String:
-					dv.Set(sv.Convert(dt))
+					dv.SetString(sv.String())
 					return nil
 				}
 			case reflect.Bool:
 				switch dt.Kind() {
 				case reflect.Bool:
-					dv.Set(sv.Convert(dt))
+					dv.SetBool(sv.Bool())
 					return nil
 				}
-			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 				switch dt.Kind() {
-				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-					reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-					dv.Set(sv.Convert(dt))
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					dv.SetInt(sv.Int())
+					return nil
+				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+					dv.SetUint(uint64(sv.Int()))
 					return nil
 				case reflect.Float32, reflect.Float64:
-					dv.Set(sv.Convert(dt))
+					dv.SetFloat(float64(sv.Int()))
+					return nil
+				}
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				switch dt.Kind() {
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					dv.SetInt(int64(sv.Uint()))
+					return nil
+				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+					dv.SetUint(sv.Uint())
+					return nil
+				case reflect.Float32, reflect.Float64:
+					dv.SetFloat(float64(sv.Uint()))
 					return nil
 				}
 			case reflect.Float32, reflect.Float64:
 				switch dt.Kind() {
 				case reflect.Float32, reflect.Float64:
-					dv.Set(sv.Convert(dt))
+					dv.SetFloat(sv.Float())
 					return nil
 				}
 				if sv.Float() == math.Trunc(sv.Float()) {
@@ -374,18 +474,12 @@ func fromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) error 
 	default:
 		return fmt.Errorf("unrecognized type: %v", dt.Kind())
 	}
-
 }
 
-func fieldInfoFromField(structType reflect.Type, field int) *fieldInfo {
-	fieldCacheMap := fieldCache.value.Load().(fieldsCacheMap)
-	if info, ok := fieldCacheMap[structField{structType, field}]; ok {
-		return info
-	}
-
-	// Cache miss - we need to compute the field name.
+func computeFieldInfo(structType reflect.Type, field int) *fieldInfo {
 	info := &fieldInfo{}
 	typeField := structType.Field(field)
+	info.hasPatchStrategy = typeField.Tag.Get("patchStrategy") != ""
 	jsonTag, exists := typeField.Tag.Lookup("json")
 	if !exists || len(jsonTag) == 0 {
 		if !typeField.Anonymous {
@@ -413,17 +507,11 @@ func fieldInfoFromField(structType reflect.Type, field int) *fieldInfo {
 		}
 	}
 	info.nameValue = reflect.ValueOf(info.name)
-
-	fieldCache.Lock()
-	defer fieldCache.Unlock()
-	fieldCacheMap = fieldCache.value.Load().(fieldsCacheMap)
-	newFieldCacheMap := make(fieldsCacheMap)
-	for k, v := range fieldCacheMap {
-		newFieldCacheMap[k] = v
-	}
-	newFieldCacheMap[structField{structType, field}] = info
-	fieldCache.value.Store(newFieldCacheMap)
 	return info
+}
+
+func fieldInfoFromField(structType reflect.Type, field int) *fieldInfo {
+	return structInfoFromType(structType).fields[field]
 }
 
 func unwrapInterface(v reflect.Value) reflect.Value {
@@ -444,10 +532,36 @@ func mapFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) err
 	}
 
 	if sv.IsNil() {
-		dv.Set(reflect.Zero(dt))
+		if !dv.IsZero() {
+			dv.SetZero()
+		}
 		return nil
 	}
-	dv.Set(reflect.MakeMap(dt))
+	if st == mapStringInterfaceType && dt == mapStringStringType && sv.CanInterface() {
+		// Labels and annotations are common enough to skip reflecting over.
+		src := sv.Interface().(map[string]interface{})
+		if dst, ok := stringMapFromUnstructured(src); ok {
+			dv.Set(reflect.ValueOf(dst))
+			return nil
+		}
+	}
+	dv.Set(reflect.MakeMapWithSize(dt, sv.Len()))
+	if st == mapStringInterfaceType && dt.Key() == stringType && sv.CanInterface() {
+		srcMap := sv.Interface().(map[string]interface{})
+		value := reflect.New(dt.Elem()).Elem()
+		for k, rawVal := range srcMap {
+			if !value.IsZero() {
+				value.SetZero()
+			}
+			if rawVal != nil {
+				if err := fromUnstructured(reflect.ValueOf(rawVal), value, ctx); err != nil {
+					return err
+				}
+			}
+			dv.SetMapIndex(reflect.ValueOf(k), value)
+		}
+		return nil
+	}
 	for _, key := range sv.MapKeys() {
 		value := reflect.New(dt.Elem()).Elem()
 		if val := unwrapInterface(sv.MapIndex(key)); val.IsValid() {
@@ -455,7 +569,7 @@ func mapFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) err
 				return err
 			}
 		} else {
-			value.Set(reflect.Zero(dt.Elem()))
+			value.SetZero()
 		}
 		if st.Key().AssignableTo(dt.Key()) {
 			dv.SetMapIndex(key, value)
@@ -464,6 +578,21 @@ func mapFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) err
 		}
 	}
 	return nil
+}
+
+// stringMapFromUnstructured copies src, reporting false unless every value in it
+// is a string.
+func stringMapFromUnstructured(src map[string]interface{}) (map[string]string, bool) {
+	for _, v := range src {
+		if _, ok := v.(string); !ok {
+			return nil, false
+		}
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v.(string)
+	}
+	return dst, true
 }
 
 func sliceFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) error {
@@ -494,16 +623,35 @@ func sliceFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) e
 	}
 
 	if sv.IsNil() {
-		dv.Set(reflect.Zero(dt))
+		if !dv.IsZero() {
+			dv.SetZero()
+		}
 		return nil
 	}
-	dv.Set(reflect.MakeSlice(dt, sv.Len(), sv.Cap()))
+	svLen := sv.Len()
+	dv.Set(reflect.MakeSlice(dt, svLen, sv.Cap()))
 
 	pathLen := len(ctx.parentPath)
 	defer func() {
 		ctx.parentPath = ctx.parentPath[:pathLen]
 	}()
-	for i := 0; i < sv.Len(); i++ {
+	if sv.CanInterface() {
+		if srcSlice, ok := sv.Interface().([]interface{}); ok {
+			for i, elem := range srcSlice {
+				ctx.pushIndex(i)
+				if elem == nil {
+					if !dv.Index(i).IsZero() {
+						dv.Index(i).SetZero()
+					}
+				} else if err := fromUnstructured(reflect.ValueOf(elem), dv.Index(i), ctx); err != nil {
+					return err
+				}
+				ctx.parentPath = ctx.parentPath[:pathLen]
+			}
+			return nil
+		}
+	}
+	for i := 0; i < svLen; i++ {
 		ctx.pushIndex(i)
 		if err := fromUnstructured(sv.Index(i), dv.Index(i), ctx); err != nil {
 			return err
@@ -517,7 +665,9 @@ func pointerFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext)
 	st, dt := sv.Type(), dv.Type()
 
 	if st.Kind() == reflect.Pointer && sv.IsNil() {
-		dv.Set(reflect.Zero(dt))
+		if !dv.IsZero() {
+			dv.SetZero()
+		}
 		return nil
 	}
 	dv.Set(reflect.New(dt.Elem()))
@@ -535,6 +685,7 @@ func structFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) 
 		return fmt.Errorf("cannot restore struct from: %v", st.Kind())
 	}
 
+	sInfo := structInfoFromType(dt)
 	pathLen := len(ctx.parentPath)
 	svInlined := ctx.isInlined
 	defer func() {
@@ -546,8 +697,56 @@ func structFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) 
 		topLevelKeys, ctx.topLevelKeys = ctx.topLevelKeys, nil
 		ctx.pushMatchedKeyTracker()
 	}
-	for i := 0; i < dt.NumField(); i++ {
-		fieldInfo := fieldInfoFromField(dt, i)
+
+	if sv.CanInterface() {
+		if realMap, ok := sv.Interface().(map[string]interface{}); ok {
+			for i, fieldInfo := range sInfo.fields {
+				fv := dv.Field(i)
+				if len(fieldInfo.name) == 0 {
+					ctx.isInlined = true
+					if err := fromUnstructured(sv, fv, ctx); err != nil {
+						return err
+					}
+					ctx.isInlined = svInlined
+				} else {
+					ctx.recordMatchedKey(fieldInfo.name)
+					var subKeys map[string]interface{}
+					if topLevelKeys != nil {
+						if shouldSkipTopLevelField(fieldInfo, topLevelKeys) {
+							continue
+						}
+						subKeys = subPatchKeysForField(fv, fieldInfo, topLevelKeys)
+						if subKeys == nil && !fv.IsZero() {
+							fv.SetZero()
+						}
+					}
+					rawVal, exists := realMap[fieldInfo.name]
+					if exists && rawVal != nil {
+						ctx.isInlined = false
+						ctx.pushKey(fieldInfo.name)
+						ctx.topLevelKeys = subKeys
+						err := fromUnstructured(reflect.ValueOf(rawVal), fv, ctx)
+						ctx.topLevelKeys = nil
+						if err != nil {
+							return err
+						}
+						ctx.parentPath = ctx.parentPath[:pathLen]
+						ctx.isInlined = svInlined
+					} else if subKeys != nil {
+						ClearPatchedFields(fv, subKeys)
+					} else if !fv.IsZero() {
+						fv.SetZero()
+					}
+				}
+			}
+			if !svInlined {
+				ctx.popAndVerifyMatchedKeys(sv)
+			}
+			return nil
+		}
+	}
+
+	for i, fieldInfo := range sInfo.fields {
 		fv := dv.Field(i)
 
 		if len(fieldInfo.name) == 0 {
@@ -565,25 +764,32 @@ func structFromUnstructured(sv, dv reflect.Value, ctx *fromUnstructuredContext) 
 			// the parentPath to indicate that we are one level
 			// deeper.
 			ctx.recordMatchedKey(fieldInfo.name)
+			var subKeys map[string]interface{}
 			if topLevelKeys != nil {
 				if shouldSkipTopLevelField(fieldInfo, topLevelKeys) {
 					continue
 				}
-				// Zero the pre-populated field before unmarshaling so map/slice/struct
-				// conversions do not merge into or alias original values.
-				fv.SetZero()
+				subKeys = subPatchKeysForField(fv, fieldInfo, topLevelKeys)
+				if subKeys == nil && !fv.IsZero() {
+					fv.SetZero()
+				}
 			}
 			value := unwrapInterface(sv.MapIndex(fieldInfo.nameValue))
 			if value.IsValid() {
 				ctx.isInlined = false
 				ctx.pushKey(fieldInfo.name)
-				if err := fromUnstructured(value, fv, ctx); err != nil {
+				ctx.topLevelKeys = subKeys
+				err := fromUnstructured(value, fv, ctx)
+				ctx.topLevelKeys = nil
+				if err != nil {
 					return err
 				}
 				ctx.parentPath = ctx.parentPath[:pathLen]
 				ctx.isInlined = svInlined
-			} else {
-				fv.Set(reflect.Zero(fv.Type()))
+			} else if subKeys != nil {
+				ClearPatchedFields(fv, subKeys)
+			} else if !fv.IsZero() {
+				fv.SetZero()
 			}
 		}
 	}
@@ -601,6 +807,51 @@ func shouldSkipTopLevelField(fieldInfo *fieldInfo, topLevelKeys map[string]inter
 	return !ok
 }
 
+func subPatchKeysForField(fv reflect.Value, fieldInfo *fieldInfo, patchKeys map[string]interface{}) map[string]interface{} {
+	if patchKeys == nil || len(fieldInfo.name) == 0 || fieldInfo.omitzero != nil || fieldInfo.hasPatchStrategy {
+		return nil
+	}
+	if fv.Kind() != reflect.Struct || fv.NumField() == 0 {
+		return nil
+	}
+	subMap, ok := patchKeys[fieldInfo.name].(map[string]interface{})
+	if !ok || len(subMap) == 0 {
+		return nil
+	}
+	for k := range subMap {
+		if strings.HasPrefix(k, "$") {
+			return nil
+		}
+	}
+	if !structInfoFromType(fv.Type()).canPruneSubfields {
+		return nil
+	}
+	return subMap
+}
+
+// ClearPatchedFields zeroes the struct fields (or nested struct subfields) in v
+// that will be overwritten when unmarshaling a pruned strategic merge patch.
+func ClearPatchedFields(v reflect.Value, patchKeys map[string]interface{}) {
+	if patchKeys == nil || v.Kind() != reflect.Struct {
+		return
+	}
+	sInfo := structInfoFromType(v.Type())
+	for i, fieldInfo := range sInfo.fields {
+		if fieldInfo.name == "-" || len(fieldInfo.name) == 0 {
+			continue
+		}
+		if _, ok := patchKeys[fieldInfo.name]; !ok {
+			continue
+		}
+		fv := v.Field(i)
+		if subKeys := subPatchKeysForField(fv, fieldInfo, patchKeys); subKeys != nil {
+			ClearPatchedFields(fv, subKeys)
+		} else if !fv.IsZero() {
+			fv.SetZero()
+		}
+	}
+}
+
 func interfaceFromUnstructured(sv, dv reflect.Value) error {
 	// TODO: Is this conversion safe?
 	dv.Set(sv)
@@ -615,7 +866,7 @@ func (c *unstructuredConverter) ToUnstructured(obj interface{}) (map[string]inte
 
 // ToUnstructuredTopLevel converts an object into map[string]interface{} representation.
 // When topLevelKeys is non-nil and obj is a pointer to a struct without a custom converter,
-// only top-level struct fields whose JSON names appear in topLevelKeys (plus inlined fields) are converted.
+// only struct fields (and nested struct subfields) whose JSON names appear in topLevelKeys (plus inlined fields) are converted.
 func (c *unstructuredConverter) ToUnstructuredTopLevel(obj interface{}, topLevelKeys map[string]interface{}) (map[string]interface{}, error) {
 	var u map[string]interface{}
 	var err error
@@ -627,12 +878,20 @@ func (c *unstructuredConverter) ToUnstructuredTopLevel(obj interface{}, topLevel
 		if t == nil || t.Kind() != reflect.Pointer || v.IsNil() {
 			return nil, fmt.Errorf("ToUnstructured requires a non-nil pointer to an object, got %v", t)
 		}
-		u = map[string]interface{}{}
-		sv, dv := v.Elem(), reflect.ValueOf(&u).Elem()
-		if topLevelKeys != nil && sv.Kind() == reflect.Struct && !value.TypeReflectEntryOf(sv.Type()).CanConvertToUnstructured() {
-			err = structToUnstructuredTopLevel(sv, dv, topLevelKeys)
+		sv := v.Elem()
+		if sv.Kind() == reflect.Struct && !value.TypeReflectEntryOf(sv.Type()).CanConvertToUnstructured() {
+			sInfo := structInfoFromType(sv.Type())
+			capHint := len(sInfo.fields)
+			if topLevelKeys != nil && len(topLevelKeys)+2 < capHint {
+				capHint = len(topLevelKeys) + 2
+			} else if capHint > 8 {
+				capHint = 8
+			}
+			u = make(map[string]interface{}, capHint)
+			err = structToUnstructuredIntoMap(sv, sInfo, u, topLevelKeys)
 		} else {
-			err = toUnstructured(sv, dv)
+			u = map[string]interface{}{}
+			err = toUnstructured(sv, reflect.ValueOf(&u).Elem())
 		}
 	}
 	if c.mismatchDetection && topLevelKeys == nil {
@@ -749,6 +1008,99 @@ func toUnstructured(sv, dv reflect.Value) error {
 	}
 }
 
+func toUnstructuredValue(sv reflect.Value) (interface{}, error) {
+	entry := value.TypeReflectEntryOf(sv.Type())
+	if entry.CanConvertToUnstructured() {
+		return entry.ToUnstructured(sv)
+	}
+	st := sv.Type()
+	switch st.Kind() {
+	case reflect.String:
+		return sv.String(), nil
+	case reflect.Bool:
+		return sv.Bool(), nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return sv.Int(), nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return uintToUnstructuredHelper(sv.Uint())
+	case reflect.Float32, reflect.Float64:
+		return sv.Float(), nil
+	case reflect.Pointer:
+		if sv.IsNil() {
+			return nil, nil
+		}
+		return toUnstructuredValue(sv.Elem())
+	case reflect.Interface:
+		if !sv.IsValid() || sv.IsNil() {
+			return nil, nil
+		}
+		return toUnstructuredValue(sv.Elem())
+	case reflect.Struct:
+		sInfo := structInfoFromType(st)
+		capHint := len(sInfo.fields)
+		if capHint > 8 {
+			capHint = 8
+		}
+		out := make(map[string]interface{}, capHint)
+		if err := structToUnstructuredIntoMap(sv, sInfo, out, nil); err != nil {
+			return nil, err
+		}
+		return out, nil
+	case reflect.Slice:
+		if sv.IsNil() {
+			return nil, nil
+		}
+		if st.Elem().Kind() == reflect.Uint8 {
+			data, err := json.Marshal(sv.Bytes())
+			if err != nil {
+				return nil, err
+			}
+			var result string
+			if err = json.Unmarshal(data, &result); err != nil {
+				return nil, err
+			}
+			return result, nil
+		}
+		n := sv.Len()
+		out := make([]interface{}, n)
+		for i := 0; i < n; i++ {
+			v, err := toUnstructuredValue(sv.Index(i))
+			if err != nil {
+				return nil, err
+			}
+			out[i] = v
+		}
+		return out, nil
+	case reflect.Map:
+		if sv.IsNil() {
+			return nil, nil
+		}
+		if st.Key().Kind() != reflect.String {
+			return nil, fmt.Errorf("cannot convert map with non-string key: %v", st.Key())
+		}
+		if st == mapStringStringType && sv.CanInterface() {
+			srcMap := sv.Interface().(map[string]string)
+			out := make(map[string]interface{}, len(srcMap))
+			for k, v := range srcMap {
+				out[k] = v
+			}
+			return out, nil
+		}
+		out := make(map[string]interface{}, sv.Len())
+		iter := sv.MapRange()
+		for iter.Next() {
+			v, err := toUnstructuredValue(iter.Value())
+			if err != nil {
+				return nil, err
+			}
+			out[iter.Key().String()] = v
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unrecognized type: %v", st.Kind())
+	}
+}
+
 func mapToUnstructured(sv, dv reflect.Value) error {
 	st, dt := sv.Type(), dv.Type()
 	if sv.IsNil() {
@@ -757,7 +1109,7 @@ func mapToUnstructured(sv, dv reflect.Value) error {
 	}
 	if dt.Kind() == reflect.Interface && dv.NumMethod() == 0 {
 		if st.Key().Kind() == reflect.String {
-			dv.Set(reflect.MakeMap(mapStringInterfaceType))
+			dv.Set(reflect.MakeMapWithSize(mapStringInterfaceType, sv.Len()))
 			dv = dv.Elem()
 			dt = dv.Type()
 		}
@@ -768,6 +1120,15 @@ func mapToUnstructured(sv, dv reflect.Value) error {
 
 	if !st.Key().AssignableTo(dt.Key()) && !st.Key().ConvertibleTo(dt.Key()) {
 		return fmt.Errorf("cannot copy map with non-assignable keys: %v %v", st.Key(), dt.Key())
+	}
+
+	if st == mapStringStringType && dt == mapStringInterfaceType && sv.CanInterface() {
+		// Labels and annotations are common enough to skip reflecting over.
+		dst := dv.Interface().(map[string]interface{})
+		for k, v := range sv.Interface().(map[string]string) {
+			dst[k] = v
+		}
+		return nil
 	}
 
 	for _, key := range sv.MapKeys() {
@@ -854,8 +1215,15 @@ func structToUnstructured(sv, dv reflect.Value) error {
 
 func structToUnstructuredTopLevel(sv, dv reflect.Value, topLevelKeys map[string]interface{}) error {
 	st, dt := sv.Type(), dv.Type()
+	sInfo := structInfoFromType(st)
 	if dt.Kind() == reflect.Interface && dv.NumMethod() == 0 {
-		dv.Set(reflect.MakeMapWithSize(mapStringInterfaceType, st.NumField()))
+		capHint := len(sInfo.fields)
+		if topLevelKeys != nil && len(topLevelKeys)+2 < capHint {
+			capHint = len(topLevelKeys) + 2
+		} else if capHint > 8 {
+			capHint = 8
+		}
+		dv.Set(reflect.MakeMapWithSize(mapStringInterfaceType, capHint))
 		dv = dv.Elem()
 		dt = dv.Type()
 	}
@@ -863,13 +1231,27 @@ func structToUnstructuredTopLevel(sv, dv reflect.Value, topLevelKeys map[string]
 		return fmt.Errorf("cannot convert struct to: %v", dt.Kind())
 	}
 	realMap := dv.Interface().(map[string]interface{})
+	return structToUnstructuredIntoMap(sv, sInfo, realMap, topLevelKeys)
+}
 
-	for i := 0; i < st.NumField(); i++ {
-		fieldInfo := fieldInfoFromField(st, i)
-		fv := sv.Field(i)
+//go:noinline
+func toUnstructuredInlinedFallback(fv reflect.Value, realMap map[string]interface{}) error {
+	return toUnstructured(fv, reflect.ValueOf(&realMap).Elem())
+}
 
+func structToUnstructuredIntoMap(sv reflect.Value, sInfo *structTypeInfo, realMap map[string]interface{}, topLevelKeys map[string]interface{}) error {
+	for i, fieldInfo := range sInfo.fields {
 		if fieldInfo.name == "-" || shouldSkipTopLevelField(fieldInfo, topLevelKeys) {
 			// This field should be skipped.
+			continue
+		}
+		fv := sv.Field(i)
+		if subKeys := subPatchKeysForField(fv, fieldInfo, topLevelKeys); subKeys != nil {
+			subMap := make(map[string]interface{}, len(subKeys))
+			if err := structToUnstructuredIntoMap(fv, structInfoFromType(fv.Type()), subMap, subKeys); err != nil {
+				return err
+			}
+			realMap[fieldInfo.name] = subMap
 			continue
 		}
 		if fieldInfo.omitempty && isEmpty(fv) {
@@ -882,12 +1264,25 @@ func structToUnstructuredTopLevel(sv, dv reflect.Value, topLevelKeys map[string]
 		}
 		if len(fieldInfo.name) == 0 {
 			// This field is inlined.
-			if err := toUnstructured(fv, dv); err != nil {
+			inlined := fv
+			if inlined.Kind() == reflect.Pointer {
+				if inlined.IsNil() {
+					continue
+				}
+				inlined = inlined.Elem()
+			}
+			if inlined.Kind() == reflect.Struct && !value.TypeReflectEntryOf(inlined.Type()).CanConvertToUnstructured() {
+				if err := structToUnstructuredIntoMap(inlined, structInfoFromType(inlined.Type()), realMap, nil); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := toUnstructuredInlinedFallback(fv, realMap); err != nil {
 				return err
 			}
 			continue
 		}
-		switch fv.Type().Kind() {
+		switch fv.Kind() {
 		case reflect.String:
 			realMap[fieldInfo.name] = fv.String()
 		case reflect.Bool:
@@ -903,11 +1298,11 @@ func structToUnstructuredTopLevel(sv, dv reflect.Value, topLevelKeys map[string]
 		case reflect.Float32, reflect.Float64:
 			realMap[fieldInfo.name] = fv.Float()
 		default:
-			subv := reflect.New(dt.Elem()).Elem()
-			if err := toUnstructured(fv, subv); err != nil {
+			val, err := toUnstructuredValue(fv)
+			if err != nil {
 				return err
 			}
-			dv.SetMapIndex(fieldInfo.nameValue, subv)
+			realMap[fieldInfo.name] = val
 		}
 	}
 	return nil
