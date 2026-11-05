@@ -25,6 +25,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	goruntime "runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
@@ -38,6 +40,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+	examplev1 "k8s.io/apiserver/pkg/apis/example/v1"
+	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 	"k8s.io/apiserver/pkg/endpoints/metrics"
 	endpointstesting "k8s.io/apiserver/pkg/endpoints/testing"
@@ -486,4 +490,133 @@ apiserver_watch_events_total{group="group",resource="resource",version="version"
 			require.NoError(t, err)
 		})
 	}
+}
+
+type noopFlushResponseWriter struct {
+	header  http.Header
+	flushed chan struct{}
+	once    sync.Once
+}
+
+func (w *noopFlushResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *noopFlushResponseWriter) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (w *noopFlushResponseWriter) WriteHeader(int) {}
+
+func (w *noopFlushResponseWriter) Flush() {
+	if w.flushed != nil {
+		w.once.Do(func() { close(w.flushed) })
+	}
+}
+
+func BenchmarkWatchHTTP(b *testing.B) {
+	metrics.Register()
+	gvr := examplev1.SchemeGroupVersion.WithResource("pods")
+	pod := &examplev1.Pod{
+		TypeMeta: metav1.TypeMeta{APIVersion: examplev1.SchemeGroupVersion.String(), Kind: "Pod"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "pod-bench",
+			Namespace:       "default",
+			ResourceVersion: "100",
+			Labels:          map[string]string{"app": "benchmark", "tier": "backend"},
+			Annotations:     map[string]string{"description": strings.Repeat("x", 2048)},
+		},
+	}
+
+	b.Run("EncodeCacheHit", func(b *testing.B) {
+		embedded := newWatchEmbeddedEncoder(b.Context(), codecs.LegacyCodec(examplev1.SchemeGroupVersion), nil, nil, nil, &RequestScope{})
+		enc := newWatchEncoder(b.Context(), gvr, embedded, codecs.LegacyCodec(examplev1.SchemeGroupVersion), io.Discard)
+		cachedObj := &fakeCachingObject{obj: pod}
+		event := watch.Event{Type: watch.Added, Object: cachedObj}
+		require.NoError(b, enc.Encode(event))
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := enc.Encode(event); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("IdleStreamMemory", func(b *testing.B) {
+		const numWatches = 2000
+		scope := &RequestScope{
+			Serializer: codecs,
+			Resource:   gvr,
+			Kind:       examplev1.SchemeGroupVersion.WithKind("Pod"),
+		}
+
+		oldGCPercent := debug.SetGCPercent(-1)
+		defer debug.SetGCPercent(oldGCPercent)
+
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			goruntime.GC()
+			goruntime.GC()
+			var memStart goruntime.MemStats
+			goruntime.ReadMemStats(&memStart)
+
+			ctx, cancel := context.WithCancel(b.Context())
+			watchers := make([]*watch.FakeWatcher, numWatches)
+			writers := make([]*noopFlushResponseWriter, numWatches)
+			var wg sync.WaitGroup
+			wg.Add(numWatches)
+
+			b.StartTimer()
+			for wIdx := 0; wIdx < numWatches; wIdx++ {
+				watcher := watch.NewFakeWithOptions(watch.FakeOptions{ChannelSize: 2})
+				watcher.Add(pod)
+				watchers[wIdx] = watcher
+
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/api/v1/pods?watch=true", nil)
+				require.NoError(b, err)
+				req.Header.Set("Accept", runtime.ContentTypeProtobuf+";stream=watch")
+				mediaTypeOptions, ok := negotiation.NegotiateMediaTypeOptions(req.Header.Get("Accept"), codecs.SupportedMediaTypes(), negotiation.DefaultEndpointRestrictions)
+				require.True(b, ok)
+
+				rw := &noopFlushResponseWriter{
+					header:  make(http.Header),
+					flushed: make(chan struct{}),
+				}
+				writers[wIdx] = rw
+
+				handler, err := serveWatchHandler(watcher, scope, mediaTypeOptions, req, rw, 0, "cluster", false, func() {})
+				require.NoError(b, err)
+				go func() {
+					defer wg.Done()
+					handler.ServeHTTP(rw, req)
+				}()
+			}
+
+			for wIdx := 0; wIdx < numWatches; wIdx++ {
+				<-writers[wIdx].flushed
+			}
+			b.StopTimer()
+
+			goruntime.GC()
+			goruntime.GC()
+			var memAfter goruntime.MemStats
+			goruntime.ReadMemStats(&memAfter)
+			goruntime.KeepAlive(watchers)
+			goruntime.KeepAlive(writers)
+
+			var heapGrowth uint64
+			if memAfter.HeapInuse > memStart.HeapInuse {
+				heapGrowth = memAfter.HeapInuse - memStart.HeapInuse
+			}
+			b.ReportMetric(float64(heapGrowth)/float64(numWatches)/1024, "KB/watch")
+
+			cancel()
+			for wIdx := 0; wIdx < numWatches; wIdx++ {
+				watchers[wIdx].Stop()
+			}
+			wg.Wait()
+		}
+	})
 }

@@ -132,14 +132,6 @@ func serveWatchHandler(watcher watch.Interface, scope *RequestScope, mediaTypeOp
 		}
 	}
 
-	var memoryAllocator runtime.MemoryAllocator
-
-	if encoderWithAllocator, supportsAllocator := negotiatedEncoder.(runtime.EncoderWithAllocator); supportsAllocator {
-		// don't put the allocator inside the embeddedEncodeFn as that would allocate memory on every call.
-		// instead, we allocate the buffer for the entire watch session and release it when we close the connection.
-		memoryAllocator = runtime.AllocatorPool.Get().(*runtime.Allocator)
-		negotiatedEncoder = runtime.NewEncoderWithAllocator(encoderWithAllocator, memoryAllocator)
-	}
 	var tableOptions *metav1.TableOptions
 	if options != nil {
 		if passedOptions, ok := options.(*metav1.TableOptions); ok {
@@ -149,15 +141,6 @@ func serveWatchHandler(watcher watch.Interface, scope *RequestScope, mediaTypeOp
 		}
 	}
 	embeddedEncoder := newWatchEmbeddedEncoder(ctx, negotiatedEncoder, mediaTypeOptions.Convert, tableOptions, mediaTypeOptions.Drop, scope)
-
-	if encoderWithAllocator, supportsAllocator := encoder.(runtime.EncoderWithAllocator); supportsAllocator {
-		if memoryAllocator == nil {
-			// don't put the allocator inside the embeddedEncodeFn as that would allocate memory on every call.
-			// instead, we allocate the buffer for the entire watch session and release it when we close the connection.
-			memoryAllocator = runtime.AllocatorPool.Get().(*runtime.Allocator)
-		}
-		encoder = runtime.NewEncoderWithAllocator(encoderWithAllocator, memoryAllocator)
-	}
 
 	var serverShuttingDownCh <-chan struct{}
 	if signals := apirequest.ServerShutdownSignalFrom(req.Context()); signals != nil {
@@ -174,7 +157,6 @@ func serveWatchHandler(watcher watch.Interface, scope *RequestScope, mediaTypeOp
 		Encoder:         encoder,
 		EmbeddedEncoder: embeddedEncoder,
 
-		MemoryAllocator:      memoryAllocator,
 		TimeoutFactory:       &realTimeoutFactory{timeout},
 		ServerShuttingDownCh: serverShuttingDownCh,
 
@@ -318,17 +300,20 @@ type watchResponseWriter struct {
 	flusher            http.Flusher
 	contentEncoding    string
 	isWatchListRequest bool
+	plainWriter        plainResponseWriter
 	writer             watchStreamWriter
 }
 
 func newWatchResponseWriter(delegateRW http.ResponseWriter, flusher http.Flusher, contentEncoding string, isWatchListRequest bool) *watchResponseWriter {
-	return &watchResponseWriter{
+	rw := &watchResponseWriter{
 		delegateRW:         delegateRW,
 		flusher:            flusher,
 		contentEncoding:    contentEncoding,
 		isWatchListRequest: isWatchListRequest,
-		writer:             &plainResponseWriter{w: delegateRW, flusher: flusher},
+		plainWriter:        plainResponseWriter{w: delegateRW, flusher: flusher},
 	}
+	rw.writer = &rw.plainWriter
+	return rw
 }
 
 func (w *watchResponseWriter) BeginStream(mediaType string) {
