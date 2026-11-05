@@ -176,16 +176,51 @@ func TestCachingObjectLazyDeepCopy(t *testing.T) {
 		t.Fatalf("couldn't create cachingObject: %v", err)
 	}
 
-	if object.deepCopied != false {
+	if object.object != pod {
 		t.Errorf("object deep-copied without the need")
 	}
 
 	object.SetResourceVersion("123")
-	if object.deepCopied != false {
+	if object.object != pod {
 		t.Errorf("object deep-copied on no-op change")
 	}
 	object.SetResourceVersion("234")
-	if object.deepCopied != true {
+	if object.object == pod {
 		t.Errorf("object not deep-copied on change")
+	}
+}
+
+func TestCachingObjectCacheEncodeAvoidsDeepCopy(t *testing.T) {
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "pod-1",
+			ResourceVersion: "100",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{Name: "c1"}},
+		},
+	}
+	object, err := newCachingObject(pod)
+	if err != nil {
+		t.Fatalf("couldn't create cachingObject: %v", err)
+	}
+
+	var encodedPod *v1.Pod
+	err = object.CacheEncode("test", func(obj runtime.Object, w io.Writer) error {
+		encodedPod = obj.(*v1.Pod)
+		encodedPod.SetGroupVersionKind(v1.SchemeGroupVersion.WithKind("Pod"))
+		return nil
+	}, bytes.NewBuffer(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if encodedPod == pod {
+		t.Errorf("expected shallow copy to isolate top-level TypeMeta/ObjectMeta")
+	}
+	if &encodedPod.Spec.Containers[0] != &pod.Spec.Containers[0] {
+		t.Errorf("expected CacheEncode to share Spec.Containers backing array without full DeepCopy")
+	}
+	if !pod.GetObjectKind().GroupVersionKind().Empty() {
+		t.Errorf("expected original pod GVK to remain unmodified, got %v", pod.GetObjectKind().GroupVersionKind())
 	}
 }

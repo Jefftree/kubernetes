@@ -64,16 +64,6 @@ type serializationsCache map[runtime.Identifier]*serializationResult
 type cachingObject struct {
 	lock sync.RWMutex
 
-	// deepCopied defines whether the object below has already been
-	// deep copied. The operation is performed lazily on the first
-	// setXxx operation.
-	//
-	// The lazy deep-copy make is useful, as effectively the only
-	// case when we are setting some fields are ResourceVersion for
-	// DELETE events, so in all other cases we can effectively avoid
-	// performing any deep copies.
-	deepCopied bool
-
 	// Object for which serializations are cached.
 	object metaRuntimeInterface
 
@@ -83,15 +73,13 @@ type cachingObject struct {
 	serializations atomic.Value
 }
 
-// newCachingObject performs a deep copy of the given object and wraps it
-// into a cachingObject.
+// newCachingObject wraps the given object into a cachingObject.
 // An error is returned if it's not possible to cast the object to
 // metav1.Object type.
 func newCachingObject(object runtime.Object) (*cachingObject, error) {
 	if obj, ok := object.(metaRuntimeInterface); ok {
 		result := &cachingObject{
-			object:     obj,
-			deepCopied: false,
+			object: obj,
 		}
 		result.serializations.Store(make(serializationsCache))
 		return result, nil
@@ -137,11 +125,7 @@ func (o *cachingObject) CacheEncode(id runtime.Identifier, encode func(runtime.O
 	result := o.getSerializationResult(id)
 	result.once.Do(func() {
 		buffer := bytes.NewBuffer(nil)
-		// TODO(wojtek-t): This is currently making a copy to avoid races
-		//   in cases where encoding is making subtle object modifications,
-		//   e.g. #82497
-		//   Figure out if we can somehow avoid this under some conditions.
-		result.err = encode(o.GetObject(), buffer)
+		result.err = encode(o.getObjectForEncode(), buffer)
 		result.raw = buffer.Bytes()
 	})
 	// Once invoked, fields of serialization will not change.
@@ -154,6 +138,50 @@ func (o *cachingObject) CacheEncode(id runtime.Identifier, encode func(runtime.O
 	}
 	_, err := w.Write(result.raw)
 	return err
+}
+
+var (
+	typeMetaType   = reflect.TypeFor[metav1.TypeMeta]()
+	objectMetaType = reflect.TypeFor[metav1.ObjectMeta]()
+)
+
+func hasValueTypeAndObjectMeta(t reflect.Type) bool {
+	if t.Kind() != reflect.Struct {
+		return false
+	}
+	var hasTypeMeta, hasObjectMeta bool
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if f.Anonymous && f.Type == typeMetaType {
+			hasTypeMeta = true
+		} else if f.Type == objectMetaType {
+			hasObjectMeta = true
+		}
+		if hasTypeMeta && hasObjectMeta {
+			return true
+		}
+	}
+	return false
+}
+
+// getObjectForEncode returns a shallow copy of the wrapped object when it embeds
+// metav1.TypeMeta and metav1.ObjectMeta by value, isolating transient GVK or
+// metadata mutations during encoding (e.g. #82497) without deep-copying Spec/Status.
+func (o *cachingObject) getObjectForEncode() runtime.Object {
+	o.lock.RLock()
+	obj := o.object
+	o.lock.RUnlock()
+
+	v := reflect.ValueOf(obj)
+	if v.Kind() == reflect.Pointer && hasValueTypeAndObjectMeta(v.Type().Elem()) {
+		cp := reflect.New(v.Type().Elem())
+		cp.Elem().Set(v.Elem())
+		cpObj := cp.Interface().(runtime.Object)
+		if cpObj.GetObjectKind() != obj.GetObjectKind() {
+			return cpObj
+		}
+	}
+	return obj.DeepCopyObject()
 }
 
 // GetObject implements runtime.CacheableObject interface.
@@ -177,9 +205,7 @@ func (o *cachingObject) DeepCopyObject() runtime.Object {
 	// DeepCopyObject on cachingObject is not expected to be called anywhere.
 	// However, to be on the safe-side, we implement it, though given the
 	// cache is only an optimization we ignore copying it.
-	result := &cachingObject{
-		deepCopied: true,
-	}
+	result := &cachingObject{}
 	result.serializations.Store(make(serializationsCache))
 
 	o.lock.RLock()
@@ -237,10 +263,7 @@ func (o *cachingObject) conditionalSet(isNoop func() bool, set func()) {
 	if isNoop() {
 		return
 	}
-	if !o.deepCopied {
-		o.object = o.object.DeepCopyObject().(metaRuntimeInterface)
-		o.deepCopied = true
-	}
+	o.object = o.object.DeepCopyObject().(metaRuntimeInterface)
 	o.invalidateCacheLocked()
 	set()
 }
