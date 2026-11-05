@@ -53,21 +53,21 @@ func getAvoidTimestampEqualities() conversion.Equalities {
 
 		var eqs = equality.Semantic.Copy()
 		err := eqs.AddFuncs(
-			func(a, b metav1.ManagedFieldsEntry) bool {
+			conversion.EqualityFunc[metav1.ManagedFieldsEntry](func(a, b metav1.ManagedFieldsEntry) bool {
 				// Two objects' managed fields are equivalent if, ignoring timestamp,
 				//	the objects are deeply equal.
 				a.Time = nil
 				b.Time = nil
 				return reflect.DeepEqual(a, b)
-			},
-			func(a, b unstructured.Unstructured) bool {
+			}),
+			conversion.EqualityFunc[unstructured.Unstructured](func(a, b unstructured.Unstructured) bool {
 				// Check if the managed fields are equal by converting to structured types and leveraging the above
 				// function, then, ignoring the managed fields, equality check the rest of the unstructured data.
 				if !avoidTimestampEqualities.DeepEqual(a.GetManagedFields(), b.GetManagedFields()) {
 					return false
 				}
 				return equalIgnoringValueAtPath(a.Object, b.Object, []string{"metadata", "managedFields"})
-			},
+			}),
 		)
 
 		if err != nil {
@@ -103,6 +103,26 @@ func equalIgnoringValueAtPath(a, b any, path []string) bool {
 				return false
 			}
 		} else if !avoidTimestampEqualities.DeepEqual(aVal, bVal) {
+			return false
+		}
+	}
+	return true
+}
+
+func managedFieldsEqualModuloTime(a, b []metav1.ManagedFieldsEntry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		ea, eb := &a[i], &b[i]
+		if ea.Manager != eb.Manager || ea.Operation != eb.Operation || ea.APIVersion != eb.APIVersion ||
+			ea.FieldsType != eb.FieldsType || ea.Subresource != eb.Subresource {
+			return false
+		}
+		if (ea.FieldsV1 == nil) != (eb.FieldsV1 == nil) {
+			return false
+		}
+		if ea.FieldsV1 != nil && !ea.FieldsV1.Equal(*eb.FieldsV1) {
 			return false
 		}
 	}
@@ -191,17 +211,15 @@ func IgnoreManagedFieldsTimestampsTransformer(
 		return newObj, nil
 	}
 
+	if !managedFieldsEqualModuloTime(oldManagedFields, newManagedFields) {
+		metrics.RecordTimestampComparisonLatency("unequal_objects_fast", time.Since(start))
+		return newObj, nil
+	}
+
 	eqFn := equalities.DeepEqual
 	if _, ok := newObj.(*unstructured.Unstructured); ok {
 		// Use strict equality with unstructured
 		eqFn = equalities.DeepEqualWithNilDifferentFromEmpty
-	}
-
-	// This condition ensures the managed fields are always compared first. If
-	//	this check fails, the if statement will short circuit. If the check
-	// 	succeeds the slow path is taken which compares entire objects.
-	if !eqFn(oldManagedFields, newManagedFields) {
-		return newObj, nil
 	}
 
 	if eqFn(newObj, oldObj) {

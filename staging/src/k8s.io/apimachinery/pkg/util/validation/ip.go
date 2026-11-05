@@ -103,6 +103,10 @@ func IsValidIP(fldPath *field.Path, value string) field.ErrorList {
 // GetWarningsForIP returns warnings for IP address values in non-standard forms. This
 // should only be used with fields that are validated with IsValidIPForLegacyField().
 func GetWarningsForIP(fldPath *field.Path, value string) []string {
+	addr, _ := netip.ParseAddr(value)
+	if addr.IsValid() && addr.Is4() {
+		return nil
+	}
 	ip := netutils.ParseIPSloppy(value)
 	if ip == nil {
 		//nolint:logcheck // Should not be reached.
@@ -110,7 +114,6 @@ func GetWarningsForIP(fldPath *field.Path, value string) []string {
 		return nil
 	}
 
-	addr, _ := netip.ParseAddr(value)
 	if !addr.IsValid() || addr.Is4In6() {
 		// This catches 2 cases: leading 0s (if ParseIPSloppy() accepted it but
 		// ParseAddr() doesn't) or IPv4-mapped IPv6 (.Is4In6()). Either way,

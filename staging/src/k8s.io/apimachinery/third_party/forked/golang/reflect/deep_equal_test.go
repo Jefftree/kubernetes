@@ -5,6 +5,8 @@
 package reflect
 
 import (
+	"math"
+	"reflect"
 	"testing"
 )
 
@@ -198,5 +200,210 @@ func TestDerivatives(t *testing.T) {
 		if e, a := item.equal, e.DeepDerivative(item.a, item.b); e != a {
 			t.Errorf("Expected (%+v ~ %+v) == %v, but got %v", item.a, item.b, e, a)
 		}
+	}
+}
+
+func TestScalarKindsMatchInterfaceEquality(t *testing.T) {
+	type named string
+	type namedInt int16
+	nan := math.NaN()
+	values := []interface{}{
+		"", "a", "b", named("a"), named("b"),
+		true, false,
+		int(1), int(2), int8(-1), int8(1), int16(3), namedInt(3), namedInt(4), int32(5), int64(-6), int64(6),
+		uint(1), uint(2), uint8(1), uint16(3), uint32(5), uint64(6), uintptr(7), uintptr(8),
+		float32(1.5), float32(2.5), float64(0), math.Copysign(0, -1), nan, math.Inf(1), float32(nan),
+		complex64(1 + 2i), complex64(1 + 3i), complex128(complex(nan, 0)), complex128(1 + 2i),
+	}
+	e := Equalities{}
+	for _, a := range values {
+		for _, b := range values {
+			want := a == b
+			if got := e.DeepEqual(a, b); got != want {
+				t.Errorf("DeepEqual(%#v, %#v) = %v, want %v", a, b, got, want)
+			}
+			type wrapper struct{ V interface{} }
+			if got := e.DeepEqual(wrapper{a}, wrapper{b}); got != want {
+				t.Errorf("DeepEqual(wrapper{%#v}, wrapper{%#v}) = %v, want %v", a, b, got, want)
+			}
+		}
+	}
+}
+
+func TestUnexportedFieldPanics(t *testing.T) {
+	type hidden struct{ s string }
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected a panic for an unexported field")
+		}
+	}()
+	Equalities{}.DeepEqual(hidden{"a"}, hidden{"a"})
+}
+
+func TestStringMaps(t *testing.T) {
+	type holder struct{ M map[string]string }
+	maps := []map[string]string{nil, {}, {"a": "b"}, {"a": "c"}, {"b": "b"}, {"a": "b", "c": "d"}, {"a": "", "c": "d"}}
+	for _, equateNilAndEmpty := range []bool{true, false} {
+		for i, a := range maps {
+			for j, b := range maps {
+				want := i == j || equateNilAndEmpty && len(a) == 0 && len(b) == 0
+				if got := (Equalities{}).deepEqual(holder{a}, holder{b}, equateNilAndEmpty); got != want {
+					t.Errorf("deepEqual(%v, %v, %v) = %v, want %v", a, b, equateNilAndEmpty, got, want)
+				}
+			}
+		}
+	}
+
+	// A registered string equality still applies to map values.
+	e := Equalities{}
+	if err := e.AddFunc(func(a, b string) bool { return len(a) == len(b) }); err != nil {
+		t.Fatal(err)
+	}
+	if !e.DeepEqual(map[string]string{"a": "x"}, map[string]string{"a": "y"}) {
+		t.Error("expected the registered string equality to be used")
+	}
+}
+
+func TestMapsOfStructs(t *testing.T) {
+	type val struct {
+		X int
+		P *int
+		S []int
+		A [2]int
+	}
+	one, two, otherOne := 1, 2, 1
+	cases := []struct {
+		a, b map[string]val
+		want bool
+	}{
+		{map[string]val{"a": {X: 1}, "b": {X: 2}}, map[string]val{"a": {X: 1}, "b": {X: 2}}, true},
+		{map[string]val{"a": {X: 1}, "b": {X: 2}}, map[string]val{"a": {X: 1}, "b": {X: 3}}, false},
+		{map[string]val{"a": {P: &one}, "b": {P: &two}}, map[string]val{"a": {P: &otherOne}, "b": {P: &two}}, true},
+		{map[string]val{"a": {P: &one}, "b": {P: &two}}, map[string]val{"a": {P: &one}, "b": {P: &one}}, false},
+		{map[string]val{"a": {S: []int{1}}, "b": {S: []int{2}}}, map[string]val{"a": {S: []int{1}}, "b": {S: []int{3}}}, false},
+		{map[string]val{"a": {A: [2]int{1, 2}}, "b": {A: [2]int{3, 4}}}, map[string]val{"a": {A: [2]int{1, 2}}, "b": {A: [2]int{3, 5}}}, false},
+		{map[string]val{"a": {}}, map[string]val{"b": {}}, false},
+	}
+	e := Equalities{}
+	for i, tc := range cases {
+		if got := e.DeepEqual(tc.a, tc.b); got != tc.want {
+			t.Errorf("%d: DeepEqual = %v, want %v", i, got, tc.want)
+		}
+		if got := e.DeepEqual(tc.b, tc.a); got != tc.want {
+			t.Errorf("%d: reversed DeepEqual = %v, want %v", i, got, tc.want)
+		}
+	}
+}
+
+type sel interface{ Key() string }
+
+type keySel string
+
+func (k keySel) Key() string { return string(k) }
+
+func TestEqualityFuncMatchesPlainFunc(t *testing.T) {
+	type num struct{ V, Scale int }
+	type holder struct {
+		N   num
+		NP  *num
+		NS  []num
+		NM  map[string]num
+		Sel sel
+	}
+	sameValue := func(a, b num) bool { return a.V*b.Scale == b.V*a.Scale || a.Scale == 0 && b.Scale == 0 }
+	sameSel := func(a, b sel) bool { return (a == nil) == (b == nil) }
+	plain := EqualitiesOrDie(sameValue, sameSel)
+	typed := EqualitiesOrDie(EqualityFunc[num](sameValue), EqualityFunc[sel](sameSel))
+
+	values := []holder{
+		{},
+		{N: num{1, 1}, NP: &num{2, 1}, NS: []num{{3, 1}}, NM: map[string]num{"a": {4, 1}}},
+		{N: num{2, 2}, NP: &num{4, 2}, NS: []num{{6, 2}}, NM: map[string]num{"a": {8, 2}}},
+		{N: num{1, 2}, NP: &num{2, 1}, NS: []num{{3, 1}}, NM: map[string]num{"a": {4, 1}}},
+		{NM: map[string]num{"a": {4, 1}}, Sel: keySel("k")},
+		{NM: map[string]num{"a": {5, 1}}},
+	}
+	for i, a := range values {
+		for j, b := range values {
+			for _, args := range [][2]interface{}{{a, b}, {&a, &b}, {a.N, b.N}, {a.NM, b.NM}, {a.Sel, b.Sel}} {
+				want := plain.DeepEqual(args[0], args[1])
+				if got := typed.DeepEqual(args[0], args[1]); got != want {
+					t.Errorf("%d, %d: DeepEqual(%T) = %v, want %v", i, j, args[0], got, want)
+				}
+				if args[0] == nil || args[1] == nil {
+					continue // DeepDerivative does not take nil interfaces
+				}
+				want = plain.DeepDerivative(args[0], args[1])
+				if got := typed.DeepDerivative(args[0], args[1]); got != want {
+					t.Errorf("%d, %d: DeepDerivative(%T) = %v, want %v", i, j, args[0], got, want)
+				}
+			}
+		}
+	}
+
+	a, b := &holder{N: num{1, 1}}, &holder{N: num{2, 2}}
+	if allocs := testing.AllocsPerRun(10, func() { typed.DeepEqual(a, b) }); allocs != 0 {
+		t.Errorf("DeepEqual with an EqualityFunc allocated %v times, want 0", allocs)
+	}
+}
+
+func TestCycles(t *testing.T) {
+	type node struct {
+		V    int
+		Next *node
+		Kids []node
+		Arr  [1]*node
+	}
+	ring := func(vs ...int) *node {
+		nodes := make([]*node, len(vs))
+		for i, v := range vs {
+			nodes[i] = &node{V: v}
+		}
+		for i := range nodes {
+			nodes[i].Next = nodes[(i+1)%len(nodes)]
+		}
+		return nodes[0]
+	}
+	selfKids := func(v int) *node {
+		n := &node{V: v, Kids: make([]node, 1)}
+		n.Kids[0].V = v
+		n.Kids[0].Kids = n.Kids
+		return n
+	}
+	viaArray := func(v int) *node {
+		n := &node{V: v}
+		n.Arr[0] = n
+		return n
+	}
+	values := []*node{
+		ring(1), ring(1), ring(2), ring(1, 2), ring(1, 2), ring(2, 1), ring(1, 2, 1, 2), ring(1, 1),
+		selfKids(1), selfKids(1), selfKids(2), viaArray(1), viaArray(1), viaArray(2),
+	}
+	for i, a := range values {
+		for j, b := range values {
+			want := reflect.DeepEqual(a, b)
+			if got := (Equalities{}).DeepEqualWithNilDifferentFromEmpty(a, b); got != want {
+				t.Errorf("%d, %d: DeepEqual = %v, want %v", i, j, got, want)
+			}
+			if got := (Equalities{}).DeepEqualWithNilDifferentFromEmpty(*a, *b); got != want {
+				t.Errorf("%d, %d: DeepEqual of values = %v, want %v", i, j, got, want)
+			}
+		}
+	}
+}
+
+func TestUnexportedSetMapField(t *testing.T) {
+	type holder struct {
+		set map[string]struct{}
+	}
+	a := holder{set: map[string]struct{}{"x": {}}}
+	b := holder{set: map[string]struct{}{"x": {}}}
+	c := holder{set: map[string]struct{}{"y": {}}}
+	e := Equalities{}
+	if !e.DeepEqual(a, b) {
+		t.Fatalf("expected equal unexported map[string]struct{} fields")
+	}
+	if e.DeepEqual(a, c) {
+		t.Fatalf("expected unequal unexported map[string]struct{} fields")
 	}
 }

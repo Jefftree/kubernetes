@@ -1443,8 +1443,7 @@ func validateLocalDescendingPath(targetPath string, fldPath *field.Path) field.E
 // on the node to ensure there are no backsteps.
 func validatePathNoBacksteps(targetPath string, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
-	parts := strings.Split(filepath.ToSlash(targetPath), "/")
-	for _, item := range parts {
+	for item := range strings.SplitSeq(filepath.ToSlash(targetPath), "/") {
 		if item == ".." {
 			allErrs = append(allErrs, field.Invalid(fldPath, targetPath, "must not contain '..'"))
 			break // even for `../../..`, one error is sufficient to make the point
@@ -4684,6 +4683,11 @@ func validatePodMetadataAndSpec(pod *core.Pod, opts PodValidationOptions) field.
 
 // validatePodIPs validates IPs in pod status
 func validatePodIPs(pod, oldPod *core.Pod) field.ErrorList {
+	if oldPod != nil && len(pod.Status.PodIPs) == 1 && len(oldPod.Status.PodIPs) == 1 &&
+		len(pod.Status.PodIP) > 0 && pod.Status.PodIP == pod.Status.PodIPs[0].IP &&
+		pod.Status.PodIPs[0].IP == oldPod.Status.PodIPs[0].IP {
+		return nil
+	}
 	allErrs := field.ErrorList{}
 
 	podIPsField := field.NewPath("status", "podIPs")
@@ -4737,6 +4741,11 @@ func validateHostIPs(pod, oldPod *core.Pod) field.ErrorList {
 
 	if len(pod.Status.HostIPs) == 0 {
 		return allErrs
+	}
+	if oldPod != nil && len(pod.Status.HostIPs) == 1 && len(oldPod.Status.HostIPs) == 1 &&
+		pod.Status.HostIP == pod.Status.HostIPs[0].IP &&
+		pod.Status.HostIPs[0].IP == oldPod.Status.HostIPs[0].IP {
+		return nil
 	}
 
 	hostIPsField := field.NewPath("status", "hostIPs")
@@ -5928,7 +5937,7 @@ func ValidatePodUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions) fiel
 
 	// the last thing to check is pod spec equality.  If the pod specs are equal, then we can simply return the errors we have
 	// so far and save the cost of a deep copy.
-	if apiequality.Semantic.DeepEqual(newPod.Spec, oldPod.Spec) {
+	if apiequality.Semantic.DeepEqual(&newPod.Spec, &oldPod.Spec) {
 		return allErrs
 	}
 
@@ -6021,7 +6030,25 @@ func ValidatePodUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions) fiel
 }
 
 // ValidateContainerStateTransition test to if any illegal container state transitions are being attempted
+func hasTerminatedToNonTerminatedTransition(newStatuses, oldStatuses []core.ContainerStatus) bool {
+	for i := range oldStatuses {
+		if oldStatuses[i].State.Terminated == nil {
+			continue
+		}
+		name := oldStatuses[i].Name
+		for j := range newStatuses {
+			if newStatuses[j].Name == name && newStatuses[j].State.Terminated == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func ValidateContainerStateTransition(newStatuses, oldStatuses []core.ContainerStatus, fldPath *field.Path, podSpec core.PodSpec, opts PodValidationOptions) field.ErrorList {
+	if !hasTerminatedToNonTerminatedTransition(newStatuses, oldStatuses) {
+		return nil
+	}
 	allErrs := field.ErrorList{}
 	if opts.AllowContainerRestartPolicyRules {
 		// Convert the *core.PodSpec to *v1.PodSpec to satisfy the call to AllContainersCouldRestart and
@@ -6087,6 +6114,9 @@ func ValidateContainerStateTransition(newStatuses, oldStatuses []core.ContainerS
 
 // ValidateInitContainerStateTransition test to if any illegal init container state transitions are being attempted
 func ValidateInitContainerStateTransition(newStatuses, oldStatuses []core.ContainerStatus, fldpath *field.Path, podSpec core.PodSpec, opts PodValidationOptions) field.ErrorList {
+	if !hasTerminatedToNonTerminatedTransition(newStatuses, oldStatuses) {
+		return nil
+	}
 	allErrs := field.ErrorList{}
 	if opts.AllowContainerRestartPolicyRules {
 		// Convert the *core.PodSpec to *v1.PodSpec to satisfy the call to AllContainersCouldRestart and
@@ -6182,14 +6212,29 @@ func ValidateEphemeralContainerStateTransition(newStatuses, oldStatuses []core.C
 	return allErrs
 }
 
+var (
+	podStatusFldPathMetadata                             = field.NewPath("metadata")
+	podStatusFldPathMetadataAnnotations                  = podStatusFldPathMetadata.Child("annotations")
+	podStatusFldPathStatus                               = field.NewPath("status")
+	podStatusFldPathStatusConditions                     = podStatusFldPathStatus.Child("conditions")
+	podStatusFldPathStatusQOSClass                       = podStatusFldPathStatus.Child("qosClass")
+	podStatusFldPathStatusContainerStatuses              = podStatusFldPathStatus.Child("containerStatuses")
+	podStatusFldPathStatusInitContainerStatuses          = podStatusFldPathStatus.Child("initContainerStatuses")
+	podStatusFldPathStatusEphemeralContainerStatuses     = podStatusFldPathStatus.Child("ephemeralContainerStatuses")
+	podStatusFldPathStatusResourceClaimStatuses          = podStatusFldPathStatus.Child("resourceClaimStatuses")
+	podStatusFldPathStatusExtendedResourceClaimStatus    = podStatusFldPathStatus.Child("extendedResourceClaimStatus")
+	podStatusFldPathStatusNodeAllocatableResourceClaims  = podStatusFldPathStatus.Child("nodeAllocatableResourceClaimStatuses")
+	podStatusFldPathStatusVolumeHealth                   = podStatusFldPathStatus.Child("volumeHealth")
+)
+
 // ValidatePodStatusUpdate checks for changes to status that shouldn't occur in normal operation.
 func ValidatePodStatusUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions) field.ErrorList {
-	fldPath := field.NewPath("metadata")
+	fldPath := podStatusFldPathMetadata
 	allErrs := ValidateObjectMetaUpdate(&newPod.ObjectMeta, &oldPod.ObjectMeta, fldPath)
-	allErrs = append(allErrs, ValidatePodSpecificAnnotationUpdates(newPod, oldPod.Annotations, fldPath.Child("annotations"), opts)...)
+	allErrs = append(allErrs, ValidatePodSpecificAnnotationUpdates(newPod, oldPod.Annotations, podStatusFldPathMetadataAnnotations, opts)...)
 
-	fldPath = field.NewPath("status")
-	allErrs = append(allErrs, validatePodConditions(newPod.Status.Conditions, fldPath.Child("conditions"))...)
+	fldPath = podStatusFldPathStatus
+	allErrs = append(allErrs, validatePodConditions(newPod.Status.Conditions, podStatusFldPathStatusConditions)...)
 
 	if newPod.Spec.NodeName != oldPod.Spec.NodeName {
 		allErrs = append(allErrs, field.Forbidden(fldPath.Child("nodeName"), "may not be changed directly"))
@@ -6215,7 +6260,9 @@ func ValidatePodStatusUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions
 	}
 
 	// Pod QoS is immutable
-	allErrs = append(allErrs, ValidateImmutableField(newPod.Status.QOSClass, oldPod.Status.QOSClass, fldPath.Child("qosClass"))...)
+	if newPod.Status.QOSClass != oldPod.Status.QOSClass {
+		allErrs = append(allErrs, ValidateImmutableField(newPod.Status.QOSClass, oldPod.Status.QOSClass, podStatusFldPathStatusQOSClass)...)
+	}
 
 	// Note: there is no check that ContainerStatuses, InitContainerStatuses, and EphemeralContainerStatuses doesn't have duplicate conatainer names
 	// or statuses of containers that are not defined in the pod spec. Changing this may lead to a breaking changes. So consumers of those fields
@@ -6223,15 +6270,15 @@ func ValidatePodStatusUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions
 	//
 	// If pod should not restart, make sure the status update does not transition
 	// any terminated containers to a non-terminated state.
-	allErrs = append(allErrs, ValidateContainerStateTransition(newPod.Status.ContainerStatuses, oldPod.Status.ContainerStatuses, fldPath.Child("containerStatuses"), oldPod.Spec, opts)...)
-	allErrs = append(allErrs, ValidateInitContainerStateTransition(newPod.Status.InitContainerStatuses, oldPod.Status.InitContainerStatuses, fldPath.Child("initContainerStatuses"), oldPod.Spec, opts)...)
-	allErrs = append(allErrs, ValidateEphemeralContainerStateTransition(newPod.Status.EphemeralContainerStatuses, oldPod.Status.EphemeralContainerStatuses, fldPath.Child("ephemeralContainerStatuses"))...)
-	allErrs = append(allErrs, validatePodResourceClaimStatuses(newPod.Status.ResourceClaimStatuses, newPod.Spec.ResourceClaims, fldPath.Child("resourceClaimStatuses"))...)
-	allErrs = append(allErrs, validatePodExtendedResourceClaimStatus(newPod.Status.ExtendedResourceClaimStatus, &newPod.Spec, fldPath.Child("extendedResourceClaimStatus"))...)
-	allErrs = append(allErrs, validateNodeAllocatableResourceClaimStatus(newPod.Status, &newPod.Spec, fldPath.Child("nodeAllocatableResourceClaimStatuses"))...)
+	allErrs = append(allErrs, ValidateContainerStateTransition(newPod.Status.ContainerStatuses, oldPod.Status.ContainerStatuses, podStatusFldPathStatusContainerStatuses, oldPod.Spec, opts)...)
+	allErrs = append(allErrs, ValidateInitContainerStateTransition(newPod.Status.InitContainerStatuses, oldPod.Status.InitContainerStatuses, podStatusFldPathStatusInitContainerStatuses, oldPod.Spec, opts)...)
+	allErrs = append(allErrs, ValidateEphemeralContainerStateTransition(newPod.Status.EphemeralContainerStatuses, oldPod.Status.EphemeralContainerStatuses, podStatusFldPathStatusEphemeralContainerStatuses)...)
+	allErrs = append(allErrs, validatePodResourceClaimStatuses(newPod.Status.ResourceClaimStatuses, newPod.Spec.ResourceClaims, podStatusFldPathStatusResourceClaimStatuses)...)
+	allErrs = append(allErrs, validatePodExtendedResourceClaimStatus(newPod.Status.ExtendedResourceClaimStatus, &newPod.Spec, podStatusFldPathStatusExtendedResourceClaimStatus)...)
+	allErrs = append(allErrs, validateNodeAllocatableResourceClaimStatus(newPod.Status, &newPod.Spec, podStatusFldPathStatusNodeAllocatableResourceClaims)...)
 
 	if len(newPod.Status.VolumeHealth) > 0 {
-		allErrs = append(allErrs, validatePodVolumeHealth(newPod.Status.VolumeHealth, &newPod.Spec, fldPath.Child("volumeHealth"))...)
+		allErrs = append(allErrs, validatePodVolumeHealth(newPod.Status.VolumeHealth, &newPod.Spec, podStatusFldPathStatusVolumeHealth)...)
 	}
 
 	if newIPErrs := validatePodIPs(newPod, oldPod); len(newIPErrs) > 0 {
@@ -6242,31 +6289,31 @@ func ValidatePodStatusUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions
 		allErrs = append(allErrs, newIPErrs...)
 	}
 
-	allErrs = append(allErrs, validateContainerStatusUsers(newPod.Status.ContainerStatuses, fldPath.Child("containerStatuses"), newPod.Spec.OS)...)
-	allErrs = append(allErrs, validateContainerStatusUsers(newPod.Status.InitContainerStatuses, fldPath.Child("initContainerStatuses"), newPod.Spec.OS)...)
-	allErrs = append(allErrs, validateContainerStatusUsers(newPod.Status.EphemeralContainerStatuses, fldPath.Child("ephemeralContainerStatuses"), newPod.Spec.OS)...)
+	allErrs = append(allErrs, validateContainerStatusUsers(newPod.Status.ContainerStatuses, podStatusFldPathStatusContainerStatuses, newPod.Spec.OS)...)
+	allErrs = append(allErrs, validateContainerStatusUsers(newPod.Status.InitContainerStatuses, podStatusFldPathStatusInitContainerStatuses, newPod.Spec.OS)...)
+	allErrs = append(allErrs, validateContainerStatusUsers(newPod.Status.EphemeralContainerStatuses, podStatusFldPathStatusEphemeralContainerStatuses, newPod.Spec.OS)...)
 
-	allErrs = append(allErrs, validateContainerStatusAllocatedResourcesStatus(newPod.Status.ContainerStatuses, fldPath.Child("containerStatuses"), newPod.Spec.Containers, &newPod.Status)...)
-	allErrs = append(allErrs, validateContainerStatusAllocatedResourcesStatus(newPod.Status.InitContainerStatuses, fldPath.Child("initContainerStatuses"), newPod.Spec.InitContainers, &newPod.Status)...)
+	allErrs = append(allErrs, validateContainerStatusAllocatedResourcesStatus(newPod.Status.ContainerStatuses, podStatusFldPathStatusContainerStatuses, newPod.Spec.Containers, &newPod.Status)...)
+	allErrs = append(allErrs, validateContainerStatusAllocatedResourcesStatus(newPod.Status.InitContainerStatuses, podStatusFldPathStatusInitContainerStatuses, newPod.Spec.InitContainers, &newPod.Status)...)
 	// ephemeral containers are not allowed to have resources allocated
-	allErrs = append(allErrs, validateContainerStatusNoAllocatedResourcesStatus(newPod.Status.EphemeralContainerStatuses, fldPath.Child("ephemeralContainerStatuses"))...)
+	allErrs = append(allErrs, validateContainerStatusNoAllocatedResourcesStatus(newPod.Status.EphemeralContainerStatuses, podStatusFldPathStatusEphemeralContainerStatuses)...)
 
 	if opts.AllowImageVolumeWithDigest {
 		for i, containerStatus := range newPod.Status.ContainerStatuses {
 			for j, volumeMountStatus := range containerStatus.VolumeMounts {
-				validatedField := fldPath.Child("containerStatuses").Index(i).Child("volumeMounts").Index(j).Child("volumeStatus")
+				validatedField := podStatusFldPathStatusContainerStatuses.Index(i).Child("volumeMounts").Index(j).Child("volumeStatus")
 				allErrs = append(allErrs, validateVolumeStatus(volumeMountStatus.VolumeStatus, validatedField)...)
 			}
 		}
 		for i, containerStatus := range newPod.Status.InitContainerStatuses {
 			for j, volumeMountStatus := range containerStatus.VolumeMounts {
-				validatedField := fldPath.Child("initContainerStatuses").Index(i).Child("volumeMounts").Index(j).Child("volumeStatus")
+				validatedField := podStatusFldPathStatusInitContainerStatuses.Index(i).Child("volumeMounts").Index(j).Child("volumeStatus")
 				allErrs = append(allErrs, validateVolumeStatus(volumeMountStatus.VolumeStatus, validatedField)...)
 			}
 		}
 		for i, containerStatus := range newPod.Status.EphemeralContainerStatuses {
 			for j, volumeMountStatus := range containerStatus.VolumeMounts {
-				validatedField := fldPath.Child("ephemeralContainerStatuses").Index(i).Child("volumeMounts").Index(j).Child("volumeStatus")
+				validatedField := podStatusFldPathStatusEphemeralContainerStatuses.Index(i).Child("volumeMounts").Index(j).Child("volumeStatus")
 				allErrs = append(allErrs, validateVolumeStatus(volumeMountStatus.VolumeStatus, validatedField)...)
 			}
 		}
@@ -6279,24 +6326,26 @@ func ValidatePodStatusUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions
 // is a non-negative integer.
 func validatePodConditions(conditions []core.PodCondition, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
-	systemConditions := sets.New(
-		core.PodScheduled,
-		core.PodReady,
-		core.PodInitialized)
 	for i, condition := range conditions {
 		if condition.ObservedGeneration < 0 {
 			allErrs = append(allErrs, field.Invalid(fldPath.Index(i).Child("observedGeneration"), condition.ObservedGeneration, "must be a non-negative integer"))
 		}
-		if systemConditions.Has(condition.Type) {
+		switch condition.Type {
+		case core.PodScheduled, core.PodReady, core.PodInitialized:
 			continue
 		}
-		allErrs = append(allErrs, ValidateQualifiedName(string(condition.Type), fldPath.Index(i).Child("Type"))...)
+		if len(condition.Type) == 0 || len(content.IsQualifiedName(string(condition.Type))) > 0 {
+			allErrs = append(allErrs, ValidateQualifiedName(string(condition.Type), fldPath.Index(i).Child("Type"))...)
+		}
 	}
 	return allErrs
 }
 
 // validatePodResourceClaimStatuses validates the ResourceClaimStatuses slice in a pod status.
 func validatePodResourceClaimStatuses(statuses []core.PodResourceClaimStatus, podClaims []core.PodResourceClaim, fldPath *field.Path) field.ErrorList {
+	if len(statuses) == 0 {
+		return nil
+	}
 	var allErrs field.ErrorList
 
 	claimNames := sets.New[string]()
@@ -7873,7 +7922,7 @@ func validateResourceName(value core.ResourceName, fldPath *field.Path) field.Er
 		return allErrs
 	}
 
-	if len(strings.Split(string(value), "/")) == 1 {
+	if !strings.Contains(string(value), "/") {
 		if !helper.IsStandardResourceName(value) {
 			return append(allErrs, field.Invalid(fldPath, value, "must be a standard resource type or fully qualified"))
 		}
@@ -7887,7 +7936,7 @@ func validateResourceName(value core.ResourceName, fldPath *field.Path) field.Er
 func ValidateContainerResourceName(value core.ResourceName, fldPath *field.Path) field.ErrorList {
 	allErrs := validateResourceName(value, fldPath)
 
-	if len(strings.Split(string(value), "/")) == 1 {
+	if !strings.Contains(string(value), "/") {
 		if !helper.IsStandardContainerResourceName(value) {
 			return append(allErrs, field.Invalid(fldPath, value, "must be a standard resource for containers"))
 		}
@@ -7920,7 +7969,7 @@ func validatePodResourceName(resourceName core.ResourceName, fldPath *field.Path
 func ValidateResourceQuotaResourceName(value core.ResourceName, fldPath *field.Path) field.ErrorList {
 	allErrs := validateResourceName(value, fldPath)
 
-	if len(strings.Split(string(value), "/")) == 1 {
+	if !strings.Contains(string(value), "/") {
 		if !helper.IsStandardQuotaResourceName(value) {
 			return append(allErrs, field.Invalid(fldPath, value, isInvalidQuotaResource))
 		}
@@ -7938,7 +7987,7 @@ func validateLimitRangeTypeName(value core.LimitType, fldPath *field.Path) field
 		return allErrs
 	}
 
-	if len(strings.Split(string(value), "/")) == 1 {
+	if !strings.Contains(string(value), "/") {
 		if !helper.IsStandardLimitRangeType(value) {
 			return append(allErrs, field.Invalid(fldPath, value, "must be a standard limit type or fully qualified"))
 		}
@@ -9894,17 +9943,19 @@ func validateContainerStatusUsers(containerStatuses []core.ContainerStatus, fldP
 			// allow for a pod spec's runAsUser) can only ever be applied to
 			// container status validation.
 			if linuxUser := containerUser.Linux; linuxUser != nil {
-				userFldPath := fldPath.Index(i).Child("user").Child("linux")
 				// UID is reported by the container runtime and may be any valid
 				// Linux uid_t (0 to math.MaxUint32).
 				if linuxUser.UID < 0 || linuxUser.UID > math.MaxUint32 {
+					userFldPath := fldPath.Index(i).Child("user").Child("linux")
 					allErrors = append(allErrors, field.Invalid(userFldPath.Child("uid"), linuxUser.UID, fmt.Sprintf("must be between 0 and %d, inclusive", int64(math.MaxUint32))))
 				}
 				for _, msg := range validation.IsValidGroupID(linuxUser.GID) {
+					userFldPath := fldPath.Index(i).Child("user").Child("linux")
 					allErrors = append(allErrors, field.Invalid(userFldPath.Child("gid"), linuxUser.GID, msg))
 				}
 				for g, gid := range linuxUser.SupplementalGroups {
 					for _, msg := range validation.IsValidGroupID(gid) {
+						userFldPath := fldPath.Index(i).Child("user").Child("linux")
 						allErrors = append(allErrors, field.Invalid(userFldPath.Child("supplementalGroups").Index(g), gid, msg))
 					}
 				}
