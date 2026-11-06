@@ -1749,3 +1749,80 @@ func verifyEventEmitted(t *testing.T, dc *disruptionController, expectedEvent st
 		}
 	}
 }
+
+func TestUpdatePodDeltaFiltering(t *testing.T) {
+	logger, ctx := ktesting.NewTestContext(t)
+	dc, _ := newFakeDisruptionController(ctx)
+
+	pdb, key := newMinAvailablePodDisruptionBudget(t, intstr.FromInt32(1))
+	add(t, dc.pdbStore, pdb)
+	dc.addDB(logger, pdb)
+	_ = getQueuedPDBKeys(t, dc)
+
+	pod, _ := newPod(t, "pod-1")
+	add(t, dc.podStore, pod)
+	dc.addPod(logger, pod)
+	if got := getQueuedPDBKeys(t, dc); len(got) != 1 || got[0] != key {
+		t.Fatalf("expected initial addPod to enqueue %q, got %v", key, got)
+	}
+
+	noOpPod := pod.DeepCopy()
+	noOpPod.ResourceVersion = "19"
+	noOpPod.Annotations["foo"] = "bar"
+	noOpPod.Status.Conditions = append(noOpPod.Status.Conditions, v1.PodCondition{
+		Type:   v1.ContainersReady,
+		Status: v1.ConditionTrue,
+	})
+	update(t, dc.podStore, noOpPod)
+	dc.updatePod(logger, pod, noOpPod)
+	if got := getQueuedPDBKeys(t, dc); len(got) != 0 {
+		t.Fatalf("expected no-op updatePod not to enqueue PDB, got %v", got)
+	}
+
+	unreadyPod := noOpPod.DeepCopy()
+	unreadyPod.ResourceVersion = "20"
+	unreadyPod.Status.Conditions = []v1.PodCondition{
+		{Type: v1.PodReady, Status: v1.ConditionFalse},
+	}
+	update(t, dc.podStore, unreadyPod)
+	dc.updatePod(logger, noOpPod, unreadyPod)
+	if got := getQueuedPDBKeys(t, dc); len(got) != 1 || got[0] != key {
+		t.Fatalf("expected Ready change to enqueue %q, got %v", key, got)
+	}
+
+	deletingPod := unreadyPod.DeepCopy()
+	deletingPod.ResourceVersion = "21"
+	now := metav1.Now()
+	deletingPod.DeletionTimestamp = &now
+	update(t, dc.podStore, deletingPod)
+	dc.updatePod(logger, unreadyPod, deletingPod)
+	if got := getQueuedPDBKeys(t, dc); len(got) != 1 || got[0] != key {
+		t.Fatalf("expected DeletionTimestamp transition to enqueue %q, got %v", key, got)
+	}
+
+	stillDeletingPod := deletingPod.DeepCopy()
+	stillDeletingPod.ResourceVersion = "22"
+	update(t, dc.podStore, stillDeletingPod)
+	dc.updatePod(logger, deletingPod, stillDeletingPod)
+	if got := getQueuedPDBKeys(t, dc); len(got) != 0 {
+		t.Fatalf("expected already-deleting pod update not to enqueue PDB, got %v", got)
+	}
+
+	controllerChangedPod := stillDeletingPod.DeepCopy()
+	controllerChangedPod.ResourceVersion = "23"
+	isController := true
+	controllerChangedPod.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: "apps/v1",
+			Kind:       "ReplicaSet",
+			Name:       "rs-1",
+			UID:        "uid-1",
+			Controller: &isController,
+		},
+	}
+	update(t, dc.podStore, controllerChangedPod)
+	dc.updatePod(logger, stillDeletingPod, controllerChangedPod)
+	if got := getQueuedPDBKeys(t, dc); len(got) != 1 || got[0] != key {
+		t.Fatalf("expected controllerRef change to enqueue %q, got %v", key, got)
+	}
+}

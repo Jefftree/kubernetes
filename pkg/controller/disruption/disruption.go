@@ -536,14 +536,34 @@ func (dc *DisruptionController) addPod(logger klog.Logger, obj interface{}) {
 	}
 }
 
+func podDisruptionChanged(oldPod, curPod *v1.Pod) bool {
+	if (oldPod.DeletionTimestamp != nil) != (curPod.DeletionTimestamp != nil) {
+		return true
+	}
+	if apipod.IsPodReady(oldPod) != apipod.IsPodReady(curPod) {
+		return true
+	}
+	return !reflect.DeepEqual(metav1.GetControllerOfNoCopy(oldPod), metav1.GetControllerOfNoCopy(curPod))
+}
+
 func (dc *DisruptionController) updatePod(logger klog.Logger, old, cur interface{}) {
 	curPod := cur.(*v1.Pod)
 	oldPod := old.(*v1.Pod)
+
+	if has, cleanAfter := dc.nonTerminatingPodHasStaleDisruptionCondition(curPod); has {
+		dc.enqueueStalePodDisruptionCleanup(logger, curPod, cleanAfter)
+	}
+
+	labelsChanged := !reflect.DeepEqual(oldPod.Labels, curPod.Labels)
+	if !labelsChanged && !podDisruptionChanged(oldPod, curPod) {
+		return
+	}
+
 	syncPdbs := map[string]*policy.PodDisruptionBudget{}
 
 	logger.V(4).Info("UpdatePod called on pod", "pod", klog.KObj(curPod))
 
-	if !reflect.DeepEqual(oldPod.Labels, curPod.Labels) {
+	if labelsChanged {
 		for _, pdb := range dc.getPdbsForPod(logger, oldPod) {
 			key, err := controller.KeyFunc(pdb)
 			if err != nil {
@@ -570,9 +590,6 @@ func (dc *DisruptionController) updatePod(logger klog.Logger, old, cur interface
 	for _, pdb := range syncPdbs {
 		logger.V(4).Info("updatePod -> PDB", "pod", klog.KObj(curPod), "podDisruptionBudget", klog.KObj(pdb))
 		dc.enqueuePdb(logger, pdb)
-	}
-	if has, cleanAfter := dc.nonTerminatingPodHasStaleDisruptionCondition(curPod); has {
-		dc.enqueueStalePodDisruptionCleanup(logger, curPod, cleanAfter)
 	}
 }
 
