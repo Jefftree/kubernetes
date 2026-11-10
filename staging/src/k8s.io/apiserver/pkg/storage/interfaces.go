@@ -434,6 +434,18 @@ func ValidateListOptions(keyPrefix string, versioner Versioner, opts ListOptions
 	return withRev, "", nil
 }
 
+// ValidateWatchOptions rejects options that no storage implementation
+// supports for watch, so that all implementations fail the same way.
+func ValidateWatchOptions(opts ListOptions) error {
+	if opts.WatchWithoutPrevKV && !opts.Predicate.Empty() {
+		return apierrors.NewInternalError(errors.New("watchWithoutPrevKV requires an empty predicate"))
+	}
+	if opts.KeysOnly {
+		return apierrors.NewInternalError(errors.New("keysOnly is not supported for watch"))
+	}
+	return nil
+}
+
 // Stats provides statistics information about storage.
 type Stats struct {
 	// ObjectCount informs about number of objects stored in the storage.

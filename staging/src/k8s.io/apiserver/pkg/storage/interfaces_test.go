@@ -21,7 +21,10 @@ import (
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 func TestPreconditionsCheckWithNilObject(t *testing.T) {
@@ -189,6 +192,53 @@ func TestValidateListOptions(t *testing.T) {
 			}
 			if continueKey != tt.expectedContinueKey {
 				t.Errorf("%s: expecting continueKey = %q, but get %q", tt.name, tt.expectedContinueKey, continueKey)
+			}
+		})
+	}
+}
+
+func TestValidateWatchOptions(t *testing.T) {
+	testCases := []struct {
+		name          string
+		opts          ListOptions
+		expectedError string
+	}{
+		{
+			name: "default",
+			opts: ListOptions{Predicate: Everything},
+		},
+		{
+			name: "watchWithoutPrevKV with empty predicate",
+			opts: ListOptions{Predicate: Everything, WatchWithoutPrevKV: true},
+		},
+		{
+			name: "watchWithoutPrevKV with predicate",
+			opts: ListOptions{
+				Predicate:          SelectionPredicate{Label: labels.Everything(), Field: fields.ParseSelectorOrDie("metadata.name=foo")},
+				WatchWithoutPrevKV: true,
+			},
+			expectedError: "watchWithoutPrevKV requires an empty predicate",
+		},
+		{
+			name:          "keysOnly",
+			opts:          ListOptions{Predicate: Everything, KeysOnly: true},
+			expectedError: "keysOnly is not supported for watch",
+		},
+	}
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateWatchOptions(tt.opts)
+			if len(tt.expectedError) == 0 {
+				if err != nil {
+					t.Fatalf("ValidateWatchOptions failed: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.expectedError) {
+				t.Fatalf("expected error: %s, but got: %v", tt.expectedError, err)
+			}
+			if !apierrors.IsInternalError(err) {
+				t.Errorf("expected internal error, but got: %#v", err)
 			}
 		})
 	}
