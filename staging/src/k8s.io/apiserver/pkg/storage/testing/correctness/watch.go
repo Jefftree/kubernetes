@@ -123,6 +123,9 @@ func checkWatchOptions(versioner storage.Versioner, request WatchRequest) error 
 	if opts.WatchWithoutPrevKV && !opts.Predicate.Empty() {
 		return apierrors.NewInternalError(errors.New("watchWithoutPrevKV requires an empty predicate"))
 	}
+	if opts.KeysOnly {
+		return apierrors.NewInternalError(errors.New("keysOnly is not supported for watch"))
+	}
 	if opts.Predicate.Limit != 0 || opts.Predicate.Continue != "" {
 		panic("pagination (limit, continue) is not supported")
 	}

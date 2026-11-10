@@ -605,6 +605,9 @@ func (c *Cacher) Watch(ctx context.Context, key string, opts storage.ListOptions
 	if opts.WatchWithoutPrevKV && !opts.Predicate.Empty() {
 		return nil, errors.NewInternalError(fmt.Errorf("watchWithoutPrevKV requires an empty predicate"))
 	}
+	if opts.KeysOnly {
+		return nil, errors.NewInternalError(fmt.Errorf("keysOnly is not supported for watch"))
+	}
 	key, err := c.prepareKey(key, opts.Recursive)
 	if err != nil {
 		return nil, err
@@ -898,6 +901,9 @@ type listResp struct {
 
 // GetList implements storage.Interface
 func (c *Cacher) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+	if opts.KeysOnly && !opts.Predicate.Empty() {
+		return errors.NewInternalError(fmt.Errorf("keysOnly requires an empty predicate"))
+	}
 	preparedKey, err := c.prepareKey(key, opts.Recursive)
 	if err != nil {
 		return err
@@ -956,7 +962,13 @@ func (c *Cacher) GetList(ctx context.Context, key string, opts storage.ListOptio
 			if err != nil {
 				return err
 			}
-			listVal.Index(numFetched).Set(reflect.ValueOf(elem.Object).Elem())
+			if opts.KeysOnly {
+				if err := copyKeysOnly(listVal.Index(numFetched).Addr().Interface(), elem.Object); err != nil {
+					return err
+				}
+			} else {
+				listVal.Index(numFetched).Set(reflect.ValueOf(elem.Object).Elem())
+			}
 			lastSelectedObjectKey = elem.Key
 			numFetched++
 			if numFetched == count {
@@ -1017,6 +1029,21 @@ func (c *Cacher) GetList(ctx context.Context, key string, opts storage.ListOptio
 	}
 	opts.Predicate.SetShardInfoOnList(listObj)
 	metrics.RecordListCacheMetrics(c.groupResource, indexUsed, numFetched, listVal.Len())
+	return nil
+}
+
+func copyKeysOnly(dst, src any) error {
+	srcMeta, err := meta.Accessor(src)
+	if err != nil {
+		return storage.NewInternalError(err)
+	}
+	dstMeta, err := meta.Accessor(dst)
+	if err != nil {
+		return storage.NewInternalError(err)
+	}
+	dstMeta.SetName(srcMeta.GetName())
+	dstMeta.SetNamespace(srcMeta.GetNamespace())
+	dstMeta.SetResourceVersion(srcMeta.GetResourceVersion())
 	return nil
 }
 

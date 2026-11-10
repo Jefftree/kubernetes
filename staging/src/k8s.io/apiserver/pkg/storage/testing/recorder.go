@@ -39,6 +39,12 @@ func NewKVRecorder(kv clientv3.KV, lists *KubernetesRecorder) *KVRecorder {
 
 func (r *KVRecorder) Get(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
 	atomic.AddUint64(&r.reads, 1)
+	if r.lists != nil {
+		op := clientv3.OpGet(key, opts...)
+		if len(op.RangeBytes()) > 0 && op.IsKeysOnly() {
+			r.lists.record(ctx, RecordedList{Key: key, Revision: op.Rev(), Limit: op.Limit()})
+		}
+	}
 	return r.KV.Get(ctx, key, opts...)
 }
 

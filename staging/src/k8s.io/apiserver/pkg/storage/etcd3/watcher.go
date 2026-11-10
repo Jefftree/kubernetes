@@ -155,6 +155,9 @@ func (w *watcher) Watch(ctx context.Context, key string, rev int64, opts storage
 			return nil, apierrors.NewInternalError(errors.New("watchWithoutPrevKV requires a reverseKeyFunc"))
 		}
 	}
+	if opts.KeysOnly {
+		return nil, apierrors.NewInternalError(errors.New("keysOnly is not supported for watch"))
+	}
 	startWatchRV, err := w.getStartWatchResourceVersion(ctx, rev, opts)
 	if err != nil {
 		return nil, err
