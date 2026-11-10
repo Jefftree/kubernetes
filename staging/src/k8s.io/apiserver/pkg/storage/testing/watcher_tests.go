@@ -176,6 +176,11 @@ func testWatch(ctx context.Context, t *testing.T, store storage.Interface, recur
 		keysOnly:           true,
 		expectedWatchError: errors.NewInternalError(fmt.Errorf("keysOnly is not supported for watch")),
 		pred:               storage.Everything,
+	}, {
+		name:               "watch with limit",
+		namespace:          fmt.Sprintf("test-ns-10-%t", recursive),
+		expectedWatchError: errors.NewInternalError(fmt.Errorf("limit and continue are not supported for watch")),
+		pred:               storage.SelectionPredicate{Label: labels.Everything(), Field: fields.Everything(), Limit: 1},
 	}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

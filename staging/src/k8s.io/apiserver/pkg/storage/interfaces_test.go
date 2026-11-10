@@ -224,6 +224,16 @@ func TestValidateWatchOptions(t *testing.T) {
 			opts:          ListOptions{Predicate: Everything, KeysOnly: true},
 			expectedError: "keysOnly is not supported for watch",
 		},
+		{
+			name:          "limit",
+			opts:          ListOptions{Predicate: SelectionPredicate{Label: labels.Everything(), Field: fields.Everything(), Limit: 1}},
+			expectedError: "limit and continue are not supported for watch",
+		},
+		{
+			name:          "continue",
+			opts:          ListOptions{Predicate: SelectionPredicate{Label: labels.Everything(), Field: fields.Everything(), Continue: "token"}},
+			expectedError: "limit and continue are not supported for watch",
+		},
 	}
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {

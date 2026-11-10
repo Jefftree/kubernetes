@@ -443,6 +443,9 @@ func ValidateWatchOptions(opts ListOptions) error {
 	if opts.KeysOnly {
 		return apierrors.NewInternalError(errors.New("keysOnly is not supported for watch"))
 	}
+	if opts.Predicate.Limit != 0 || opts.Predicate.Continue != "" {
+		return apierrors.NewInternalError(errors.New("limit and continue are not supported for watch"))
+	}
 	return nil
 }
 
